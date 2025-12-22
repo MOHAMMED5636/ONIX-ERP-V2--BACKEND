@@ -1,0 +1,188 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  password      String
+  firstName     String
+  lastName      String
+  role          UserRole @default(ADMIN)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // Relations
+  assignedTenders TenderInvitation[] @relation("AssignedEngineer")
+  createdProjects  Project[]
+  
+  @@map("users")
+}
+
+enum UserRole {
+  ADMIN
+  TENDER_ENGINEER
+  PROJECT_MANAGER
+  CONTRACTOR
+}
+
+model Client {
+  id              String   @id @default(uuid())
+  referenceNumber String   @unique
+  name            String
+  isCorporate     String   // "Person" or "Company"
+  leadSource      String?
+  rank            String?
+  email           String?
+  phone           String?
+  address         String?
+  nationality     String?
+  idNumber        String?
+  passportNumber  String?
+  birthDate       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  // Relations
+  projects        Project[]
+  tenders         Tender[]
+  
+  @@map("clients")
+}
+
+model Project {
+  id              String   @id @default(uuid())
+  name            String
+  referenceNumber String   @unique
+  clientId        String?
+  client          Client?  @relation(fields: [clientId], references: [id])
+  owner           String?
+  description     String?
+  status          String   @default("Open")
+  deadline        DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  // Relations
+  createdBy       String?
+  creator         User?    @relation(fields: [createdBy], references: [id])
+  tenders         Tender[]
+  documents       Document[]
+  
+  @@map("projects")
+}
+
+model Tender {
+  id                      String   @id @default(uuid())
+  projectId               String
+  project                 Project  @relation(fields: [projectId], references: [id])
+  name                    String
+  referenceNumber         String   @unique
+  clientId                String?
+  client                  Client?  @relation(fields: [clientId], references: [id])
+  status                  TenderStatus @default(OPEN)
+  
+  // Tender Details
+  scopeOfWork             String?
+  technicalDrawingsLink   String?
+  hasInvitationFees       Boolean  @default(false)
+  invitationFeeAmount     Decimal? @db.Decimal(10, 2)
+  tenderAcceptanceDeadline DateTime?
+  bidSubmissionDeadline  DateTime?
+  additionalNotes         String?
+  
+  // Attachment
+  attachmentFile          String?  // File path or URL
+  
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+  
+  // Relations
+  invitations             TenderInvitation[]
+  technicalSubmissions    TechnicalSubmission[]
+  
+  @@map("tenders")
+}
+
+enum TenderStatus {
+  OPEN
+  CLOSED
+  AWARDED
+  REJECTED
+  CANCELLED
+}
+
+model TenderInvitation {
+  id              String   @id @default(uuid())
+  tenderId        String
+  tender          Tender   @relation(fields: [tenderId], references: [id])
+  engineerId      String
+  engineer        User     @relation("AssignedEngineer", fields: [engineerId], references: [id])
+  invitationToken String  @unique
+  status          InvitationStatus @default(PENDING)
+  assignedAt      DateTime @default(now())
+  acceptedAt      DateTime?
+  
+  @@map("tender_invitations")
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+model TechnicalSubmission {
+  id              String   @id @default(uuid())
+  tenderId        String
+  tender          Tender   @relation(fields: [tenderId], references: [id])
+  engineerId      String
+  submittedAt     DateTime @default(now())
+  status          SubmissionStatus @default(SUBMITTED)
+  
+  // Relations
+  documents       Document[]
+  
+  @@map("technical_submissions")
+}
+
+enum SubmissionStatus {
+  SUBMITTED
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+}
+
+model Document {
+  id              String   @id @default(uuid())
+  module          String   // "PRJ", "HR", "CLI", "FIN", "GEN"
+  entityCode      String   // Reference number
+  documentType    String   // "CNTR", "DRW", "RPT", etc.
+  year            Int
+  sequence        String
+  referenceCode   String   @unique
+  fileName        String
+  filePath        String
+  fileUrl         String?
+  fileSize        Int
+  mimeType        String
+  
+  // Relations
+  projectId       String?
+  project         Project? @relation(fields: [projectId], references: [id])
+  submissionId   String?
+  submission      TechnicalSubmission? @relation(fields: [submissionId], references: [id])
+  
+  uploadedBy     String?
+  uploadedAt     DateTime @default(now())
+  
+  @@map("documents")
+}
+
