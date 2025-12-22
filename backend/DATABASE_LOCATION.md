@@ -101,7 +101,7 @@ This tells your application:
 ## Quick Access Commands
 
 ### View database in Prisma Studio:
-```powershell
+```powershell1
 cd C:\Users\Lenovo\Desktop\Onix-ERP-Backend\backend
 npx prisma studio
 ```
