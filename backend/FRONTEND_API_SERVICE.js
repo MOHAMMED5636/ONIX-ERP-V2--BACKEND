@@ -84,12 +84,42 @@ export const getCurrentUser = async () => {
 };
 
 /**
- * Logout user (clears localStorage)
+ * Logout user (calls backend and clears localStorage)
  */
-export const logout = () => {
-  localStorage.removeItem('token');
-  localStorage.removeItem('user');
-  window.location.href = '/login'; // Redirect to login page
+export const logout = async () => {
+  try {
+    const token = localStorage.getItem('token');
+    
+    // Call backend logout endpoint if token exists
+    if (token) {
+      try {
+        await fetch(`${API_BASE_URL}/auth/logout`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          credentials: 'include',
+        });
+      } catch (error) {
+        // Even if backend call fails, still clear local storage
+        console.error('Logout API error:', error);
+      }
+    }
+    
+    // Clear local storage
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    
+    // Redirect to login page
+    window.location.href = '/login';
+  } catch (error) {
+    console.error('Logout error:', error);
+    // Still clear storage and redirect even if there's an error
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    window.location.href = '/login';
+  }
 };
 
 /**
@@ -171,6 +201,8 @@ export default {
   getStoredUser,
   apiRequest,
 };
+
+
 
 
 

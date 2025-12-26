@@ -1,10 +1,87 @@
-// ============================================
-// COPY THIS TO YOUR FRONTEND PROJECT
-// Location: src/components/Login.jsx or src/pages/Login.jsx
-// ============================================
+# Frontend Email Validation Fix
 
+## Issue
+The frontend login form is showing "Invalid email format" error for valid emails like `admin@onixgroup.ae`.
+
+## Root Cause
+This is likely caused by:
+1. **HTML5 email input validation** being too strict
+2. **Custom JavaScript validation** that's rejecting valid emails
+3. **Whitespace** in the email field
+
+## Solution
+
+### Option 1: Remove HTML5 Email Validation (Recommended)
+
+If your frontend login component uses `type="email"`, you can either:
+
+**A. Change to `type="text"` and handle validation on the backend:**
+```jsx
+<input
+  id="email"
+  name="email"
+  type="text"  // Changed from "email"
+  required
+  value={formData.email}
+  onChange={(e) => setFormData({ ...formData, email: e.target.value.trim() })}
+  placeholder="admin@onixgroup.ae"
+/>
+```
+
+**B. Keep `type="email"` but add `noValidate` to the form:**
+```jsx
+<form onSubmit={handleSubmit} noValidate>
+  {/* form fields */}
+</form>
+```
+
+### Option 2: Fix Custom Validation
+
+If you have custom email validation in your frontend code, update it to use this regex:
+
+```javascript
+const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+
+// In your validation function:
+const isValidEmail = (email) => {
+  const trimmedEmail = email.trim();
+  return emailRegex.test(trimmedEmail);
+};
+```
+
+### Option 3: Trim Email Before Validation
+
+Always trim the email before validation and submission:
+
+```jsx
+const handleSubmit = async (e) => {
+  e.preventDefault();
+  setError('');
+  setLoading(true);
+
+  // Trim email before sending
+  const trimmedEmail = formData.email.trim().toLowerCase();
+
+  try {
+    const response = await login(
+      trimmedEmail,  // Use trimmed email
+      formData.password,
+      formData.role
+    );
+    // ... rest of your code
+  } catch (err) {
+    setError(err.message || 'Login failed. Please check your credentials.');
+  } finally {
+    setLoading(false);
+  }
+};
+```
+
+## Complete Fixed Login Component Example
+
+```jsx
 import { useState } from 'react';
-import { login } from '../services/api'; // Adjust path to your API service
+import { login } from '../services/api';
 
 function LoginPage() {
   const [formData, setFormData] = useState({
@@ -20,18 +97,19 @@ function LoginPage() {
     setError('');
     setLoading(true);
 
+    // Trim and normalize email
+    const trimmedEmail = formData.email.trim().toLowerCase();
+
     try {
       const response = await login(
-        formData.email,
+        trimmedEmail,
         formData.password,
         formData.role
       );
 
       if (response.success) {
-        // Redirect to dashboard or home page
+        // Redirect to dashboard
         window.location.href = '/dashboard';
-        // OR if using React Router:
-        // navigate('/dashboard');
       }
     } catch (err) {
       setError(err.message || 'Login failed. Please check your credentials.');
@@ -43,13 +121,11 @@ function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50">
       <div className="max-w-md w-full space-y-8 p-8 bg-white rounded-lg shadow-lg">
-        <div>
-          <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">
-            Login to ONIX ERP
-          </h2>
-        </div>
+        <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">
+          Login to ONIX ERP
+        </h2>
 
-        <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
+        <form className="mt-8 space-y-6" onSubmit={handleSubmit} noValidate>
           {error && (
             <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded">
               {error}
@@ -64,7 +140,7 @@ function LoginPage() {
               <input
                 id="email"
                 name="email"
-                type="email"
+                type="text"  // Changed from "email" to avoid HTML5 validation issues
                 required
                 value={formData.email}
                 onChange={(e) => setFormData({ ...formData, email: e.target.value })}
@@ -117,16 +193,6 @@ function LoginPage() {
               {loading ? 'Logging in...' : 'Sign in'}
             </button>
           </div>
-
-          <div className="mt-4 p-4 bg-gray-50 rounded-md">
-            <p className="text-xs font-semibold text-gray-700 mb-2">Test Credentials:</p>
-            <p className="text-xs text-gray-600">
-              <strong>Admin:</strong> admin@onixgroup.ae / admin123
-            </p>
-            <p className="text-xs text-gray-600">
-              <strong>Engineer:</strong> engineer@onixgroup.ae / engineer@123
-            </p>
-          </div>
         </form>
       </div>
     </div>
@@ -134,9 +200,40 @@ function LoginPage() {
 }
 
 export default LoginPage;
+```
 
+## Key Changes Made
 
+1. ✅ Changed `type="email"` to `type="text"` to avoid HTML5 validation issues
+2. ✅ Added `noValidate` to form to disable browser validation
+3. ✅ Trim and lowercase email before sending to backend
+4. ✅ Backend now handles email validation more robustly
 
+## Backend Improvements
 
+The backend has been updated to:
+- ✅ Trim whitespace from emails automatically
+- ✅ Use a more robust email regex pattern
+- ✅ Normalize emails to lowercase
 
+## Test Credentials
+
+After applying the fix, you should be able to login with:
+
+**Admin:**
+- Email: `admin@onixgroup.ae`
+- Password: `admin123`
+- Role: `ADMIN`
+
+**Tender Engineer:**
+- Email: `engineer@onixgroup.ae`
+- Password: `engineer@123`
+- Role: `TENDER_ENGINEER`
+
+## Testing
+
+1. Restart your backend server (if needed)
+2. Update your frontend login component with the fixes above
+3. Try logging in with `admin@onixgroup.ae` / `admin123` / `ADMIN`
+4. The "Invalid email format" error should no longer appear
 

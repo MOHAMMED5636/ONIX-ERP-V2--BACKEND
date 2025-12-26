@@ -7,7 +7,7 @@ import { AuthRequest } from '../middleware/auth.middleware';
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, password, role } = req.body;
+    let { email, password, role } = req.body;
     
     // Input validation
     if (!email || !password || !role) {
@@ -18,8 +18,11 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       return;
     }
     
-    // Email format validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    // Trim whitespace from email
+    email = email.trim().toLowerCase();
+    
+    // Email format validation - more robust regex
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
     if (!emailRegex.test(email)) {
       res.status(400).json({ 
         success: false, 
@@ -31,7 +34,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     // Find user by email
     const user = await prisma.user.findUnique({
       where: { email },
-    });
+    }); 
     
     if (!user || user.role !== role) {
       res.status(401).json({ success: false, message: 'Invalid credentials' });
@@ -91,6 +94,25 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
     
     res.json({ success: true, data: user });
   } catch (error) {
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+export const logout = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    // Since JWT tokens are stateless, we can't invalidate them server-side
+    // without implementing a token blacklist. This endpoint validates the token
+    // and returns success, allowing the frontend to clear the token from storage.
+    
+    // The token is already validated by the authenticate middleware
+    // We can optionally log the logout event or update user's last logout time
+    
+    res.json({
+      success: true,
+      message: 'Logged out successfully'
+    });
+  } catch (error) {
+    console.error('Logout error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
