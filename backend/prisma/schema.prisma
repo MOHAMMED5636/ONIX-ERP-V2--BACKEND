@@ -8,19 +8,27 @@ datasource db {
 }
 
 model User {
-  id            String   @id @default(uuid())
-  email         String   @unique
-  password      String
-  firstName     String
-  lastName      String
-  role          UserRole @default(ADMIN)
-  isActive      Boolean  @default(true)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id                  String   @id @default(uuid())
+  email               String   @unique
+  password            String
+  firstName           String
+  lastName            String
+  role                UserRole @default(ADMIN)
+  isActive            Boolean  @default(true)
+  forcePasswordChange Boolean  @default(false)  // Force password change on first login
+  phone               String?
+  department          String?
+  position            String?
+  employeeId          String?  @unique  // Employee ID/Number
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  createdBy           String?  // ID of admin who created this user
   
   // Relations
-  assignedTenders TenderInvitation[] @relation("AssignedEngineer")
-  createdProjects  Project[]
+  assignedTenders     TenderInvitation[] @relation("AssignedEngineer")
+  createdProjects     Project[]
+  assignedProjects    ProjectAssignment[] @relation("AssignedEmployee")
+  assignedTasks       TaskAssignment[]
   
   @@map("users")
 }
@@ -30,6 +38,8 @@ enum UserRole {
   TENDER_ENGINEER
   PROJECT_MANAGER
   CONTRACTOR
+  EMPLOYEE
+  HR
 }
 
 model Client {
@@ -74,6 +84,7 @@ model Project {
   creator         User?    @relation(fields: [createdBy], references: [id])
   tenders         Tender[]
   documents       Document[]
+  assignedEmployees ProjectAssignment[] @relation("ProjectAssignments")
   
   @@map("projects")
 }
@@ -184,5 +195,34 @@ model Document {
   uploadedAt     DateTime @default(now())
   
   @@map("documents")
+}
+
+// Project Assignment - Links employees to projects
+model ProjectAssignment {
+  id          String   @id @default(uuid())
+  projectId   String
+  project     Project  @relation("ProjectAssignments", fields: [projectId], references: [id], onDelete: Cascade)
+  employeeId  String
+  employee    User     @relation("AssignedEmployee", fields: [employeeId], references: [id], onDelete: Cascade)
+  assignedAt  DateTime @default(now())
+  assignedBy  String?  // Admin/HR who assigned
+  role        String?  // Role in project (e.g., "Engineer", "Manager", "Supervisor")
+  
+  @@unique([projectId, employeeId])
+  @@map("project_assignments")
+}
+
+// Task Assignment - Links employees to tasks
+model TaskAssignment {
+  id          String   @id @default(uuid())
+  taskId      String   // Reference to task (can be extended with Task model later)
+  employeeId  String
+  employee    User     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  assignedAt  DateTime @default(now())
+  assignedBy  String?
+  status      String   @default("PENDING") // PENDING, IN_PROGRESS, COMPLETED
+  
+  @@unique([taskId, employeeId])
+  @@map("task_assignments")
 }
 

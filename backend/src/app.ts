@@ -11,6 +11,7 @@ import clientsRoutes from './routes/clients.routes';
 import tendersRoutes from './routes/tenders.routes';
 import documentsRoutes from './routes/documents.routes';
 import dashboardRoutes from './routes/dashboard.routes';
+import employeeRoutes from './routes/employee.routes';
 
 const app = express();
 
@@ -52,6 +53,7 @@ app.use('/api/clients', clientsRoutes);
 app.use('/api/tenders', tendersRoutes);
 app.use('/api/documents', documentsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/employees', employeeRoutes);
 
 // Health check
 app.get('/health', (req, res) => {

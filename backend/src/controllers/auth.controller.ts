@@ -53,15 +53,37 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       return;
     }
     
-    // Generate JWT token
+    // Generate JWT token (always generate, even if password change required)
     const payload = { id: user.id, email: user.email, role: user.role };
     const secret = config.jwt.secret as string;
     const token = jwt.sign(payload, secret, {
       expiresIn: config.jwt.expiresIn
     } as SignOptions);
     
+    // Check if password change is required
+    if (user.forcePasswordChange) {
+      res.status(200).json({
+        success: true,
+        requiresPasswordChange: true,
+        message: 'Password change required. Please change your password to continue.',
+        data: {
+          token, // Still provide token for password change endpoint access
+          user: {
+            id: user.id,
+            email: user.email,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            role: user.role,
+            forcePasswordChange: true,
+          },
+        },
+      });
+      return;
+    }
+    
     res.json({
       success: true,
+      requiresPasswordChange: false,
       data: {
         token,
         user: {
@@ -70,6 +92,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           firstName: user.firstName,
           lastName: user.lastName,
           role: user.role,
+          forcePasswordChange: false,
         },
       },
     });
@@ -81,19 +104,37 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 
 export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    if (!req.user || !req.user.id) {
+      res.status(401).json({ success: false, message: 'Unauthorized' });
+      return;
+    }
+
     const user = await prisma.user.findUnique({
-      where: { id: req.user!.id },
+      where: { id: req.user.id },
       select: {
         id: true,
         email: true,
         firstName: true,
         lastName: true,
         role: true,
+        isActive: true,
+        forcePasswordChange: true,
       },
     });
     
+    if (!user) {
+      res.status(404).json({ success: false, message: 'User not found' });
+      return;
+    }
+
+    if (!user.isActive) {
+      res.status(403).json({ success: false, message: 'Account is deactivated' });
+      return;
+    }
+    
     res.json({ success: true, data: user });
   } catch (error) {
+    console.error('Get current user error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

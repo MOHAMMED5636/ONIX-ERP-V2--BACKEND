@@ -33,10 +33,11 @@ export const login = async (email, password, role) => {
       throw new Error(data.message || 'Login failed');
     }
 
-    // Store token and user in localStorage
-    if (data.success && data.data) {
+    // Store only token in localStorage (user profile will be fetched via /auth/me)
+    if (data.success && data.data && data.data.token) {
       localStorage.setItem('token', data.data.token);
-      localStorage.setItem('user', JSON.stringify(data.data.user));
+      // Remove any existing user data to ensure fresh fetch
+      localStorage.removeItem('user');
     }
 
     return data;
@@ -74,6 +75,11 @@ export const getCurrentUser = async () => {
       localStorage.removeItem('token');
       localStorage.removeItem('user');
       throw new Error(data.message || 'Failed to get current user');
+    }
+
+    // Update stored user data if needed (optional, for backward compatibility)
+    if (data.success && data.data) {
+      // Only store if explicitly needed, but prefer fetching fresh on each app load
     }
 
     return data;
@@ -139,8 +145,9 @@ export const getToken = () => {
 };
 
 /**
- * Get stored user
+ * Get stored user (DEPRECATED - Use getCurrentUser API instead)
  * @returns {object|null}
+ * @deprecated Fetch user profile from API using getCurrentUser() instead
  */
 export const getStoredUser = () => {
   const user = localStorage.getItem('user');

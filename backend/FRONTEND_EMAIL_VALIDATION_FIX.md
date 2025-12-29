@@ -237,3 +237,4 @@ After applying the fix, you should be able to login with:
 3. Try logging in with `admin@onixgroup.ae` / `admin123` / `ADMIN`
 4. The "Invalid email format" error should no longer appear
 
+
