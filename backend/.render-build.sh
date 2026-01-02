@@ -8,13 +8,13 @@ echo "📦 Installing dependencies..."
 # Use npm ci for faster, reliable builds, fallback to npm install
 npm ci || npm install
 
-# Build TypeScript
-echo "🔧 Building TypeScript..."
-npm run build
-
-# Generate Prisma Client
+# Generate Prisma Client FIRST (before TypeScript build)
 echo "🗄️ Generating Prisma Client..."
 npx prisma generate
+
+# Build TypeScript (after Prisma Client is generated)
+echo "🔧 Building TypeScript..."
+npm run build
 
 # Run database migrations
 echo "🔄 Running database migrations..."
