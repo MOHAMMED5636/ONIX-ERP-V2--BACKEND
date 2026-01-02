@@ -238,3 +238,4 @@ After applying the fix, you should be able to login with:
 4. The "Invalid email format" error should no longer appear
 
 
+

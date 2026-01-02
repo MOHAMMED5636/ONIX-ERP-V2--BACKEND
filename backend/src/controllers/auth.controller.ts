@@ -60,6 +60,11 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       expiresIn: config.jwt.expiresIn
     } as SignOptions);
     
+    // Get photo URL
+    const photoUrl = user.photo 
+      ? (user.photo.startsWith('http') ? user.photo : `${req.protocol}://${req.get('host')}/uploads/photos/${user.photo}`)
+      : null;
+
     // Check if password change is required
     if (user.forcePasswordChange) {
       res.status(200).json({
@@ -74,6 +79,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             firstName: user.firstName,
             lastName: user.lastName,
             role: user.role,
+            jobTitle: user.jobTitle,
+            photo: photoUrl,
             forcePasswordChange: true,
           },
         },
@@ -92,6 +99,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
           firstName: user.firstName,
           lastName: user.lastName,
           role: user.role,
+          jobTitle: user.jobTitle,
+          photo: photoUrl,
           forcePasswordChange: false,
         },
       },

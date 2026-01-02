@@ -46,7 +46,10 @@ const generateUniqueEmail = async (firstName: string, lastName: string): Promise
  */
 export const createEmployee = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { firstName, lastName, role, phone, department, position, employeeId, projectIds } = req.body;
+    const { firstName, lastName, role, phone, department, position, jobTitle, employeeId, projectIds } = req.body;
+    
+    // Get photo filename from uploaded file
+    const photoFilename = (req as any).file ? (req as any).file.filename : null;
 
     // Validation
     if (!firstName || !lastName) {
@@ -85,6 +88,8 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
         phone: phone || null,
         department: department || null,
         position: position || null,
+        jobTitle: jobTitle || null,
+        photo: photoFilename || null,
         employeeId: employeeId || null,
         forcePasswordChange: true, // Force password change on first login
         isActive: true,
@@ -99,6 +104,8 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
         phone: true,
         department: true,
         position: true,
+        jobTitle: true,
+        photo: true,
         employeeId: true,
         isActive: true,
         createdAt: true,
@@ -195,6 +202,8 @@ export const getEmployees = async (req: AuthRequest, res: Response): Promise<voi
           phone: true,
           department: true,
           position: true,
+          jobTitle: true,
+          photo: true,
           employeeId: true,
           isActive: true,
           forcePasswordChange: true,
@@ -268,6 +277,8 @@ export const getEmployeeById = async (req: AuthRequest, res: Response): Promise<
         phone: true,
         department: true,
         position: true,
+        jobTitle: true,
+        photo: true,
         employeeId: true,
         isActive: true,
         forcePasswordChange: true,
@@ -326,7 +337,10 @@ export const getEmployeeById = async (req: AuthRequest, res: Response): Promise<
 export const updateEmployee = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const { firstName, lastName, role, phone, department, position, employeeId, isActive, projectIds } = req.body;
+    const { firstName, lastName, role, phone, department, position, jobTitle, employeeId, isActive, projectIds } = req.body;
+    
+    // Get photo filename from uploaded file (if new photo uploaded)
+    const photoFilename = (req as any).file ? (req as any).file.filename : undefined;
 
     // Check if employee exists
     const existingEmployee = await prisma.user.findUnique({
@@ -349,6 +363,8 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
     if (phone !== undefined) updateData.phone = phone;
     if (department !== undefined) updateData.department = department;
     if (position !== undefined) updateData.position = position;
+    if (jobTitle !== undefined) updateData.jobTitle = jobTitle;
+    if (photoFilename !== undefined) updateData.photo = photoFilename;
     if (employeeId !== undefined) updateData.employeeId = employeeId;
     if (isActive !== undefined) updateData.isActive = isActive;
 
@@ -364,6 +380,8 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
         phone: true,
         department: true,
         position: true,
+        jobTitle: true,
+        photo: true,
         employeeId: true,
         isActive: true,
         updatedAt: true,
@@ -457,4 +475,5 @@ export const deleteEmployee = async (req: AuthRequest, res: Response): Promise<v
     });
   }
 };
+
 

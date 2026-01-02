@@ -36,6 +36,21 @@ async function main() {
   });
   console.log('✅ Created engineer user:', engineer.email);
 
+  // Create Anas Ali tender engineer
+  const anasPassword = await bcrypt.hash('anas@123', 10);
+  const anas = await prisma.user.upsert({
+    where: { email: 'anas.ali@onixgroup.ae' },
+    update: {},
+    create: {
+      email: 'anas.ali@onixgroup.ae',
+      password: anasPassword,
+      firstName: 'Anas',
+      lastName: 'Ali',
+      role: 'TENDER_ENGINEER',
+    },
+  });
+  console.log('✅ Created Anas Ali tender engineer:', anas.email);
+
   // Create Kaddour user
   const kaddourPassword = await bcrypt.hash('kadoour123', 10);
   const kaddour = await prisma.user.upsert({

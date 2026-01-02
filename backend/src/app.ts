@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
+import path from 'path';
 import { config } from './config/env';
 import { errorHandler } from './middleware/error.middleware';
 
@@ -16,7 +17,17 @@ import employeeRoutes from './routes/employee.routes';
 const app = express();
 
 // Middleware
-app.use(helmet());
+// Configure Helmet to allow images from same origin
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "http://localhost:3001", "http://localhost:3000", "https:"],
+    },
+  },
+}));
+
 // CORS configuration - allow frontend origin and common dev ports
 app.use(cors({
   origin: function (origin, callback) {
@@ -47,6 +58,15 @@ app.use(morgan('dev'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Serve static files (photos) with CORS headers
+app.use('/uploads', (req, res, next) => {
+  // Set CORS headers for static files
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  next();
+}, express.static(path.join(process.cwd(), 'uploads')));
+
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/clients', clientsRoutes);
@@ -54,6 +74,21 @@ app.use('/api/tenders', tendersRoutes);
 app.use('/api/documents', documentsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/employees', employeeRoutes);
+
+// Root route
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'ONIX ERP Backend API',
+    version: '1.0.0',
+    status: 'running',
+    endpoints: {
+      health: '/health',
+      api: '/api',
+      docs: 'API documentation available at /api endpoints'
+    },
+    timestamp: new Date().toISOString()
+  });
+});
 
 // Health check
 app.get('/health', (req, res) => {

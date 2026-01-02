@@ -374,3 +374,4 @@ The authentication system now:
 
 All components are ready to use. Copy the files to your frontend project and follow the integration steps above.
 
+

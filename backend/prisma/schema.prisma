@@ -19,6 +19,8 @@ model User {
   phone               String?
   department          String?
   position            String?
+  jobTitle            String?  // Job title/designation (e.g., "Senior Engineer", "Project Manager")
+  photo               String?  // Photo URL or file path
   employeeId          String?  @unique  // Employee ID/Number
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
