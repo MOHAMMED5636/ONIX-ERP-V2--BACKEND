@@ -34,6 +34,21 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     // Find user by email
     const user = await prisma.user.findUnique({
       where: { email },
+      select: {
+        id: true,
+        email: true,
+        password: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        jobTitle: true,
+        photo: true,
+        phone: true,
+        department: true,
+        position: true,
+        isActive: true,
+        forcePasswordChange: true,
+      },
     }); 
     
     if (!user || user.role !== role) {
@@ -126,6 +141,11 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
         firstName: true,
         lastName: true,
         role: true,
+        jobTitle: true,
+        photo: true,
+        phone: true,
+        department: true,
+        position: true,
         isActive: true,
         forcePasswordChange: true,
       },
