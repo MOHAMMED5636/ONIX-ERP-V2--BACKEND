@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: onix-erp-backend
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm ci || npm install && npm run build && npx prisma generate
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NPM_CONFIG_PRODUCTION
+        value: false
+      - key: PORT
+        value: 10000
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: FRONTEND_URL
+        sync: false  # Set this manually in Render dashboard
+
+databases:
+  - name: onix-erp-db
+    databaseName: onix_erp
+    user: onix_user
+    plan: free
+
+
