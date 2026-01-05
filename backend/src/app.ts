@@ -42,6 +42,8 @@ app.use(cors({
       'http://localhost:5174',
       'http://127.0.0.1:3000',
       'http://127.0.0.1:5173',
+      'http://192.168.1.151:3000', // Office network access
+      'http://192.168.1.151:3001', // Office network backend
     ];
     
     if (allowedOrigins.indexOf(origin) !== -1 || config.nodeEnv === 'development') {

@@ -31,8 +31,14 @@
       "@/routes/*": ["src/routes/*"]
     }
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+  "include": ["src/**/*", "prisma/**/*"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"],
+  "ts-node": {
+    "compilerOptions": {
+      "module": "commonjs",
+      "types": ["node"]
+    }
+  }
 }
 
 
