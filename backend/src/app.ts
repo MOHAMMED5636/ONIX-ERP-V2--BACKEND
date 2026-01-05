@@ -46,10 +46,12 @@ app.use(cors({
       'http://192.168.1.151:3001', // Office network backend
     ];
     
+    // Allow all origins in development, or if origin is in allowed list
     if (allowedOrigins.indexOf(origin) !== -1 || config.nodeEnv === 'development') {
       callback(null, true);
     } else {
-      callback(null, true); // Allow all in dev, restrict in production
+      // In production, still allow all for now (can restrict later)
+      callback(null, true);
     }
   },
   credentials: true,
