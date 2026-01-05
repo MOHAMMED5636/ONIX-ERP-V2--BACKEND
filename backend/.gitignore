@@ -37,7 +37,7 @@ uploads/
 *.docx
 
 # Prisma
-prisma/migrations/
+# prisma/migrations/ - Keep migrations in Git for deployment
 
 # Testing
 coverage/
