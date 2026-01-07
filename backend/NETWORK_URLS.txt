@@ -1,0 +1,51 @@
+================================================================================
+                    NETWORK ACCESS URLs FOR OFFICE COMPUTERS
+================================================================================
+
+Your Computer IP Address: 192.168.1.151
+
+BACKEND URLs:
+-------------
+Local (same computer):
+  • Backend: http://localhost:3001
+  • API: http://localhost:3001/api
+  • Health: http://localhost:3001/health
+
+Network (other computers):
+  • Backend: http://192.168.1.151:3001
+  • API: http://192.168.1.151:3001/api
+  • Health: http://192.168.1.151:3001/health
+
+FRONTEND URLs (after configuration):
+-------------------------------------
+Local (same computer):
+  • Frontend: http://localhost:3000
+
+Network (other computers):
+  • Frontend: http://192.168.1.151:3000
+
+================================================================================
+QUICK SETUP FOR FRONTEND:
+================================================================================
+
+1. Update API Base URL in frontend:
+   Change from: http://localhost:3001/api
+   Change to:   http://192.168.1.151:3001/api
+
+2. Start frontend on network:
+   Vite:        npm run dev -- --host 0.0.0.0
+   React CRA:   set HOST=0.0.0.0 && npm start
+   Next.js:     npm run dev -- -H 0.0.0.0
+
+3. Access from other computers:
+   Open browser: http://192.168.1.151:3000
+
+================================================================================
+FIREWALL (if needed):
+================================================================================
+Run PowerShell as Administrator:
+  New-NetFirewallRule -DisplayName "Backend Port 3001" -Direction Inbound -LocalPort 3001 -Protocol TCP -Action Allow
+  New-NetFirewallRule -DisplayName "Frontend Port 3000" -Direction Inbound -LocalPort 3000 -Protocol TCP -Action Allow
+
+================================================================================
+

@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import path from 'path';
+import os from 'os';
 import { config } from './config/env';
 import { errorHandler } from './middleware/error.middleware';
 
@@ -36,6 +37,23 @@ app.use(cors({
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     
+    // Get local network IP for dynamic CORS
+    function getLocalIPAddress(): string {
+      const interfaces = os.networkInterfaces();
+      for (const name of Object.keys(interfaces)) {
+        const nets = interfaces[name];
+        if (nets) {
+          for (const net of nets) {
+            if (net.family === 'IPv4' && !net.internal) {
+              return net.address;
+            }
+          }
+        }
+      }
+      return 'localhost';
+    }
+    const LOCAL_IP = getLocalIPAddress();
+    
     const allowedOrigins = [
       config.frontendUrl,
       'http://localhost:3000',
@@ -44,8 +62,10 @@ app.use(cors({
       'http://localhost:5174',
       'http://127.0.0.1:3000',
       'http://127.0.0.1:5173',
-      'http://192.168.1.151:3000', // Office network access
-      'http://192.168.1.151:3001', // Office network backend
+      `http://${LOCAL_IP}:3000`, // Dynamic office network access
+      `http://${LOCAL_IP}:3001`,
+      `http://${LOCAL_IP}:5173`, // Vite on network
+      `http://${LOCAL_IP}:5174`,
     ];
     
     // Allow all origins in development, or if origin is in allowed list
