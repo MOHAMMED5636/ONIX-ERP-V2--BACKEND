@@ -206,3 +206,5 @@ If photo still doesn't show after update:
 
 The console logs will help us identify exactly where the issue is.
 
+
+

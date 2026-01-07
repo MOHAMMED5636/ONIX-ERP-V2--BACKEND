@@ -160,3 +160,5 @@ app.use('/uploads', (req, res, next) => {
 
 **The CORS issue is now fixed! Restart your backend server and try uploading a photo again.** 🎉
 
+
+

@@ -226,3 +226,5 @@ backend/
 
 **The actual image files are stored on disk, and only the filename is stored in the database!** 📸
 
+
+

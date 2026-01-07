@@ -31,6 +31,7 @@ model User {
   createdProjects     Project[]
   assignedProjects    ProjectAssignment[] @relation("AssignedEmployee")
   assignedTasks       TaskAssignment[]
+  managedProjects     Project[] @relation("ProjectManager")
   
   @@map("users")
 }
@@ -72,12 +73,20 @@ model Project {
   id              String   @id @default(uuid())
   name            String
   referenceNumber String   @unique
+  pin             String?  @unique // Project Identification Number
   clientId        String?
   client          Client?  @relation(fields: [clientId], references: [id])
   owner           String?
   description     String?
-  status          String   @default("Open")
+  status          ProjectStatus @default(OPEN)
+  projectManagerId String?
+  projectManager  User?    @relation("ProjectManager", fields: [projectManagerId], references: [id])
+  startDate       DateTime?
+  endDate         DateTime?
   deadline        DateTime?
+  planDays        Int?     // Planned duration in days
+  remarks         String?  // General remarks
+  assigneeNotes   String?  // Notes from assignee
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
   
@@ -87,8 +96,20 @@ model Project {
   tenders         Tender[]
   documents       Document[]
   assignedEmployees ProjectAssignment[] @relation("ProjectAssignments")
+  tasks           Task[]
+  checklists      ProjectChecklist[]
+  attachments     ProjectAttachment[]
   
   @@map("projects")
+}
+
+enum ProjectStatus {
+  OPEN
+  IN_PROGRESS
+  ON_HOLD
+  COMPLETED
+  CANCELLED
+  CLOSED
 }
 
 model Tender {
@@ -214,17 +235,146 @@ model ProjectAssignment {
   @@map("project_assignments")
 }
 
+// Task Model
+model Task {
+  id              String   @id @default(uuid())
+  title           String
+  description     String?
+  projectId       String
+  project         Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  status          TaskStatus @default(PENDING)
+  priority        TaskPriority @default(MEDIUM)
+  startDate       DateTime?
+  dueDate         DateTime?
+  completedAt     DateTime?
+  estimatedHours  Decimal? @db.Decimal(10, 2)
+  actualHours     Decimal? @db.Decimal(10, 2)
+  tags            String[] // Array of tags
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  createdBy       String?
+  
+  // Relations
+  assignments     TaskAssignment[]
+  checklists      TaskChecklist[]
+  attachments     TaskAttachment[]
+  comments        TaskComment[]
+  
+  @@map("tasks")
+}
+
+enum TaskStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  ON_HOLD
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
 // Task Assignment - Links employees to tasks
 model TaskAssignment {
   id          String   @id @default(uuid())
-  taskId      String   // Reference to task (can be extended with Task model later)
+  taskId      String
+  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
   employeeId  String
   employee    User     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
   assignedAt  DateTime @default(now())
   assignedBy  String?
-  status      String   @default("PENDING") // PENDING, IN_PROGRESS, COMPLETED
+  status      TaskAssignmentStatus @default(PENDING)
   
   @@unique([taskId, employeeId])
   @@map("task_assignments")
+}
+
+enum TaskAssignmentStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+// Project Checklist
+model ProjectChecklist {
+  id          String   @id @default(uuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  isCompleted Boolean  @default(false)
+  completedAt DateTime?
+  completedBy String?
+  order       Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@map("project_checklists")
+}
+
+// Task Checklist
+model TaskChecklist {
+  id          String   @id @default(uuid())
+  taskId      String
+  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  title       String
+  isCompleted Boolean  @default(false)
+  completedAt DateTime?
+  completedBy String?
+  order       Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@map("task_checklists")
+}
+
+// Project Attachment
+model ProjectAttachment {
+  id          String   @id @default(uuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  fileName    String
+  filePath    String
+  fileUrl     String?
+  fileSize    Int
+  mimeType    String
+  uploadedBy  String?
+  uploadedAt  DateTime @default(now())
+  
+  @@map("project_attachments")
+}
+
+// Task Attachment
+model TaskAttachment {
+  id          String   @id @default(uuid())
+  taskId      String
+  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  fileName    String
+  filePath    String
+  fileUrl     String?
+  fileSize    Int
+  mimeType    String
+  uploadedBy  String?
+  uploadedAt  DateTime @default(now())
+  
+  @@map("task_attachments")
+}
+
+// Task Comment
+model TaskComment {
+  id          String   @id @default(uuid())
+  taskId      String
+  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  content     String
+  createdBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@map("task_comments")
 }
 

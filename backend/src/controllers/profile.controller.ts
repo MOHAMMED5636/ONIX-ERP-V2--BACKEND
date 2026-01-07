@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { getPhotoUrl } from '../utils/photo.utils';
 
 /**
  * Update user profile (photo and jobTitle)
@@ -47,10 +48,12 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
       }
     });
 
-    // Get photo URL
-    const photoUrl = user.photo 
-      ? (user.photo.startsWith('http') ? user.photo : `${req.protocol}://${req.get('host')}/uploads/photos/${user.photo}`)
-      : null;
+    // Get photo URL - verify file exists before returning URL
+    const photoUrl = getPhotoUrl(user.photo, req.protocol, req.get('host') || 'localhost:3001');
+    
+    if (user.photo && !photoUrl) {
+      console.log(`⚠️  Photo file not found after update for user ${user.id}: ${user.photo}`);
+    }
 
     res.json({
       success: true,

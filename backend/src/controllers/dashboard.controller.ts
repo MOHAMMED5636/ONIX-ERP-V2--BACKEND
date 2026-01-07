@@ -4,23 +4,39 @@ import { AuthRequest } from '../middleware/auth.middleware';
 
 export const getDashboardStats = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const userId = req.user!.id;
-    const userRole = req.user!.role;
+    // If no user (invalid/expired token), return default values
+    if (!req.user) {
+      res.json({
+        success: true,
+        data: {
+          activeProjects: 0,
+          activeTasks: 0,
+          teamMembers: 0,
+          inProgressTenders: 0,
+          pendingInvitations: 0,
+          recentProjects: []
+        }
+      });
+      return;
+    }
+
+    const userId = req.user.id;
+    const userRole = req.user.role;
 
     // Get active projects count
     const activeProjects = await prisma.project.count({
       where: {
         status: {
-          not: 'Closed'
+          not: 'CLOSED'
         }
       }
     });
 
-    // Get active tasks count (using tenders as tasks for now)
-    const activeTasks = await prisma.tender.count({
+    // Get active tasks count
+    const activeTasks = await prisma.task.count({
       where: {
         status: {
-          in: ['OPEN', 'CLOSED']
+          in: ['PENDING', 'IN_PROGRESS']
         }
       }
     });
@@ -91,6 +107,15 @@ export const getDashboardStats = async (req: AuthRequest, res: Response): Promis
 
 export const getDashboardProjects = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // If no user (invalid/expired token), return empty array
+    if (!req.user) {
+      res.json({
+        success: true,
+        data: []
+      });
+      return;
+    }
+
     const { status, limit = 10 } = req.query;
 
     const where: any = {};
@@ -133,8 +158,17 @@ export const getDashboardProjects = async (req: AuthRequest, res: Response): Pro
 
 export const getDashboardTasks = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const userId = req.user!.id;
-    const userRole = req.user!.role;
+    // If no user (invalid/expired token), return empty array
+    if (!req.user) {
+      res.json({
+        success: true,
+        data: []
+      });
+      return;
+    }
+
+    const userId = req.user.id;
+    const userRole = req.user.role;
 
     let where: any = {};
 
@@ -199,6 +233,15 @@ export const getDashboardTasks = async (req: AuthRequest, res: Response): Promis
 
 export const getDashboardTeam = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // If no user (invalid/expired token), return empty array
+    if (!req.user) {
+      res.json({
+        success: true,
+        data: []
+      });
+      return;
+    }
+
     const teamMembers = await prisma.user.findMany({
       where: {
         isActive: true
@@ -228,6 +271,15 @@ export const getDashboardTeam = async (req: AuthRequest, res: Response): Promise
 
 export const getDashboardCalendar = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // If no user (invalid/expired token), return empty array
+    if (!req.user) {
+      res.json({
+        success: true,
+        data: []
+      });
+      return;
+    }
+
     const { month, year } = req.query;
     const currentDate = new Date();
     const targetMonth = month ? Number(month) : currentDate.getMonth() + 1;
@@ -308,6 +360,23 @@ export const getDashboardCalendar = async (req: AuthRequest, res: Response): Pro
 
 export const getDashboardSummary = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // If no user (invalid/expired token), return default values
+    if (!req.user) {
+      res.json({
+        success: true,
+        data: {
+          activeProjects: 0,
+          activeTasks: 0,
+          teamMembers: 0,
+          inProgressTenders: 0,
+          totalClients: 0,
+          totalTenders: 0,
+          pendingInvitations: 0
+        }
+      });
+      return;
+    }
+
     // Get all dashboard stats in one call
     const [
       activeProjects,
@@ -318,15 +387,15 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response): Prom
       totalTenders,
       pendingInvitations
     ] = await Promise.all([
-      prisma.project.count({ where: { status: { not: 'Closed' } } }),
-      prisma.tender.count({ where: { status: { in: ['OPEN', 'CLOSED'] } } }),
+      prisma.project.count({ where: { status: { not: 'CLOSED' } } }),
+      prisma.task.count({ where: { status: { in: ['PENDING', 'IN_PROGRESS'] } } }),
       prisma.user.count({ where: { isActive: true } }),
       prisma.tender.count({ where: { status: 'OPEN' } }),
       prisma.client.count(),
       prisma.tender.count(),
-      req.user!.role === 'TENDER_ENGINEER' 
+      req.user.role === 'TENDER_ENGINEER' 
         ? prisma.tenderInvitation.count({ 
-            where: { engineerId: req.user!.id, status: 'PENDING' } 
+            where: { engineerId: req.user.id, status: 'PENDING' } 
           })
         : Promise.resolve(0)
     ]);
@@ -348,6 +417,7 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response): Prom
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
+
 
 
 

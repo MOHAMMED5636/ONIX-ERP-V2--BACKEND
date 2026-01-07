@@ -216,3 +216,5 @@ The console logs will help us identify exactly where the issue is!
 
 **Try uploading the photo again and check the browser console (F12) for the debug messages!** 🔍
 
+
+

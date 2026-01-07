@@ -150,3 +150,5 @@ npx prisma migrate dev
 
 **That's it! Your application is running locally!** 🎉
 
+
+

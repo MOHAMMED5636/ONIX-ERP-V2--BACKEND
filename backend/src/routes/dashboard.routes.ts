@@ -1,11 +1,11 @@
 import { Router } from 'express';
-import { authenticate } from '../middleware/auth.middleware';
+import { optionalAuthenticate } from '../middleware/auth.middleware';
 import * as dashboardController from '../controllers/dashboard.controller';
 
 const router = Router();
 
-// All dashboard routes require authentication
-router.use(authenticate);
+// Dashboard routes use optional authentication - will return default values if token is invalid/expired
+router.use(optionalAuthenticate);
 
 // Dashboard endpoints
 router.get('/stats', dashboardController.getDashboardStats);
@@ -16,6 +16,7 @@ router.get('/team', dashboardController.getDashboardTeam);
 router.get('/calendar', dashboardController.getDashboardCalendar);
 
 export default router;
+
 
 
 

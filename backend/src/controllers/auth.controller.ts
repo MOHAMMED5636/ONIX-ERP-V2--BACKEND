@@ -4,16 +4,35 @@ import jwt, { SignOptions } from 'jsonwebtoken';
 import prisma from '../config/database';
 import { config } from '../config/env';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { getPhotoUrl } from '../utils/photo.utils';
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
+    // Log login attempt
+    console.log('=== LOGIN REQUEST ===');
+    console.log(`[${new Date().toISOString()}] POST /api/auth/login`);
+    console.log('Received request body:', { 
+      email: req.body.email, 
+      role: req.body.role, 
+      password: req.body.password ? '***' : undefined 
+    });
+    console.log('Content-Type:', req.headers['content-type']);
+    
     let { email, password, role } = req.body;
     
-    // Input validation
+    // Input validation with better error messages
     if (!email || !password || !role) {
+      console.log('❌ Missing fields - email:', !!email, 'password:', !!password, 'role:', !!role);
       res.status(400).json({ 
         success: false, 
-        message: 'Email, password, and role are required' 
+        message: 'Email, password, and role are required',
+        received: {
+          email: email || null,
+          password: password ? '***' : null,
+          role: role || null,
+          bodyType: typeof req.body,
+          bodyKeys: Object.keys(req.body || {})
+        }
       });
       return;
     }
@@ -52,6 +71,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     }); 
     
     if (!user || user.role !== role) {
+      console.log('❌ Invalid credentials - user not found or role mismatch');
       res.status(401).json({ success: false, message: 'Invalid credentials' });
       return;
     }
@@ -59,11 +79,13 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
+      console.log('❌ Invalid credentials - password mismatch');
       res.status(401).json({ success: false, message: 'Invalid credentials' });
       return;
     }
     
     if (!user.isActive) {
+      console.log('❌ Account is deactivated');
       res.status(403).json({ success: false, message: 'Account is deactivated' });
       return;
     }
@@ -75,10 +97,16 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       expiresIn: config.jwt.expiresIn
     } as SignOptions);
     
-    // Get photo URL
-    const photoUrl = user.photo 
-      ? (user.photo.startsWith('http') ? user.photo : `${req.protocol}://${req.get('host')}/uploads/photos/${user.photo}`)
-      : null;
+    console.log(`✅ Login successful for user: ${user.email} (${user.role})`);
+    
+    // Get photo URL - verify file exists before returning URL
+    const photoUrl = getPhotoUrl(user.photo, req.protocol, req.get('host') || 'localhost:3001');
+    
+    if (user.photo && !photoUrl) {
+      console.log(`⚠️  Photo file not found for user ${user.email}: ${user.photo}`);
+    } else if (photoUrl) {
+      console.log(`📸 Photo URL for ${user.email}: ${photoUrl}`);
+    }
 
     // Check if password change is required
     if (user.forcePasswordChange) {
@@ -120,8 +148,10 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         },
       },
     });
+    console.log('=== LOGIN REQUEST COMPLETED ===\n');
   } catch (error) {
-    console.error('Login error:', error);
+    console.error('❌ Login error:', error);
+    console.log('=== LOGIN REQUEST FAILED ===\n');
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
@@ -161,7 +191,20 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
     
-    res.json({ success: true, data: user });
+    // Get photo URL - verify file exists before returning URL
+    const photoUrl = getPhotoUrl(user.photo, req.protocol, req.get('host') || 'localhost:3001');
+    
+    if (user.photo && !photoUrl) {
+      console.log(`⚠️  Photo file not found for user ${user.email}: ${user.photo}`);
+    }
+    
+    res.json({ 
+      success: true, 
+      data: {
+        ...user,
+        photo: photoUrl
+      }
+    });
   } catch (error) {
     console.error('Get current user error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });

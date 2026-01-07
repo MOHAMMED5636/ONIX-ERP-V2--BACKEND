@@ -13,6 +13,8 @@ import tendersRoutes from './routes/tenders.routes';
 import documentsRoutes from './routes/documents.routes';
 import dashboardRoutes from './routes/dashboard.routes';
 import employeeRoutes from './routes/employee.routes';
+import projectsRoutes from './routes/projects.routes';
+import tasksRoutes from './routes/tasks.routes';
 
 const app = express();
 
@@ -58,18 +60,69 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
+// Request logging - log all requests including method and path
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
+// Morgan HTTP request logger
 app.use(morgan('dev'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Serve static files (photos) with CORS headers
+// This must come before authentication middleware
+import fs from 'fs';
+
+const uploadsPath = path.join(process.cwd(), 'uploads');
+const photosPath = path.join(uploadsPath, 'photos');
+
+// Ensure directories exist
+if (!fs.existsSync(uploadsPath)) {
+  fs.mkdirSync(uploadsPath, { recursive: true });
+  console.log(`📁 Created uploads directory: ${uploadsPath}`);
+}
+if (!fs.existsSync(photosPath)) {
+  fs.mkdirSync(photosPath, { recursive: true });
+  console.log(`📸 Created photos directory: ${photosPath}`);
+}
+
+console.log(`📁 Serving static files from: ${uploadsPath}`);
+console.log(`📸 Photo directory: ${photosPath}`);
+
 app.use('/uploads', (req, res, next) => {
   // Set CORS headers for static files
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
+  
+  // Log photo requests for debugging
+  if (req.path.includes('/photos/')) {
+    const relativePath = req.path.replace('/uploads', '');
+    const filePath = path.join(uploadsPath, relativePath);
+    const fileExists = fs.existsSync(filePath);
+    console.log(`📸 Photo request: ${req.method} ${req.path}`);
+    console.log(`   → Looking for file: ${filePath}`);
+    console.log(`   → File exists: ${fileExists ? '✅ YES' : '❌ NO'}`);
+    
+    if (!fileExists) {
+      console.log(`   ⚠️  WARNING: Photo file not found at: ${filePath}`);
+      // List files in photos directory for debugging
+      if (fs.existsSync(photosPath)) {
+        const files = fs.readdirSync(photosPath);
+        console.log(`   📋 Available photos (${files.length}):`, files.slice(0, 5));
+      }
+    }
+  }
+  
   next();
-}, express.static(path.join(process.cwd(), 'uploads')));
+}, express.static(uploadsPath, {
+  dotfiles: 'ignore',
+  maxAge: '1d',
+  etag: true,
+  lastModified: true
+}));
 
 // Routes
 app.use('/api/auth', authRoutes);
@@ -78,6 +131,8 @@ app.use('/api/tenders', tendersRoutes);
 app.use('/api/documents', documentsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/employees', employeeRoutes);
+app.use('/api/projects', projectsRoutes);
+app.use('/api/tasks', tasksRoutes);
 
 // Root route
 app.get('/', (req, res) => {

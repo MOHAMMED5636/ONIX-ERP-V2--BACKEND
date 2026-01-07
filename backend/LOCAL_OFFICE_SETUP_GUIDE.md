@@ -389,3 +389,5 @@ npx prisma generate
 
 **Your application is now ready to run locally!** 🚀
 
+
+
