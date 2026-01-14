@@ -631,11 +631,11 @@ export const getKanbanTasks = async (req: AuthRequest, res: Response): Promise<v
 
     // Group tasks by status
     const kanbanData = {
-      PENDING: tasks.filter((t) => t.status === 'PENDING'),
-      IN_PROGRESS: tasks.filter((t) => t.status === 'IN_PROGRESS'),
-      COMPLETED: tasks.filter((t) => t.status === 'COMPLETED'),
-      ON_HOLD: tasks.filter((t) => t.status === 'ON_HOLD'),
-      CANCELLED: tasks.filter((t) => t.status === 'CANCELLED'),
+      PENDING: tasks.filter((t: any) => t.status === 'PENDING'),
+      IN_PROGRESS: tasks.filter((t: any) => t.status === 'IN_PROGRESS'),
+      COMPLETED: tasks.filter((t: any) => t.status === 'COMPLETED'),
+      ON_HOLD: tasks.filter((t: any) => t.status === 'ON_HOLD'),
+      CANCELLED: tasks.filter((t: any) => t.status === 'CANCELLED'),
     };
 
     res.json({

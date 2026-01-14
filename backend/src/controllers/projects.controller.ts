@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { ProjectStatus } from '@prisma/client';
 
 // Get all projects with filters
 export const getAllProjects = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -284,6 +285,14 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
       }
     }
 
+    // Determine project status - default to OPEN (which counts as active)
+    const projectStatus = status ? (status as ProjectStatus) : ProjectStatus.OPEN;
+    
+    console.log(`📝 Creating project: ${name}`);
+    console.log(`   Reference Number: ${referenceNumber}`);
+    console.log(`   Status: ${projectStatus} (will count as ${projectStatus === ProjectStatus.OPEN || projectStatus === ProjectStatus.IN_PROGRESS ? 'ACTIVE' : 'INACTIVE'})`);
+    console.log(`   Created By: ${req.user?.id}`);
+
     // Create project
     const project = await prisma.project.create({
       data: {
@@ -293,7 +302,7 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
         clientId: clientId || null,
         owner: owner || null,
         description: description || null,
-        status: status || 'OPEN',
+        status: projectStatus,  // Use enum value, not string
         projectManagerId: projectManagerId || null,
         startDate: startDate ? new Date(startDate) : null,
         endDate: endDate ? new Date(endDate) : null,
@@ -333,6 +342,17 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
         },
       },
     });
+
+    // Log successful creation
+    console.log(`✅ Project created successfully: ${project.id}`);
+    console.log(`   Final Status: ${project.status}`);
+    
+    // Verify the project was saved correctly
+    const verifyProject = await prisma.project.findUnique({
+      where: { id: project.id },
+      select: { id: true, name: true, status: true, referenceNumber: true }
+    });
+    console.log(`   Verified in DB:`, verifyProject);
 
     res.status(201).json({
       success: true,
@@ -608,4 +628,6 @@ export const getProjectStats = async (req: AuthRequest, res: Response): Promise<
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
+
+
 

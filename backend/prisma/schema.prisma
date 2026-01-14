@@ -378,3 +378,53 @@ model TaskComment {
   @@map("task_comments")
 }
 
+// Company Model - For managing multiple companies/entities
+model Company {
+  id              String   @id @default(uuid())
+  name            String
+  tag             String?  // Company tag/abbreviation (e.g., "ONIX", "TECH")
+  address         String?
+  industry        String?
+  founded         String?  // Year founded
+  status          CompanyStatus @default(ACTIVE)
+  
+  // Contact Information
+  contactName     String?
+  contactEmail    String?
+  contactPhone    String?
+  contactExtension String?
+  
+  // License Information
+  licenseExpiry   DateTime?
+  licenseStatus   LicenseStatus @default(ACTIVE)
+  
+  // Branding
+  logo            String?  // Logo file path or URL
+  header          String?  // Header file path or URL
+  footer          String?  // Footer file path or URL
+  
+  // Statistics
+  employees       Int      @default(0)
+  
+  // Metadata
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  createdBy       String?
+  
+  @@map("companies")
+}
+
+enum CompanyStatus {
+  ACTIVE
+  INACTIVE
+  PENDING
+  SUSPENDED
+}
+
+enum LicenseStatus {
+  ACTIVE
+  EXPIRED
+  PENDING
+  SUSPENDED
+}
+

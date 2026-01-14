@@ -1,0 +1,66 @@
+================================================================================
+                    CLIENT ACCESS INFORMATION
+================================================================================
+
+ERP System Access URLs for Testing
+===================================
+
+Frontend (Login Page):
+  http://192.168.1.151:3000
+
+Backend API:
+  http://192.168.1.151:3001/api
+
+Health Check:
+  http://192.168.1.151:3001/health
+
+================================================================================
+REQUIREMENTS:
+================================================================================
+
+1. Your computer must be ON and running
+2. Backend server must be started
+3. Frontend server must be started
+4. Client computers must be on the SAME NETWORK (same WiFi/router)
+5. Firewall ports 3000 and 3001 must be open
+
+================================================================================
+TEST CREDENTIALS:
+================================================================================
+
+Admin:
+  Email: admin@onixgroup.ae
+  Password: admin123
+  Role: ADMIN
+
+Tender Engineer:
+  Email: engineer@onixgroup.ae
+  Password: engineer@123
+  Role: TENDER_ENGINEER
+
+================================================================================
+TROUBLESHOOTING:
+================================================================================
+
+If client can't access:
+
+1. Check backend is running:
+   Open: http://192.168.1.151:3001/health
+   Should see: {"status":"ok"}
+
+2. Check frontend is running:
+   Open: http://192.168.1.151:3000
+   Should see login page
+
+3. Check firewall:
+   - Windows Firewall → Inbound Rules
+   - Ports 3000 and 3001 must be allowed
+
+4. Check network:
+   - All computers on same WiFi
+   - IP address matches (192.168.1.151)
+
+================================================================================
+
+
+

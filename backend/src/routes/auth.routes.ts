@@ -12,8 +12,20 @@ router.post('/login', authController.login);
 router.get('/me', authenticate, authController.getCurrentUser);
 router.post('/logout', authenticate, authController.logout);
 
-// Profile management routes
-router.put('/profile', authenticate, uploadPhoto.single('photo'), profileController.updateProfile);
+// Profile management routes - handle multer errors
+router.put('/profile', authenticate, (req, res, next) => {
+  uploadPhoto.single('photo')(req, res, (err) => {
+    if (err) {
+      console.error('❌ Multer upload error:', err);
+      res.status(400).json({
+        success: false,
+        message: err.message || 'File upload failed'
+      });
+      return;
+    }
+    next();
+  });
+}, profileController.updateProfile);
 
 // Password management routes
 router.post('/change-password', authenticate, passwordController.changePassword);

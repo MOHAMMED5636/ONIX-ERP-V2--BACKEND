@@ -1,7 +1,13 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
+import * as dashboardService from '../services/dashboard.service';
 
+/**
+ * Get Dashboard Statistics
+ * Returns real-time counts of active projects, tasks, and other metrics
+ * Counts are calculated dynamically from database (not cached)
+ */
 export const getDashboardStats = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     // If no user (invalid/expired token), return default values
@@ -11,6 +17,9 @@ export const getDashboardStats = async (req: AuthRequest, res: Response): Promis
         data: {
           activeProjects: 0,
           activeTasks: 0,
+          completedTasks: 0,
+          pendingTasks: 0,
+          inProgressTasks: 0,
           teamMembers: 0,
           inProgressTenders: 0,
           pendingInvitations: 0,
@@ -23,90 +32,44 @@ export const getDashboardStats = async (req: AuthRequest, res: Response): Promis
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    // Get active projects count
-    const activeProjects = await prisma.project.count({
-      where: {
-        status: {
-          not: 'CLOSED'
-        }
-      }
-    });
+    // Get dashboard stats from service layer
+    // This queries the database directly - no caching, no hardcoded values
+    const stats = await dashboardService.getDashboardStats(userId, userRole);
 
-    // Get active tasks count
-    const activeTasks = await prisma.task.count({
-      where: {
-        status: {
-          in: ['PENDING', 'IN_PROGRESS']
-        }
-      }
-    });
-
-    // Get team members count (active users)
-    const teamMembers = await prisma.user.count({
-      where: {
-        isActive: true
-      }
-    });
-
-    // Get in-progress tenders count
-    const inProgressTenders = await prisma.tender.count({
-      where: {
-        status: 'OPEN'
-      }
+    // Log the stats for debugging
+    console.log(`📊 Dashboard Controller - Returning stats:`, {
+      activeProjects: stats.activeProjects,
+      activeTasks: stats.activeTasks,
+      userId,
+      userRole
     });
 
     // Get recent projects
-    const recentProjects = await prisma.project.findMany({
-      take: 5,
-      orderBy: {
-        createdAt: 'desc'
-      },
-      include: {
-        client: {
-          select: {
-            name: true
-          }
-        }
-      }
-    });
-
-    // Get pending invitations for tender engineers
-    let pendingInvitations = 0;
-    if (userRole === 'TENDER_ENGINEER') {
-      pendingInvitations = await prisma.tenderInvitation.count({
-        where: {
-          engineerId: userId,
-          status: 'PENDING'
-        }
-      });
-    }
+    const recentProjects = await dashboardService.getRecentProjects(5);
 
     res.json({
       success: true,
       data: {
-        activeProjects,
-        activeTasks,
-        teamMembers,
-        inProgressTenders,
-        pendingInvitations,
-        recentProjects: recentProjects.map(project => ({
-          id: project.id,
-          name: project.name,
-          referenceNumber: project.referenceNumber,
-          status: project.status,
-          clientName: project.client?.name || 'N/A',
-          createdAt: project.createdAt
-        }))
+        ...stats,
+        recentProjects
       }
     });
   } catch (error) {
-    console.error('Dashboard stats error:', error);
-    // Return default values instead of error
-    res.json({
-      success: true,
+    console.error('❌ Dashboard stats error:', error);
+    console.error('   Error details:', error instanceof Error ? error.stack : error);
+    
+    // IMPORTANT: Return 0 for all counts on error (not hardcoded 3)
+    // This ensures frontend shows 0 when database query fails
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch dashboard statistics',
+      error: error instanceof Error ? error.message : 'Unknown error',
       data: {
-        activeProjects: 0,
+        activeProjects: 0,  // Always 0 on error - no fallback to 3
         activeTasks: 0,
+        completedTasks: 0,
+        pendingTasks: 0,
+        inProgressTasks: 0,
         teamMembers: 0,
         inProgressTenders: 0,
         pendingInvitations: 0,
@@ -381,6 +344,11 @@ export const getDashboardCalendar = async (req: AuthRequest, res: Response): Pro
   }
 };
 
+/**
+ * Get Dashboard Summary
+ * Returns simplified dashboard statistics
+ * Counts are calculated dynamically from database (not cached)
+ */
 export const getDashboardSummary = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     // If no user (invalid/expired token), return default values
@@ -400,40 +368,15 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response): Prom
       return;
     }
 
-    // Get all dashboard stats in one call
-    const [
-      activeProjects,
-      activeTasks,
-      teamMembers,
-      inProgressTenders,
-      totalClients,
-      totalTenders,
-      pendingInvitations
-    ] = await Promise.all([
-      prisma.project.count({ where: { status: { not: 'CLOSED' } } }),
-      prisma.task.count({ where: { status: { in: ['PENDING', 'IN_PROGRESS'] } } }),
-      prisma.user.count({ where: { isActive: true } }),
-      prisma.tender.count({ where: { status: 'OPEN' } }),
-      prisma.client.count(),
-      prisma.tender.count(),
-      req.user.role === 'TENDER_ENGINEER' 
-        ? prisma.tenderInvitation.count({ 
-            where: { engineerId: req.user.id, status: 'PENDING' } 
-          })
-        : Promise.resolve(0)
-    ]);
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    // Get dashboard summary from service layer
+    const summary = await dashboardService.getDashboardSummary(userId, userRole);
 
     res.json({
       success: true,
-      data: {
-        activeProjects,
-        activeTasks,
-        teamMembers,
-        inProgressTenders,
-        totalClients,
-        totalTenders,
-        pendingInvitations
-      }
+      data: summary
     });
   } catch (error) {
     console.error('Dashboard summary error:', error);

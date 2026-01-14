@@ -16,6 +16,7 @@ import dashboardRoutes from './routes/dashboard.routes';
 import employeeRoutes from './routes/employee.routes';
 import projectsRoutes from './routes/projects.routes';
 import tasksRoutes from './routes/tasks.routes';
+import companiesRoutes from './routes/companies.routes';
 
 const app = express();
 
@@ -89,7 +90,7 @@ app.use((req, res, next) => {
 // Morgan HTTP request logger
 app.use(morgan('dev'));
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' })); // Increase limit for file uploads
 
 // Serve static files (photos) with CORS headers
 // This must come before authentication middleware
@@ -153,6 +154,84 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/employees', employeeRoutes);
 app.use('/api/projects', projectsRoutes);
 app.use('/api/tasks', tasksRoutes);
+app.use('/api/companies', companiesRoutes);
+
+// API root endpoint - list all available endpoints
+app.get('/api', (req, res) => {
+  res.json({
+    success: true,
+    message: 'ONIX ERP Backend API',
+    version: '1.0.0',
+    endpoints: {
+      auth: {
+        login: 'POST /api/auth/login',
+        me: 'GET /api/auth/me',
+        logout: 'POST /api/auth/logout',
+        profile: 'PUT /api/auth/profile',
+        changePassword: 'POST /api/auth/change-password',
+      },
+      projects: {
+        list: 'GET /api/projects',
+        get: 'GET /api/projects/:id',
+        create: 'POST /api/projects',
+        update: 'PUT /api/projects/:id',
+        delete: 'DELETE /api/projects/:id',
+        assign: 'POST /api/projects/:id/assign',
+        stats: 'GET /api/projects/:id/stats',
+        checklists: 'GET /api/projects/:projectId/checklists',
+        attachments: 'GET /api/projects/:projectId/attachments',
+      },
+      tasks: {
+        list: 'GET /api/tasks',
+        get: 'GET /api/tasks/:id',
+        create: 'POST /api/tasks',
+        update: 'PUT /api/tasks/:id',
+        delete: 'DELETE /api/tasks/:id',
+        assign: 'POST /api/tasks/:id/assign',
+        stats: 'GET /api/tasks/stats',
+        kanban: 'GET /api/tasks/kanban',
+        checklists: 'GET /api/tasks/:taskId/checklists',
+        attachments: 'GET /api/tasks/:taskId/attachments',
+        comments: 'GET /api/tasks/:taskId/comments',
+      },
+      clients: {
+        list: 'GET /api/clients',
+        get: 'GET /api/clients/:id',
+        create: 'POST /api/clients',
+        update: 'PUT /api/clients/:id',
+        delete: 'DELETE /api/clients/:id',
+      },
+      tenders: {
+        assign: 'POST /api/tenders/assign',
+        invitation: 'GET /api/tenders/invitation/:token',
+        accept: 'POST /api/tenders/invitation/:token/accept',
+      },
+      dashboard: {
+        stats: 'GET /api/dashboard/stats',
+        summary: 'GET /api/dashboard/summary',
+        projects: 'GET /api/dashboard/projects',
+        tasks: 'GET /api/dashboard/tasks',
+        team: 'GET /api/dashboard/team',
+        calendar: 'GET /api/dashboard/calendar',
+      },
+      employees: {
+        list: 'GET /api/employees',
+        get: 'GET /api/employees/:id',
+        create: 'POST /api/employees',
+        update: 'PUT /api/employees/:id',
+        delete: 'DELETE /api/employees/:id',
+      },
+      documents: {
+        list: 'GET /api/documents',
+        upload: 'POST /api/documents',
+        download: 'GET /api/documents/:id/download',
+        delete: 'DELETE /api/documents/:id',
+      },
+    },
+    documentation: 'See API documentation for detailed endpoint information',
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // Root route
 app.get('/', (req, res) => {

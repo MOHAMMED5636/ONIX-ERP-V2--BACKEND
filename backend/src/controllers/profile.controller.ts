@@ -13,13 +13,58 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
     const userId = req.user!.id;
     const { jobTitle } = req.body;
     
+    // Debug: Log request details
+    console.log('📸 Profile update request received');
+    console.log('   User ID:', userId);
+    console.log('   Job Title:', jobTitle);
+    console.log('   Has file:', !!(req as any).file);
+    console.log('   Request headers:', {
+      'content-type': req.headers['content-type'],
+      'content-length': req.headers['content-length']
+    });
+    
     // Get photo filename from uploaded file (if new photo uploaded)
-    const photoFilename = (req as any).file ? (req as any).file.filename : undefined;
+    const file = (req as any).file;
+    let photoFilename = file ? file.filename : undefined;
+    
+    if (file) {
+      console.log('   File details:', {
+        filename: file.filename,
+        originalname: file.originalname,
+        mimetype: file.mimetype,
+        size: file.size,
+        path: file.path
+      });
+      
+      // Sanitize filename to ensure no path separators
+      if (photoFilename) {
+        // Remove any path separators that might have been included
+        photoFilename = photoFilename.replace(/[\/\\]/g, '_');
+        // Also check the file.path to ensure it's correct
+        const path = require('path');
+        const expectedPath = path.join(process.cwd(), 'uploads', 'photos', photoFilename);
+        console.log('   Expected file path:', expectedPath);
+        console.log('   Actual file path:', file.path);
+        
+        // Verify the file actually exists at the expected location
+        const fs = require('fs');
+        if (fs.existsSync(file.path)) {
+          console.log('   ✅ File exists at multer path');
+        } else {
+          console.log('   ⚠️  File does not exist at multer path');
+        }
+      }
+    }
 
     // Build update data
     const updateData: any = {};
-    if (jobTitle !== undefined) updateData.jobTitle = jobTitle;
-    if (photoFilename !== undefined) updateData.photo = photoFilename;
+    if (jobTitle !== undefined && jobTitle !== null) {
+      updateData.jobTitle = jobTitle;
+    }
+    if (photoFilename) {
+      updateData.photo = photoFilename;
+      console.log('   ✅ Photo will be updated to:', photoFilename);
+    }
 
     // If no data to update
     if (Object.keys(updateData).length === 0) {
@@ -29,6 +74,8 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
       });
       return;
     }
+
+    console.log('   Update data:', updateData);
 
     // Update user profile
     const user = await prisma.user.update({
@@ -48,26 +95,58 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
       }
     });
 
-    // Get photo URL - verify file exists before returning URL
-    const photoUrl = getPhotoUrl(user.photo, req.protocol, req.get('host') || 'localhost:3001');
+    console.log('   ✅ User updated in database');
+    console.log('   Photo in database:', user.photo);
+
+    // Get photo URL - construct URL directly since we just uploaded the file
+    const host = req.get('host') || '192.168.1.54:3001';
+    const protocol = req.protocol || 'http';
     
-    if (user.photo && !photoUrl) {
-      console.log(`⚠️  Photo file not found after update for user ${user.id}: ${user.photo}`);
+    // Construct photo URL directly (don't verify since we just uploaded it)
+    let photoUrl: string | null = null;
+    if (user.photo) {
+      // If it's already a full URL, use it
+      if (user.photo.startsWith('http://') || user.photo.startsWith('https://')) {
+        photoUrl = user.photo;
+      } else {
+        // Construct full URL
+        photoUrl = `${protocol}://${host}/uploads/photos/${user.photo}`;
+      }
     }
+    
+    console.log('   Photo URL generated:', photoUrl);
+    
+    // Verify file exists (for logging only)
+    if (user.photo && photoUrl) {
+      const fs = require('fs');
+      const path = require('path');
+      const filePath = path.join(process.cwd(), 'uploads', 'photos', user.photo);
+      const fileExists = fs.existsSync(filePath);
+      console.log('   File exists check:', fileExists ? '✅ YES' : '❌ NO');
+      if (!fileExists) {
+        console.log(`   ⚠️  Photo file not found at: ${filePath}`);
+      }
+    }
+
+    const responseData = {
+      ...user,
+      photo: photoUrl, // Always return the constructed URL
+    };
+
+    console.log('   ✅ Sending response with photo:', responseData.photo);
 
     res.json({
       success: true,
       message: 'Profile updated successfully',
-      data: {
-        ...user,
-        photo: photoUrl,
-      }
+      data: responseData
     });
   } catch (error) {
-    console.error('Update profile error:', error);
+    console.error('❌ Update profile error:', error);
+    console.error('   Error details:', error instanceof Error ? error.message : error);
     res.status(500).json({
       success: false,
-      message: 'Failed to update profile'
+      message: 'Failed to update profile',
+      error: error instanceof Error ? error.message : 'Unknown error'
     });
   }
 };
