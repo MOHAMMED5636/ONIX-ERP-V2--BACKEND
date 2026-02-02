@@ -31,5 +31,9 @@ export const config = {
     maxSize: parseInt(process.env.MAX_FILE_SIZE || '10485760'), // 10MB
     allowedTypes: process.env.ALLOWED_FILE_TYPES?.split(',') || [],
   },
+  
+  googleMaps: {
+    apiKey: process.env.GOOGLE_MAPS_API_KEY || '',
+  },
 };
 

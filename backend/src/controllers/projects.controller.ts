@@ -246,7 +246,53 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
       remarks,
       assigneeNotes,
       employeeIds, // Array of employee IDs to assign
+      contractReferenceNumber, // Contract reference number for auto-population
     } = req.body;
+
+    // If contract reference number is provided, fetch contract and auto-populate fields
+    let contractData: any = null;
+    let contractId: string | null = null;
+    
+    // Use let for fields that might be auto-populated from contract
+    let finalClientId = clientId;
+    let finalStartDate = startDate;
+    let finalEndDate = endDate;
+    let finalDescription = description;
+    
+    if (contractReferenceNumber) {
+      try {
+        const contract = await prisma.contract.findUnique({
+          where: { referenceNumber: contractReferenceNumber },
+          include: {
+            client: true,
+          },
+        });
+
+        if (contract) {
+          contractData = contract;
+          contractId = contract.id;
+          
+          // Auto-populate fields from contract if not provided
+          if (!finalClientId && contract.clientId) {
+            finalClientId = contract.clientId;
+          }
+          if (!finalStartDate && contract.startDate) {
+            finalStartDate = contract.startDate.toISOString();
+          }
+          if (!finalEndDate && contract.endDate) {
+            finalEndDate = contract.endDate.toISOString();
+          }
+          if (!finalDescription && contract.description) {
+            finalDescription = contract.description;
+          }
+        } else {
+          console.warn(`⚠️ Contract with reference number ${contractReferenceNumber} not found`);
+        }
+      } catch (contractError) {
+        console.error('Error fetching contract for auto-population:', contractError);
+        // Continue with project creation even if contract lookup fails
+      }
+    }
 
     // Validate required fields
     if (!name || !referenceNumber) {
@@ -299,13 +345,13 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
         name,
         referenceNumber,
         pin: pin || null,
-        clientId: clientId || null,
+        clientId: finalClientId || null,
         owner: owner || null,
-        description: description || null,
+        description: finalDescription || null,
         status: projectStatus,  // Use enum value, not string
         projectManagerId: projectManagerId || null,
-        startDate: startDate ? new Date(startDate) : null,
-        endDate: endDate ? new Date(endDate) : null,
+        startDate: finalStartDate ? new Date(finalStartDate) : null,
+        endDate: finalEndDate ? new Date(finalEndDate) : null,
         deadline: deadline ? new Date(deadline) : null,
         planDays: planDays ? parseInt(planDays, 10) : null,
         remarks: remarks || null,
@@ -343,9 +389,26 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
       },
     });
 
+    // Link contract to project if contract reference was provided
+    if (contractId && contractData) {
+      try {
+        await prisma.contract.update({
+          where: { id: contractId },
+          data: { projectId: project.id },
+        });
+        console.log(`✅ Contract ${contractReferenceNumber} linked to project ${project.id}`);
+      } catch (linkError) {
+        console.error('Error linking contract to project:', linkError);
+        // Don't fail project creation if contract linking fails
+      }
+    }
+
     // Log successful creation
     console.log(`✅ Project created successfully: ${project.id}`);
     console.log(`   Final Status: ${project.status}`);
+    if (contractReferenceNumber) {
+      console.log(`   Linked to Contract: ${contractReferenceNumber}`);
+    }
     
     // Verify the project was saved correctly
     const verifyProject = await prisma.project.findUnique({
@@ -354,10 +417,46 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
     });
     console.log(`   Verified in DB:`, verifyProject);
 
+    // Fetch the project with contract relation if linked
+    const projectWithContract = await prisma.project.findUnique({
+      where: { id: project.id },
+      include: {
+        client: true,
+        projectManager: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+          },
+        },
+        assignedEmployees: {
+          include: {
+            employee: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+              },
+            },
+          },
+        },
+        contracts: {
+          select: {
+            id: true,
+            referenceNumber: true,
+            title: true,
+            status: true,
+          },
+        },
+      },
+    });
+
     res.status(201).json({
       success: true,
       message: 'Project created successfully',
-      data: project,
+      data: projectWithContract || project,
     });
   } catch (error) {
     console.error('Create project error:', error);
@@ -486,26 +585,231 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
   try {
     const { id } = req.params;
 
+    console.log(`🗑️ Delete project request received for ID: ${id}`);
+
     const project = await prisma.project.findUnique({
       where: { id },
+      select: { id: true, name: true, referenceNumber: true },
     });
 
     if (!project) {
+      console.log(`❌ Project ${id} not found`);
       res.status(404).json({ success: false, message: 'Project not found' });
       return;
     }
 
-    await prisma.project.delete({
+    console.log(`📋 Deleting project: ${project.name} (${project.referenceNumber})`);
+
+    // Delete all related records first (cascade delete)
+    // Use a transaction to ensure all deletions succeed or none do
+    await prisma.$transaction(async (tx) => {
+      console.log(`🔄 Starting transaction for project ${id} deletion`);
+
+      // Get all tender IDs for this project first
+      const tenders = await tx.tender.findMany({
+        where: { projectId: id },
+        select: { id: true },
+      });
+      const tenderIds = tenders.map(t => t.id);
+      console.log(`📦 Found ${tenderIds.length} tenders to delete`);
+
+      // Delete tender invitations for all tenders in this project
+      if (tenderIds.length > 0) {
+        const deletedInvitations = await tx.tenderInvitation.deleteMany({
+          where: { tenderId: { in: tenderIds } },
+        });
+        console.log(`✅ Deleted ${deletedInvitations.count} tender invitations`);
+
+        // Delete technical submissions for all tenders
+        const deletedSubmissions = await tx.technicalSubmission.deleteMany({
+          where: { tenderId: { in: tenderIds } },
+        });
+        console.log(`✅ Deleted ${deletedSubmissions.count} technical submissions`);
+      }
+
+      // Delete project assignments
+      const deletedAssignments = await tx.projectAssignment.deleteMany({
+        where: { projectId: id },
+      });
+      console.log(`✅ Deleted ${deletedAssignments.count} project assignments`);
+
+      // Delete tasks
+      const deletedTasks = await tx.task.deleteMany({
+        where: { projectId: id },
+      });
+      console.log(`✅ Deleted ${deletedTasks.count} tasks`);
+
+      // Delete documents
+      const deletedDocuments = await tx.document.deleteMany({
+        where: { projectId: id },
+      });
+      console.log(`✅ Deleted ${deletedDocuments.count} documents`);
+
+      // Delete tenders (after deleting their related records)
+      const deletedTenders = await tx.tender.deleteMany({
+        where: { projectId: id },
+      });
+      console.log(`✅ Deleted ${deletedTenders.count} tenders`);
+
+      // Delete checklists
+      const deletedChecklists = await tx.projectChecklist.deleteMany({
+        where: { projectId: id },
+      });
+      console.log(`✅ Deleted ${deletedChecklists.count} checklists`);
+
+      // Delete attachments
+      const deletedAttachments = await tx.projectAttachment.deleteMany({
+        where: { projectId: id },
+      });
+      console.log(`✅ Deleted ${deletedAttachments.count} attachments`);
+
+      // Finally, delete the project itself
+      await tx.project.delete({
+        where: { id },
+      });
+      console.log(`✅ Project ${id} deleted`);
+    });
+
+    // Verify the project is actually deleted
+    const verifyProject = await prisma.project.findUnique({
       where: { id },
     });
+
+    if (verifyProject) {
+      console.error(`❌ CRITICAL: Project ${id} still exists after deletion!`);
+      res.status(500).json({
+        success: false,
+        message: 'Project deletion failed - project still exists in database',
+      });
+      return;
+    }
+
+    console.log(`✅ Project ${id} deleted successfully and verified`);
 
     res.json({
       success: true,
       message: 'Project deleted successfully',
     });
   } catch (error) {
-    console.error('Delete project error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
+    console.error('❌ Delete project error:', error);
+    console.error('❌ Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+    // Provide more detailed error message
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    res.status(500).json({ 
+      success: false, 
+      message: `Failed to delete project: ${errorMessage}`,
+      error: errorMessage
+    });
+  }
+};
+
+// Bulk delete projects
+export const deleteProjects = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { ids } = req.body;
+
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      res.status(400).json({ 
+        success: false, 
+        message: 'Project IDs array is required' 
+      });
+      return;
+    }
+
+    // Verify all projects exist
+    const projects = await prisma.project.findMany({
+      where: { id: { in: ids } },
+      select: { id: true },
+    });
+
+    if (projects.length !== ids.length) {
+      res.status(404).json({ 
+        success: false, 
+        message: 'Some projects not found' 
+      });
+      return;
+    }
+
+    // Delete all related records and projects in a transaction
+    const deletedCount = await prisma.$transaction(async (tx) => {
+      let totalDeleted = 0;
+
+      for (const projectId of ids) {
+        // Get all tender IDs for this project
+        const tenders = await tx.tender.findMany({
+          where: { projectId },
+          select: { id: true },
+        });
+        const tenderIds = tenders.map(t => t.id);
+
+        // Delete tender invitations
+        if (tenderIds.length > 0) {
+          await tx.tenderInvitation.deleteMany({
+            where: { tenderId: { in: tenderIds } },
+          });
+
+          // Delete technical submissions
+          await tx.technicalSubmission.deleteMany({
+            where: { tenderId: { in: tenderIds } },
+          });
+        }
+
+        // Delete project assignments
+        await tx.projectAssignment.deleteMany({
+          where: { projectId },
+        });
+
+        // Delete tasks
+        await tx.task.deleteMany({
+          where: { projectId },
+        });
+
+        // Delete documents
+        await tx.document.deleteMany({
+          where: { projectId },
+        });
+
+        // Delete tenders
+        await tx.tender.deleteMany({
+          where: { projectId },
+        });
+
+        // Delete checklists
+        await tx.projectChecklist.deleteMany({
+          where: { projectId },
+        });
+
+        // Delete attachments
+        await tx.projectAttachment.deleteMany({
+          where: { projectId },
+        });
+
+        // Delete the project
+        await tx.project.delete({
+          where: { id: projectId },
+        });
+
+        totalDeleted++;
+      }
+
+      return totalDeleted;
+    });
+
+    console.log(`✅ ${deletedCount} projects deleted successfully`);
+
+    res.json({
+      success: true,
+      message: `${deletedCount} project(s) deleted successfully`,
+      deletedCount,
+    });
+  } catch (error) {
+    console.error('❌ Bulk delete projects error:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Internal server error';
+    res.status(500).json({ 
+      success: false, 
+      message: `Failed to delete projects: ${errorMessage}`,
+      error: errorMessage
+    });
   }
 };
 

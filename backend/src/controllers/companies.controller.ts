@@ -79,6 +79,8 @@ export const getCompanyById = async (req: AuthRequest, res: Response): Promise<v
   try {
     const { id } = req.params;
 
+    console.log(`📡 Fetching company by ID: ${id}`);
+
     const company = await prisma.company.findUnique({
       where: { id },
     });
@@ -87,6 +89,19 @@ export const getCompanyById = async (req: AuthRequest, res: Response): Promise<v
       res.status(404).json({ success: false, message: 'Company not found' });
       return;
     }
+
+    console.log(`✅ Company found: ${company.name}`);
+    console.log(`📋 License fields:`, {
+      licenseCategory: company.licenseCategory,
+      legalType: company.legalType,
+      dunsNumber: company.dunsNumber,
+      registerNo: company.registerNo,
+      issueDate: company.issueDate,
+      mainLicenseNo: company.mainLicenseNo,
+      dcciNo: company.dcciNo,
+      trnNumber: company.trnNumber,
+      licenseExpiry: company.licenseExpiry
+    });
 
     res.json({
       success: true,
@@ -115,8 +130,16 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
       contactEmail,
       contactPhone,
       contactExtension,
+      licenseCategory,
+      legalType,
       licenseExpiry,
       licenseStatus,
+      dunsNumber,
+      registerNo,
+      issueDate,
+      mainLicenseNo,
+      dcciNo,
+      trnNumber,
       logo,
       header,
       footer,
@@ -132,10 +155,31 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
+    // Handle file uploads from multer
+    // Multer with .fields() returns an object with fieldname as keys
+    const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
+    const logoFile = files?.logo?.[0];
+    const headerFile = files?.header?.[0];
+    const footerFile = files?.footer?.[0];
+
+    // Get file paths if files were uploaded, otherwise use provided URLs
+    const logoPath = logoFile 
+      ? `/uploads/companies/${logoFile.filename}`
+      : (logo && typeof logo === 'string' ? logo : null);
+    const headerPath = headerFile
+      ? `/uploads/companies/${headerFile.filename}`
+      : (header && typeof header === 'string' ? header : null);
+    const footerPath = footerFile
+      ? `/uploads/companies/${footerFile.filename}`
+      : (footer && typeof footer === 'string' ? footer : null);
+
     console.log(`📝 Creating company: ${name}`);
     console.log(`   Tag: ${tag || 'N/A'}`);
     console.log(`   Status: ${status || 'ACTIVE'}`);
     console.log(`   Created By: ${req.user?.id}`);
+    console.log(`   Logo: ${logoPath || 'null'}`);
+    console.log(`   Header: ${headerPath || 'null'}`);
+    console.log(`   Footer: ${footerPath || 'null'}`);
 
     // Create company
     const company = await prisma.company.create({
@@ -150,12 +194,20 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
         contactEmail: contactEmail || null,
         contactPhone: contactPhone || null,
         contactExtension: contactExtension || null,
-        licenseExpiry: licenseExpiry ? new Date(licenseExpiry) : null,
+        licenseCategory: licenseCategory || null,
+        legalType: legalType || null,
+        licenseExpiry: licenseExpiry ? (typeof licenseExpiry === 'string' ? new Date(licenseExpiry) : licenseExpiry) : null,
         licenseStatus: (licenseStatus as LicenseStatus) || LicenseStatus.ACTIVE,
-        logo: logo || null,
-        header: header || null,
-        footer: footer || null,
-        employees: employees ? parseInt(employees, 10) : 0,
+        dunsNumber: dunsNumber || null,
+        registerNo: registerNo || null,
+        issueDate: issueDate ? (typeof issueDate === 'string' ? new Date(issueDate) : issueDate) : null,
+        mainLicenseNo: mainLicenseNo || null,
+        dcciNo: dcciNo || null,
+        trnNumber: trnNumber || null,
+        logo: logoPath,
+        header: headerPath,
+        footer: footerPath,
+        employees: employees ? (typeof employees === 'number' ? employees : parseInt(String(employees), 10)) : 0,
         createdBy: req.user?.id || null,
       },
     });
@@ -176,10 +228,25 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
       data: company,
     });
   } catch (error) {
-    console.error('Create company error:', error);
+    console.error('❌ Create company error:', error);
+    console.error('   Error details:', error instanceof Error ? error.stack : error);
+    console.error('   Request body:', JSON.stringify(req.body, null, 2));
+    
+    // More specific error messages
+    let errorMessage = 'Internal server error';
+    if (error instanceof Error) {
+      if (error.message.includes('Unique constraint')) {
+        errorMessage = 'A company with this name or tag already exists';
+      } else if (error.message.includes('Invalid value')) {
+        errorMessage = 'Invalid data provided. Please check all fields.';
+      } else {
+        errorMessage = error.message;
+      }
+    }
+    
     res.status(500).json({ 
       success: false, 
-      message: 'Internal server error',
+      message: errorMessage,
       error: error instanceof Error ? error.message : 'Unknown error'
     });
   }
@@ -193,6 +260,47 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
   try {
     const { id } = req.params;
     const updateData = req.body;
+
+    // Handle file uploads from multer
+    // Multer with .fields() returns an object with fieldname as keys
+    const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
+    const logoFile = files?.logo?.[0];
+    const headerFile = files?.header?.[0];
+    const footerFile = files?.footer?.[0];
+
+    // Update file paths if new files were uploaded
+    // If new file uploaded, use new file path; otherwise preserve existing URL from req.body
+    if (logoFile) {
+      updateData.logo = `/uploads/companies/${logoFile.filename}`;
+      console.log(`📸 Logo uploaded: ${updateData.logo}`);
+    } else if (updateData.logo && typeof updateData.logo === 'string' && updateData.logo.trim() !== '') {
+      // Keep existing logo URL if provided (from FormData or JSON)
+      updateData.logo = updateData.logo;
+      console.log(`📸 Logo preserved: ${updateData.logo}`);
+    } else {
+      // If logo field is empty string or null, don't update it (preserve existing)
+      delete updateData.logo;
+    }
+
+    if (headerFile) {
+      updateData.header = `/uploads/companies/${headerFile.filename}`;
+      console.log(`📸 Header uploaded: ${updateData.header}`);
+    } else if (updateData.header && typeof updateData.header === 'string' && updateData.header.trim() !== '') {
+      updateData.header = updateData.header;
+      console.log(`📸 Header preserved: ${updateData.header}`);
+    } else {
+      delete updateData.header;
+    }
+
+    if (footerFile) {
+      updateData.footer = `/uploads/companies/${footerFile.filename}`;
+      console.log(`📸 Footer uploaded: ${updateData.footer}`);
+    } else if (updateData.footer && typeof updateData.footer === 'string' && updateData.footer.trim() !== '') {
+      updateData.footer = updateData.footer;
+      console.log(`📸 Footer preserved: ${updateData.footer}`);
+    } else {
+      delete updateData.footer;
+    }
 
     // Convert status enums if provided
     if (updateData.status) {

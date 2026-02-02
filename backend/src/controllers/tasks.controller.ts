@@ -521,9 +521,50 @@ export const getTaskStats = async (req: AuthRequest, res: Response): Promise<voi
   try {
     const { projectId } = req.query;
 
+    // First, check if there are any projects
+    const projectCount = await prisma.project.count({});
+    
+    // If no projects exist, return all zeros
+    if (projectCount === 0) {
+      res.json({
+        success: true,
+        data: {
+          total: 0,
+          completed: 0,
+          inProgress: 0,
+          pending: 0,
+          byPriority: {},
+        },
+      });
+      return;
+    }
+
     const where: any = {};
     if (projectId) {
       where.projectId = projectId as string;
+    } else {
+      // Only count tasks that belong to existing projects
+      // This ensures orphaned tasks (without projects) are not counted
+      const existingProjects = await prisma.project.findMany({
+        select: { id: true },
+      });
+      const projectIds = existingProjects.map(p => p.id);
+      if (projectIds.length > 0) {
+        where.projectId = { in: projectIds };
+      } else {
+        // No projects, return zeros
+        res.json({
+          success: true,
+          data: {
+            total: 0,
+            completed: 0,
+            inProgress: 0,
+            pending: 0,
+            byPriority: {},
+          },
+        });
+        return;
+      }
     }
 
     // If user is not admin, filter by assigned tasks

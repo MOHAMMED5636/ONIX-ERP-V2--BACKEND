@@ -17,6 +17,12 @@ import employeeRoutes from './routes/employee.routes';
 import projectsRoutes from './routes/projects.routes';
 import tasksRoutes from './routes/tasks.routes';
 import companiesRoutes from './routes/companies.routes';
+import departmentsRoutes from './routes/departments.routes';
+import subDepartmentsRoutes from './routes/subdepartments.routes';
+import positionsRoutes from './routes/positions.routes';
+import projectChatsRoutes from './routes/projectChats.routes';
+import contractsRoutes from './routes/contracts.routes';
+import mapsRoutes from './routes/maps.routes';
 
 const app = express();
 
@@ -155,6 +161,12 @@ app.use('/api/employees', employeeRoutes);
 app.use('/api/projects', projectsRoutes);
 app.use('/api/tasks', tasksRoutes);
 app.use('/api/companies', companiesRoutes);
+app.use('/api/departments', departmentsRoutes);
+app.use('/api', subDepartmentsRoutes);
+app.use('/api', positionsRoutes);
+app.use('/api/project-chats', projectChatsRoutes);
+app.use('/api/contracts', contractsRoutes);
+app.use('/api/maps', mapsRoutes);
 
 // API root endpoint - list all available endpoints
 app.get('/api', (req, res) => {
@@ -169,6 +181,7 @@ app.get('/api', (req, res) => {
         logout: 'POST /api/auth/logout',
         profile: 'PUT /api/auth/profile',
         changePassword: 'POST /api/auth/change-password',
+        preferences: 'GET /api/auth/preferences (read), PATCH /api/auth/preferences (Admin only)',
       },
       projects: {
         list: 'GET /api/projects',
@@ -196,6 +209,7 @@ app.get('/api', (req, res) => {
       },
       clients: {
         list: 'GET /api/clients',
+        stats: 'GET /api/clients/stats',
         get: 'GET /api/clients/:id',
         create: 'POST /api/clients',
         update: 'PUT /api/clients/:id',
@@ -226,6 +240,29 @@ app.get('/api', (req, res) => {
         upload: 'POST /api/documents',
         download: 'GET /api/documents/:id/download',
         delete: 'DELETE /api/documents/:id',
+      },
+      projectChats: {
+        list: 'GET /api/project-chats',
+        get: 'GET /api/project-chats/:id',
+        getByProject: 'GET /api/project-chats/project/:projectId',
+        update: 'PUT /api/project-chats/:id',
+        delete: 'DELETE /api/project-chats/:id',
+        createMessage: 'POST /api/project-chats/:chatId/messages',
+        deleteMessage: 'DELETE /api/project-chats/messages/:messageId',
+      },
+      contracts: {
+        list: 'GET /api/contracts',
+        stats: 'GET /api/contracts/stats',
+        get: 'GET /api/contracts/:id',
+        create: 'POST /api/contracts',
+        update: 'PUT /api/contracts/:id',
+        approve: 'POST /api/contracts/:id/approve',
+        delete: 'DELETE /api/contracts/:id',
+      },
+      maps: {
+        validateMakani: 'GET /api/maps/validate-makani?makaniNumber=...',
+        getLocationFromMakani: 'GET /api/maps/makani?makaniNumber=...',
+        location: 'GET /api/maps/location?latitude=...&longitude=...',
       },
     },
     documentation: 'See API documentation for detailed endpoint information',

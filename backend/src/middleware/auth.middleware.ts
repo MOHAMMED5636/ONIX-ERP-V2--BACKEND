@@ -84,4 +84,3 @@ export const optionalAuthenticate = (req: AuthRequest, res: Response, next: Next
     next();
   }
 };
-

@@ -151,8 +151,20 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     console.log('=== LOGIN REQUEST COMPLETED ===\n');
   } catch (error) {
     console.error('❌ Login error:', error);
+    console.error('❌ Error details:', error instanceof Error ? error.message : String(error));
+    console.error('❌ Error stack:', error instanceof Error ? error.stack : 'No stack trace');
     console.log('=== LOGIN REQUEST FAILED ===\n');
-    res.status(500).json({ success: false, message: 'Internal server error' });
+    
+    // Return more detailed error in development
+    const errorMessage = process.env.NODE_ENV === 'development' 
+      ? (error instanceof Error ? error.message : 'Internal server error')
+      : 'Internal server error';
+    
+    res.status(500).json({ 
+      success: false, 
+      message: errorMessage,
+      ...(process.env.NODE_ENV === 'development' && { error: error instanceof Error ? error.stack : String(error) })
+    });
   }
 };
 

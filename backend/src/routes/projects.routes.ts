@@ -41,6 +41,7 @@ router.get('/stats', projectsController.getProjectStats);
 router.get('/:id', projectsController.getProjectById);
 router.post('/', projectsController.createProject);
 router.put('/:id', projectsController.updateProject);
+router.delete('/bulk', projectsController.deleteProjects); // Bulk delete must come before /:id
 router.delete('/:id', projectsController.deleteProject);
 
 // Project employee assignment

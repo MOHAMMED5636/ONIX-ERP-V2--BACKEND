@@ -88,9 +88,7 @@ export const getPhotoUrl = (filename: string | null | undefined): string | null 
 const documentsDir = path.join(process.cwd(), 'uploads', 'documents');
 if (!fs.existsSync(documentsDir)) {
   fs.mkdirSync(documentsDir, { recursive: true });
-}
-
-const documentsStorage = multer.diskStorage({
+}const documentsStorage = multer.diskStorage({
   destination: (req: Request, file: Express.Multer.File, cb: (error: Error | null, destination: string) => void) => {
     cb(null, documentsDir);
   },
@@ -100,9 +98,7 @@ const documentsStorage = multer.diskStorage({
     const name = path.basename(file.originalname, ext);
     cb(null, `${name}-${uniqueSuffix}${ext}`);
   }
-});
-
-// File filter for documents - allow common document types
+});// File filter for documents - allow common document types
 const documentsFileFilter = (req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
   const allowedMimes = [
     'application/pdf',
@@ -121,9 +117,7 @@ const documentsFileFilter = (req: Request, file: Express.Multer.File, cb: multer
   } else {
     cb(new Error('Invalid file type. Only PDF, Word, Excel, text, and image files are allowed.'));
   }
-};
-
-// Export documents upload middleware
+};// Export documents upload middleware
 export const upload = multer({
   storage: documentsStorage,
   limits: {
@@ -132,3 +126,161 @@ export const upload = multer({
   fileFilter: documentsFileFilter,
 });
 
+// Multiple document uploads for employee legal documents
+export const uploadLegalDocuments = multer({
+  storage: documentsStorage,
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB max file size
+    files: 10, // Max 10 files
+  },
+  fileFilter: documentsFileFilter,
+}).fields([
+  { name: 'passportAttachment', maxCount: 1 },
+  { name: 'nationalIdAttachment', maxCount: 1 },
+  { name: 'residencyAttachment', maxCount: 1 },
+  { name: 'insuranceAttachment', maxCount: 1 },
+  { name: 'drivingLicenseAttachment', maxCount: 1 },
+  { name: 'labourIdAttachment', maxCount: 1 },
+]);
+
+// Combined upload for employee: photo + legal documents in a single multer instance
+// This prevents "Unexpected end of form" errors when chaining multiple multer instances
+export const uploadEmployeeFiles = multer({
+  storage: multer.diskStorage({
+    destination: (req: Request, file: Express.Multer.File, cb: (error: Error | null, destination: string) => void) => {
+      // Route to appropriate directory based on field name
+      if (file.fieldname === 'photo') {
+        if (!fs.existsSync(uploadsDir)) {
+          fs.mkdirSync(uploadsDir, { recursive: true });
+        }
+        cb(null, uploadsDir);
+      } else {
+        // Legal documents
+        if (!fs.existsSync(documentsDir)) {
+          fs.mkdirSync(documentsDir, { recursive: true });
+        }
+        cb(null, documentsDir);
+      }
+    },
+    filename: (req: Request, file: Express.Multer.File, cb: (error: Error | null, filename: string) => void) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+      const ext = path.extname(file.originalname);
+      let name = path.basename(file.originalname, ext);
+      
+      // Sanitize filename
+      name = name.replace(/[\/\\\?\*\|"<>:]/g, '_');
+      name = name.replace(/\s+/g, '_');
+      name = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      if (name.length > 50) {
+        name = name.substring(0, 50);
+      }
+      if (!name || name.trim() === '') {
+        name = file.fieldname === 'photo' ? 'photo' : 'document';
+      }
+      
+      const finalFilename = `${name}-${uniqueSuffix}${ext}`;
+      cb(null, finalFilename);
+    }
+  }),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB max file size
+    files: 10, // Max 10 files total
+  },
+  fileFilter: (req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+    // Use photo filter for photo, documents filter for legal documents
+    if (file.fieldname === 'photo') {
+      const allowedMimes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+      if (allowedMimes.includes(file.mimetype)) {
+        cb(null, true);
+      } else {
+        cb(new Error(`Invalid file type: ${file.mimetype}. Only JPEG, PNG, GIF, and WebP images are allowed.`));
+      }
+    } else {
+      // Legal documents
+      const allowedMimes = [
+        'application/pdf',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'text/plain',
+        'image/jpeg',
+        'image/jpg',
+        'image/png',
+      ];
+      if (allowedMimes.includes(file.mimetype)) {
+        cb(null, true);
+      } else {
+        cb(new Error('Invalid file type. Only PDF, Word, Excel, text, and image files are allowed.'));
+      }
+    }
+  }
+}).fields([
+  { name: 'photo', maxCount: 1 },
+  { name: 'passportAttachment', maxCount: 1 },
+  { name: 'nationalIdAttachment', maxCount: 1 },
+  { name: 'residencyAttachment', maxCount: 1 },
+  { name: 'insuranceAttachment', maxCount: 1 },
+  { name: 'drivingLicenseAttachment', maxCount: 1 },
+  { name: 'labourIdAttachment', maxCount: 1 },
+]);
+
+// Company assets upload configuration (logo, header, footer)
+const companyAssetsDir = path.join(process.cwd(), 'uploads', 'companies');
+if (!fs.existsSync(companyAssetsDir)) {
+  fs.mkdirSync(companyAssetsDir, { recursive: true });
+}
+
+const companyAssetsStorage = multer.diskStorage({
+  destination: (req: Request, file: Express.Multer.File, cb: (error: Error | null, destination: string) => void) => {
+    cb(null, companyAssetsDir);
+  },
+  filename: (req: Request, file: Express.Multer.File, cb: (error: Error | null, filename: string) => void) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(file.originalname);
+    let name = path.basename(file.originalname, ext);
+    
+    // Sanitize filename
+    name = name.replace(/[\/\\\?\*\|"<>:]/g, '_');
+    name = name.replace(/\s+/g, '_');
+    name = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (name.length > 50) {
+      name = name.substring(0, 50);
+    }
+    if (!name || name.trim() === '') {
+      name = 'asset';
+    }
+    
+    const finalFilename = `${name}-${uniqueSuffix}${ext}`;
+    cb(null, finalFilename);
+  }
+});
+
+const companyAssetsFileFilter = (req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  const allowedMimes = [
+    'image/jpeg',
+    'image/jpg',
+    'image/png',
+    'image/gif',
+    'application/pdf'
+  ];
+  
+  if (allowedMimes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Invalid file type. Only JPEG, PNG, GIF, and PDF files are allowed.'));
+  }
+};
+
+// Export company assets upload middleware
+export const uploadCompanyAssets = multer({
+  storage: companyAssetsStorage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB max file size
+  },
+  fileFilter: companyAssetsFileFilter,
+}).fields([
+  { name: 'logo', maxCount: 1 },
+  { name: 'header', maxCount: 1 },
+  { name: 'footer', maxCount: 1 },
+]);

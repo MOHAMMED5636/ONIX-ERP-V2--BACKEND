@@ -25,7 +25,19 @@ function getLocalIPAddress(): string {
 
 const LOCAL_IP = getLocalIPAddress();
 
-const server = app.listen(PORT, HOST, () => {
+// Test database connection on startup
+async function testDatabaseConnection() {
+  try {
+    await prisma.$connect();
+    console.log('✅ Database connection successful');
+  } catch (error) {
+    console.error('❌ Database connection failed:', error);
+    console.error('   Please check your DATABASE_URL in .env file');
+    console.error('   Error details:', error instanceof Error ? error.message : String(error));
+  }
+}
+
+const server = app.listen(PORT, HOST, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 API available at http://localhost:${PORT}/api`);
   console.log(`🌐 Network API: http://${LOCAL_IP}:${PORT}/api`);
@@ -34,6 +46,9 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`\n💡 Access from other computers on your network:`);
   console.log(`   Backend: http://${LOCAL_IP}:${PORT}`);
   console.log(`   API: http://${LOCAL_IP}:${PORT}/api\n`);
+  
+  // Test database connection
+  await testDatabaseConnection();
 });
 
 // Handle server errors
@@ -55,4 +70,3 @@ process.on('SIGTERM', async () => {
     console.log('Process terminated');
   });
 });
-

@@ -40,6 +40,7 @@ export const getDashboardStats = async (userId?: string, userRole?: string): Pro
     // Count Active Projects (OPEN or IN_PROGRESS status)
     // Using Prisma enum values for type safety
     // IMPORTANT: This query counts ONLY from the projects table - no caching, no fallbacks
+    // Only projects with status OPEN or IN_PROGRESS count as active
     const activeProjects = await prisma.project.count({
       where: {
         status: {
@@ -63,11 +64,42 @@ export const getDashboardStats = async (userId?: string, userRole?: string): Pro
       }
     });
     console.log(`📊 Dashboard Stats Query - Projects by Status:`, projectsByStatus);
+    
+    // Log which projects are counted as active
+    const activeProjectsList = await prisma.project.findMany({
+      where: {
+        status: {
+          in: [ProjectStatus.OPEN, ProjectStatus.IN_PROGRESS]
+        }
+      },
+      select: {
+        id: true,
+        name: true,
+        referenceNumber: true,
+        status: true
+      }
+    });
+    console.log(`📊 Dashboard Stats Query - Active Projects List (${activeProjectsList.length}):`, 
+      activeProjectsList.map(p => `${p.referenceNumber} (${p.status})`));
+
+    // Only count tasks that belong to existing projects
+    const existingProjects = await prisma.project.findMany({
+      select: { id: true },
+    });
+    const projectIds = existingProjects.map(p => p.id);
+    
+    // Task where clause - only count tasks from existing projects
+    const taskWhere = projectIds.length > 0 ? {
+      projectId: { in: projectIds }
+    } : {
+      projectId: { in: [] } // No projects, so no tasks
+    };
 
     // Count Active Tasks (PENDING or IN_PROGRESS status)
     // Using Prisma enum values for type safety
     const activeTasks = await prisma.task.count({
       where: {
+        ...taskWhere,
         status: {
           in: [TaskStatus.PENDING, TaskStatus.IN_PROGRESS]
         }
@@ -78,13 +110,13 @@ export const getDashboardStats = async (userId?: string, userRole?: string): Pro
     // Using Prisma enum values for type safety
     const [completedTasks, pendingTasks, inProgressTasks] = await Promise.all([
       prisma.task.count({
-        where: { status: TaskStatus.COMPLETED }
+        where: { ...taskWhere, status: TaskStatus.COMPLETED }
       }),
       prisma.task.count({
-        where: { status: TaskStatus.PENDING }
+        where: { ...taskWhere, status: TaskStatus.PENDING }
       }),
       prisma.task.count({
-        where: { status: TaskStatus.IN_PROGRESS }
+        where: { ...taskWhere, status: TaskStatus.IN_PROGRESS }
       })
     ]);
 

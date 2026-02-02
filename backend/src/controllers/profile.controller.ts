@@ -99,32 +99,48 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
     console.log('   Photo in database:', user.photo);
 
     // Get photo URL - construct URL directly since we just uploaded the file
-    const host = req.get('host') || '192.168.1.54:3001';
+    const host = req.get('host') || 'localhost:3001';
     const protocol = req.protocol || 'http';
     
     // Construct photo URL directly (don't verify since we just uploaded it)
     let photoUrl: string | null = null;
     if (user.photo) {
-      // If it's already a full URL, use it
+      // If it's already a full URL, extract filename and reconstruct to ensure consistency
       if (user.photo.startsWith('http://') || user.photo.startsWith('https://')) {
-        photoUrl = user.photo;
+        // Extract filename from URL if it contains /uploads/photos/
+        if (user.photo.includes('/uploads/photos/')) {
+          const filename = user.photo.split('/uploads/photos/')[1].split('?')[0]; // Remove query params
+          photoUrl = `${protocol}://${host}/uploads/photos/${filename}`;
+        } else {
+          photoUrl = user.photo; // External URL, keep as-is
+        }
       } else {
-        // Construct full URL
+        // It's just a filename, construct full URL
         photoUrl = `${protocol}://${host}/uploads/photos/${user.photo}`;
       }
     }
     
     console.log('   Photo URL generated:', photoUrl);
+    console.log('   Photo filename in DB:', user.photo);
     
     // Verify file exists (for logging only)
     if (user.photo && photoUrl) {
       const fs = require('fs');
       const path = require('path');
-      const filePath = path.join(process.cwd(), 'uploads', 'photos', user.photo);
+      // Extract just the filename (remove any path or URL parts)
+      let filename = user.photo;
+      if (filename.includes('/uploads/photos/')) {
+        filename = filename.split('/uploads/photos/')[1].split('?')[0];
+      } else if (filename.includes('\\uploads\\photos\\')) {
+        filename = filename.split('\\uploads\\photos\\')[1];
+      }
+      const filePath = path.join(process.cwd(), 'uploads', 'photos', filename);
       const fileExists = fs.existsSync(filePath);
       console.log('   File exists check:', fileExists ? '✅ YES' : '❌ NO');
+      console.log('   Checking file at:', filePath);
       if (!fileExists) {
         console.log(`   ⚠️  Photo file not found at: ${filePath}`);
+        console.log(`   ⚠️  But will still return URL: ${photoUrl}`);
       }
     }
 

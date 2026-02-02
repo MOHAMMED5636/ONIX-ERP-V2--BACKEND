@@ -15,24 +15,92 @@ model User {
   lastName            String
   role                UserRole @default(ADMIN)
   isActive            Boolean  @default(true)
-  forcePasswordChange Boolean  @default(false)  // Force password change on first login
+  forcePasswordChange Boolean  @default(false) // Force password change on first login
   phone               String?
   department          String?
   position            String?
-  jobTitle            String?  // Job title/designation (e.g., "Senior Engineer", "Project Manager")
-  photo               String?  // Photo URL or file path
-  employeeId          String?  @unique  // Employee ID/Number
+  jobTitle            String? // Job title/designation (e.g., "Senior Engineer", "Project Manager")
+  photo               String? // Photo URL or file path
+  employeeId          String?  @unique // Employee ID/Number
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
-  createdBy           String?  // ID of admin who created this user
-  
+  createdBy           String? // ID of admin who created this user
+
+  // Employee Directory - Personal Info
+  employeeType String? // Employee type (Full-time, Part-time, Contract, etc.)
+  status       String? // Employee status (Active, Inactive, Pending, etc.)
+  userAccount  Boolean @default(false) // Whether user account should be created
+
+  // Employee Directory - Personal Details
+  gender         String? // Gender (Male, Female, Other)
+  maritalStatus  String? // Marital status (Single, Married, Divorced, Widowed)
+  nationality    String? // Nationality
+  birthday       DateTime? // Date of birth
+  childrenCount  Int? // Number of children
+  currentAddress String? // Current residential address
+
+  // Employee Directory - Contact Info (stored as JSON strings)
+  phoneNumbers   String? @db.Text // JSON array of phone numbers
+  emailAddresses String? @db.Text // JSON array of email addresses
+
+  // Employee Directory - Company Info
+  company           String? // Company name
+  companyLocation   String? // Company location/branch
+  managerId         String? // Line manager ID (references User)
+  manager           User?     @relation("LineManager", fields: [managerId], references: [id])
+  managedEmployees  User[]    @relation("LineManager") // Employees managed by this user
+  attendanceProgram String? // Attendance program name
+  joiningDate       DateTime? // Date of joining
+  exitDate          DateTime? // Date of exit/termination
+  isLineManager     Boolean   @default(false) // Whether this employee is a line manager
+
+  // Employee Directory - Legal Documents Info
+  passportNumber     String?
+  passportIssueDate  DateTime?
+  passportExpiryDate DateTime?
+  passportAttachment String? // File path/URL for passport document
+
+  nationalIdNumber     String?
+  nationalIdExpiryDate DateTime?
+  nationalIdAttachment String? // File path/URL for national ID document
+
+  residencyNumber     String?
+  residencyExpiryDate DateTime?
+  residencyAttachment String? // File path/URL for residency document
+
+  insuranceNumber     String?
+  insuranceExpiryDate DateTime?
+  insuranceAttachment String? // File path/URL for insurance document
+
+  drivingLicenseNumber     String?
+  drivingLicenseExpiryDate DateTime?
+  drivingLicenseAttachment String? // File path/URL for driving license document
+
+  labourIdNumber     String?
+  labourIdExpiryDate DateTime?
+  labourIdAttachment String? // File path/URL for labour ID document
+
+  remarks String? @db.Text // Additional remarks/notes
+
   // Relations
-  assignedTenders     TenderInvitation[] @relation("AssignedEngineer")
-  createdProjects     Project[]
-  assignedProjects    ProjectAssignment[] @relation("AssignedEmployee")
-  assignedTasks       TaskAssignment[]
-  managedProjects     Project[] @relation("ProjectManager")
-  
+  assignedTenders  TenderInvitation[]  @relation("AssignedEngineer")
+  createdProjects  Project[]
+  assignedProjects ProjectAssignment[] @relation("AssignedEmployee")
+  assignedTasks    TaskAssignment[]
+  managedProjects  Project[]           @relation("ProjectManager")
+
+  // HR Relations
+  managedDepartments    Department[]    @relation("DepartmentManager")
+  managedSubDepartments SubDepartment[] @relation("SubDepartmentManager")
+  managedPositions      Position[]      @relation("PositionManager")
+
+  // Chat Relations
+  sentMessages ProjectMessage[] @relation("MessageSender")
+
+  // Contract Relations
+  createdContracts  Contract[] @relation("ContractCreator")
+  approvedContracts Contract[] @relation("ContractApprover")
+
   @@map("users")
 }
 
@@ -46,60 +114,69 @@ enum UserRole {
 }
 
 model Client {
-  id              String   @id @default(uuid())
-  referenceNumber String   @unique
+  id              String    @id @default(uuid())
+  referenceNumber String    @unique
   name            String
-  isCorporate     String   // "Person" or "Company"
+  isCorporate     String // "Person" or "Company"
   leadSource      String?
   rank            String?
   email           String?
   phone           String?
-  address         String?
+  address         String?   @db.Text
   nationality     String?
   idNumber        String?
+  idExpiryDate    DateTime? // ID expiry date
   passportNumber  String?
   birthDate       DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  
+
+  // Document upload fields
+  documentType       String? // Document Type / Category
+  documentAttachment String? // File path/URL for uploaded document
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   // Relations
-  projects        Project[]
-  tenders         Tender[]
-  
+  projects  Project[]
+  tenders   Tender[]
+  contracts Contract[]
+
   @@map("clients")
 }
 
 model Project {
-  id              String   @id @default(uuid())
-  name            String
-  referenceNumber String   @unique
-  pin             String?  @unique // Project Identification Number
-  clientId        String?
-  client          Client?  @relation(fields: [clientId], references: [id])
-  owner           String?
-  description     String?
-  status          ProjectStatus @default(OPEN)
+  id               String        @id @default(uuid())
+  name             String
+  referenceNumber  String        @unique
+  pin              String?       @unique // Project Identification Number
+  clientId         String?
+  client           Client?       @relation(fields: [clientId], references: [id])
+  owner            String?
+  description      String?
+  status           ProjectStatus @default(OPEN)
   projectManagerId String?
-  projectManager  User?    @relation("ProjectManager", fields: [projectManagerId], references: [id])
-  startDate       DateTime?
-  endDate         DateTime?
-  deadline        DateTime?
-  planDays        Int?     // Planned duration in days
-  remarks         String?  // General remarks
-  assigneeNotes   String?  // Notes from assignee
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  
+  projectManager   User?         @relation("ProjectManager", fields: [projectManagerId], references: [id])
+  startDate        DateTime?
+  endDate          DateTime?
+  deadline         DateTime?
+  planDays         Int? // Planned duration in days
+  remarks          String? // General remarks
+  assigneeNotes    String? // Notes from assignee
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
   // Relations
-  createdBy       String?
-  creator         User?    @relation(fields: [createdBy], references: [id])
-  tenders         Tender[]
-  documents       Document[]
+  createdBy         String?
+  creator           User?               @relation(fields: [createdBy], references: [id])
+  tenders           Tender[]
+  documents         Document[]
   assignedEmployees ProjectAssignment[] @relation("ProjectAssignments")
-  tasks           Task[]
-  checklists      ProjectChecklist[]
-  attachments     ProjectAttachment[]
-  
+  tasks             Task[]
+  checklists        ProjectChecklist[]
+  attachments       ProjectAttachment[]
+  chats             ProjectChat[]
+  contracts         Contract[]
+
   @@map("projects")
 }
 
@@ -113,34 +190,34 @@ enum ProjectStatus {
 }
 
 model Tender {
-  id                      String   @id @default(uuid())
-  projectId               String
-  project                 Project  @relation(fields: [projectId], references: [id])
-  name                    String
-  referenceNumber         String   @unique
-  clientId                String?
-  client                  Client?  @relation(fields: [clientId], references: [id])
-  status                  TenderStatus @default(OPEN)
-  
+  id              String       @id @default(uuid())
+  projectId       String
+  project         Project      @relation(fields: [projectId], references: [id])
+  name            String
+  referenceNumber String       @unique
+  clientId        String?
+  client          Client?      @relation(fields: [clientId], references: [id])
+  status          TenderStatus @default(OPEN)
+
   // Tender Details
-  scopeOfWork             String?
-  technicalDrawingsLink   String?
-  hasInvitationFees       Boolean  @default(false)
-  invitationFeeAmount     Decimal? @db.Decimal(10, 2)
+  scopeOfWork              String?
+  technicalDrawingsLink    String?
+  hasInvitationFees        Boolean   @default(false)
+  invitationFeeAmount      Decimal?  @db.Decimal(10, 2)
   tenderAcceptanceDeadline DateTime?
-  bidSubmissionDeadline  DateTime?
-  additionalNotes         String?
-  
+  bidSubmissionDeadline    DateTime?
+  additionalNotes          String?
+
   // Attachment
-  attachmentFile          String?  // File path or URL
-  
-  createdAt               DateTime @default(now())
-  updatedAt               DateTime @updatedAt
-  
+  attachmentFile String? // File path or URL
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   // Relations
-  invitations             TenderInvitation[]
-  technicalSubmissions    TechnicalSubmission[]
-  
+  invitations          TenderInvitation[]
+  technicalSubmissions TechnicalSubmission[]
+
   @@map("tenders")
 }
 
@@ -153,16 +230,16 @@ enum TenderStatus {
 }
 
 model TenderInvitation {
-  id              String   @id @default(uuid())
+  id              String           @id @default(uuid())
   tenderId        String
-  tender          Tender   @relation(fields: [tenderId], references: [id])
+  tender          Tender           @relation(fields: [tenderId], references: [id])
   engineerId      String
-  engineer        User     @relation("AssignedEngineer", fields: [engineerId], references: [id])
-  invitationToken String  @unique
+  engineer        User             @relation("AssignedEngineer", fields: [engineerId], references: [id])
+  invitationToken String           @unique
   status          InvitationStatus @default(PENDING)
-  assignedAt      DateTime @default(now())
+  assignedAt      DateTime         @default(now())
   acceptedAt      DateTime?
-  
+
   @@map("tender_invitations")
 }
 
@@ -174,16 +251,16 @@ enum InvitationStatus {
 }
 
 model TechnicalSubmission {
-  id              String   @id @default(uuid())
-  tenderId        String
-  tender          Tender   @relation(fields: [tenderId], references: [id])
-  engineerId      String
-  submittedAt     DateTime @default(now())
-  status          SubmissionStatus @default(SUBMITTED)
-  
+  id          String           @id @default(uuid())
+  tenderId    String
+  tender      Tender           @relation(fields: [tenderId], references: [id])
+  engineerId  String
+  submittedAt DateTime         @default(now())
+  status      SubmissionStatus @default(SUBMITTED)
+
   // Relations
-  documents       Document[]
-  
+  documents Document[]
+
   @@map("technical_submissions")
 }
 
@@ -195,71 +272,71 @@ enum SubmissionStatus {
 }
 
 model Document {
-  id              String   @id @default(uuid())
-  module          String   // "PRJ", "HR", "CLI", "FIN", "GEN"
-  entityCode      String   // Reference number
-  documentType    String   // "CNTR", "DRW", "RPT", etc.
-  year            Int
-  sequence        String
-  referenceCode   String   @unique
-  fileName        String
-  filePath        String
-  fileUrl         String?
-  fileSize        Int
-  mimeType        String
-  
+  id            String  @id @default(uuid())
+  module        String // "PRJ", "HR", "CLI", "FIN", "GEN"
+  entityCode    String // Reference number
+  documentType  String // "CNTR", "DRW", "RPT", etc.
+  year          Int
+  sequence      String
+  referenceCode String  @unique
+  fileName      String
+  filePath      String
+  fileUrl       String?
+  fileSize      Int
+  mimeType      String
+
   // Relations
-  projectId       String?
-  project         Project? @relation(fields: [projectId], references: [id])
-  submissionId   String?
-  submission      TechnicalSubmission? @relation(fields: [submissionId], references: [id])
-  
-  uploadedBy     String?
-  uploadedAt     DateTime @default(now())
-  
+  projectId    String?
+  project      Project?             @relation(fields: [projectId], references: [id])
+  submissionId String?
+  submission   TechnicalSubmission? @relation(fields: [submissionId], references: [id])
+
+  uploadedBy String?
+  uploadedAt DateTime @default(now())
+
   @@map("documents")
 }
 
 // Project Assignment - Links employees to projects
 model ProjectAssignment {
-  id          String   @id @default(uuid())
-  projectId   String
-  project     Project  @relation("ProjectAssignments", fields: [projectId], references: [id], onDelete: Cascade)
-  employeeId  String
-  employee    User     @relation("AssignedEmployee", fields: [employeeId], references: [id], onDelete: Cascade)
-  assignedAt  DateTime @default(now())
-  assignedBy  String?  // Admin/HR who assigned
-  role        String?  // Role in project (e.g., "Engineer", "Manager", "Supervisor")
-  
+  id         String   @id @default(uuid())
+  projectId  String
+  project    Project  @relation("ProjectAssignments", fields: [projectId], references: [id], onDelete: Cascade)
+  employeeId String
+  employee   User     @relation("AssignedEmployee", fields: [employeeId], references: [id], onDelete: Cascade)
+  assignedAt DateTime @default(now())
+  assignedBy String? // Admin/HR who assigned
+  role       String? // Role in project (e.g., "Engineer", "Manager", "Supervisor")
+
   @@unique([projectId, employeeId])
   @@map("project_assignments")
 }
 
 // Task Model
 model Task {
-  id              String   @id @default(uuid())
-  title           String
-  description     String?
-  projectId       String
-  project         Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  status          TaskStatus @default(PENDING)
-  priority        TaskPriority @default(MEDIUM)
-  startDate       DateTime?
-  dueDate         DateTime?
-  completedAt     DateTime?
-  estimatedHours  Decimal? @db.Decimal(10, 2)
-  actualHours     Decimal? @db.Decimal(10, 2)
-  tags            String[] // Array of tags
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  createdBy       String?
-  
+  id             String       @id @default(uuid())
+  title          String
+  description    String?
+  projectId      String
+  project        Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  status         TaskStatus   @default(PENDING)
+  priority       TaskPriority @default(MEDIUM)
+  startDate      DateTime?
+  dueDate        DateTime?
+  completedAt    DateTime?
+  estimatedHours Decimal?     @db.Decimal(10, 2)
+  actualHours    Decimal?     @db.Decimal(10, 2)
+  tags           String[] // Array of tags
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  createdBy      String?
+
   // Relations
-  assignments     TaskAssignment[]
-  checklists      TaskChecklist[]
-  attachments     TaskAttachment[]
-  comments        TaskComment[]
-  
+  assignments TaskAssignment[]
+  checklists  TaskChecklist[]
+  attachments TaskAttachment[]
+  comments    TaskComment[]
+
   @@map("tasks")
 }
 
@@ -280,15 +357,15 @@ enum TaskPriority {
 
 // Task Assignment - Links employees to tasks
 model TaskAssignment {
-  id          String   @id @default(uuid())
-  taskId      String
-  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
-  employeeId  String
-  employee    User     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-  assignedAt  DateTime @default(now())
-  assignedBy  String?
-  status      TaskAssignmentStatus @default(PENDING)
-  
+  id         String               @id @default(uuid())
+  taskId     String
+  task       Task                 @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  employeeId String
+  employee   User                 @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  assignedAt DateTime             @default(now())
+  assignedBy String?
+  status     TaskAssignmentStatus @default(PENDING)
+
   @@unique([taskId, employeeId])
   @@map("task_assignments")
 }
@@ -302,117 +379,155 @@ enum TaskAssignmentStatus {
 
 // Project Checklist
 model ProjectChecklist {
-  id          String   @id @default(uuid())
+  id          String    @id @default(uuid())
   projectId   String
-  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
   title       String
   description String?
-  isCompleted Boolean  @default(false)
+  isCompleted Boolean   @default(false)
   completedAt DateTime?
   completedBy String?
-  order       Int      @default(0)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
+  order       Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
   @@map("project_checklists")
 }
 
 // Task Checklist
 model TaskChecklist {
-  id          String   @id @default(uuid())
+  id          String    @id @default(uuid())
   taskId      String
-  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  task        Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
   title       String
-  isCompleted Boolean  @default(false)
+  isCompleted Boolean   @default(false)
   completedAt DateTime?
   completedBy String?
-  order       Int      @default(0)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
+  order       Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
   @@map("task_checklists")
 }
 
 // Project Attachment
 model ProjectAttachment {
-  id          String   @id @default(uuid())
-  projectId   String
-  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  fileName    String
-  filePath    String
-  fileUrl     String?
-  fileSize    Int
-  mimeType    String
-  uploadedBy  String?
-  uploadedAt  DateTime @default(now())
-  
+  id         String   @id @default(uuid())
+  projectId  String
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  fileName   String
+  filePath   String
+  fileUrl    String?
+  fileSize   Int
+  mimeType   String
+  uploadedBy String?
+  uploadedAt DateTime @default(now())
+
   @@map("project_attachments")
 }
 
 // Task Attachment
 model TaskAttachment {
-  id          String   @id @default(uuid())
-  taskId      String
-  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
-  fileName    String
-  filePath    String
-  fileUrl     String?
-  fileSize    Int
-  mimeType    String
-  uploadedBy  String?
-  uploadedAt  DateTime @default(now())
-  
+  id         String   @id @default(uuid())
+  taskId     String
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  fileName   String
+  filePath   String
+  fileUrl    String?
+  fileSize   Int
+  mimeType   String
+  uploadedBy String?
+  uploadedAt DateTime @default(now())
+
   @@map("task_attachments")
 }
 
 // Task Comment
 model TaskComment {
-  id          String   @id @default(uuid())
-  taskId      String
-  task        Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
-  content     String
-  createdBy   String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
+  id        String   @id @default(uuid())
+  taskId    String
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  content   String
+  createdBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@map("task_comments")
 }
 
 // Company Model - For managing multiple companies/entities
 model Company {
-  id              String   @id @default(uuid())
-  name            String
-  tag             String?  // Company tag/abbreviation (e.g., "ONIX", "TECH")
-  address         String?
-  industry        String?
-  founded         String?  // Year founded
-  status          CompanyStatus @default(ACTIVE)
-  
+  id       String        @id @default(uuid())
+  name     String
+  tag      String? // Company tag/abbreviation (e.g., "ONIX", "TECH")
+  address  String?
+  industry String?
+  founded  String? // Year founded
+  status   CompanyStatus @default(ACTIVE)
+
   // Contact Information
-  contactName     String?
-  contactEmail    String?
-  contactPhone    String?
+  contactName      String?
+  contactEmail     String?
+  contactPhone     String?
   contactExtension String?
-  
+
   // License Information
+  licenseCategory String? // License category (e.g., Commercial, Industrial, Professional)
+  legalType       String? // Legal structure (e.g., LLC, Corporation, Partnership)
   licenseExpiry   DateTime?
   licenseStatus   LicenseStatus @default(ACTIVE)
-  
+  dunsNumber      String? // D&B D-U-N-S Number
+  registerNo      String? // Registration Number
+  issueDate       DateTime? // License issue date
+  mainLicenseNo   String? // Main License Number
+  dcciNo          String? // DCCI Dubai Chamber number
+  trnNumber       String? // TRN (Tax Registration Number) / ESBN
+
   // Branding
-  logo            String?  // Logo file path or URL
-  header          String?  // Header file path or URL
-  footer          String?  // Footer file path or URL
-  
+  logo   String? // Logo file path or URL
+  header String? // Header file path or URL
+  footer String? // Footer file path or URL
+
+  // Customization / Preferences (Organization-level; applied app-wide)
+  // All numeric values are stored in base units (sqm, meter, m³, AED). Conversion at display/calculation only.
+  defaultCurrency String?  @default("AED")  // Display currency: AED, USD, EUR, INR, SAR (extensible)
+  lengthUnit      String?  @default("meter") // meter | feet
+  areaUnit        String?  @default("sqm")   // sqm | sqft
+  volumeUnit      String?  @default("m3")    // m3 | ft3
+  heightUnit      String?  @default("meter") // meter | feet
+  weightUnit      String?  @default("kg")    // kg | ton (optional)
+
   // Statistics
-  employees       Int      @default(0)
-  
+  employees Int @default(0)
+
   // Metadata
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  createdBy       String?
-  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  createdBy String?
+
+  // Relations
+  departments Department[]
+
   @@map("companies")
 }
+
+// Organization-wide preferences (Admin Profile). Singleton: one row. Decoupled from Company.
+// All numeric values stored in base units (sqm, meter, m³, AED). Conversion at display/calculation only.
+model OrganizationPreferences {
+  id              String   @id @default(uuid())
+  defaultCurrency String   @default("AED")  // AED, USD, EUR, INR, SAR
+  lengthUnit      String   @default("meter") // meter | feet
+  areaUnit        String   @default("sqm")   // sqm | sqft
+  volumeUnit      String   @default("m3")    // m3 | ft3
+  heightUnit      String   @default("meter") // meter | feet
+  weightUnit      String   @default("kg")    // kg | ton
+  updatedAt       DateTime @updatedAt
+  updatedBy       String?  // Admin who last updated
+
+  @@map("organization_preferences")
+}
+
+// Note: SubDepartment and Position models are defined after DepartmentStatus enum
 
 enum CompanyStatus {
   ACTIVE
@@ -428,3 +543,210 @@ enum LicenseStatus {
   SUSPENDED
 }
 
+// Department Model - Belongs to a Company
+model Department {
+  id          String           @id @default(uuid())
+  companyId   String
+  company     Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  status      DepartmentStatus @default(ACTIVE)
+  managerId   String? // User ID of department manager
+  manager     User?            @relation("DepartmentManager", fields: [managerId], references: [id])
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  // Relations
+  subDepartments SubDepartment[]
+
+  @@map("departments")
+}
+
+enum DepartmentStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// SubDepartment Model - Belongs to a Department
+model SubDepartment {
+  id           String              @id @default(uuid())
+  departmentId String
+  department   Department          @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  name         String
+  description  String?
+  status       SubDepartmentStatus @default(ACTIVE)
+  managerId    String? // User ID of sub-department manager
+  manager      User?               @relation("SubDepartmentManager", fields: [managerId], references: [id])
+  location     String?
+  budget       String? // Budget as string (e.g., "$500,000")
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  // Relations
+  positions Position[]
+
+  @@map("sub_departments")
+}
+
+enum SubDepartmentStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// Position Model - Belongs to a SubDepartment
+model Position {
+  id              String         @id @default(uuid())
+  subDepartmentId String
+  subDepartment   SubDepartment  @relation(fields: [subDepartmentId], references: [id], onDelete: Cascade)
+  name            String
+  description     String?
+  status          PositionStatus @default(ACTIVE)
+  managerId       String? // User ID of position manager
+  manager         User?          @relation("PositionManager", fields: [managerId], references: [id])
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@map("positions")
+}
+
+enum PositionStatus {
+  ACTIVE
+  INACTIVE
+}
+
+// Project Chat Model - Represents a chat conversation for a project
+model ProjectChat {
+  id        String   @id @default(uuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title     String? // Optional chat title (defaults to project name)
+  isActive  Boolean  @default(true) // Whether the chat is active
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  messages ProjectMessage[]
+
+  @@map("project_chats")
+}
+
+// Project Message Model - Represents individual messages in a project chat
+model ProjectMessage {
+  id        String      @id @default(uuid())
+  chatId    String
+  chat      ProjectChat @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  senderId  String? // User ID who sent the message
+  sender    User?       @relation("MessageSender", fields: [senderId], references: [id])
+  content   String      @db.Text // Message content
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  @@map("project_messages")
+}
+
+// Contract Model - Represents contracts for projects
+model Contract {
+  id              String   @id @default(uuid())
+  referenceNumber String   @unique
+  projectId       String?
+  project         Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  clientId        String?
+  client          Client?  @relation(fields: [clientId], references: [id], onDelete: SetNull)
+
+  // Contract Details
+  title            String
+  description      String?        @db.Text
+  contractType     String? // e.g., "Service", "Construction", "Consulting", "Maintenance"
+  contractCategory String? // Contract category from dropdown
+  status           ContractStatus @default(DRAFT)
+
+  // Project Nature - Multi-select (stored as JSON array)
+  projectNature String? @db.Text // JSON array: ["Interior Project", "Exterior Project", etc.]
+
+  // Company
+  companyId   String? // Reference to Company model if exists
+  companyName String? // Company name if not linked
+
+  // Multiple Clients (stored as JSON array of client IDs)
+  selectedClients String? @db.Text // JSON array of client IDs
+
+  // Dates
+  startDate  DateTime?
+  endDate    DateTime?
+  signedDate DateTime? // Date when contract was signed
+  expiryDate DateTime? // Contract expiry date
+
+  // Location Details
+  makaniNumber   String? // Makani number (UAE addressing system - 10 digits)
+  latitude       Decimal? @db.Decimal(10, 7) // Location latitude
+  longitude      Decimal? @db.Decimal(10, 7) // Location longitude
+  region         String? // Region/Area
+  plotNumber     String? // Plot number
+  community      String? // Community name
+  numberOfFloors Int? // Number of floors
+
+  // Building Details
+  buildingCost     Decimal? @db.Decimal(15, 2) // Building cost
+  builtUpArea      Decimal? @db.Decimal(15, 2) // Built up area in sq ft
+  buildingHeight   Decimal? @db.Decimal(10, 2) // Building height in meters
+  structuralSystem String? // Structural system type
+  buildingType     String? // Building type
+
+  // Authority & Community
+  authorityApprovalStatus   String? // Approval status: "Pending", "Approved", "Rejected", "Under Review"
+  developerName             String? // Developer name
+  authorityApprovalRequired Boolean @default(false) // Whether authority approval is required
+
+  // Financial Details
+  contractValue Decimal? @db.Decimal(15, 2) // Total contract value
+  currency      String?  @default("AED") // Currency code
+  paymentTerms  String?  @db.Text // Payment terms and conditions
+
+  // Contract Fees (stored as JSON array)
+  contractFees String? @db.Text // JSON array of fee objects: [{name, type, amount, calculatedAmount, period, dueDate}]
+
+  // Payment Schedule
+  paymentScheduleType String? // "Standard" or "Custom"
+  totalAmount         Decimal? @db.Decimal(15, 2) // Total amount
+  installments        Int? // Number of installments
+  perInstallment      Decimal? @db.Decimal(15, 2) // Amount per installment
+  generateInvoice     Boolean  @default(false) // Whether to generate invoice
+
+  // Parties
+  contractorName    String? // Contractor/Service provider name
+  contractorContact String? @db.Text // Contractor contact information
+  clientName        String? // Client name (if not linked to Client model)
+  clientContact     String? @db.Text // Client contact information
+
+  // Legal & Terms
+  termsAndConditions String? @db.Text // Terms and conditions
+  specialClauses     String? @db.Text // Special clauses or notes
+  renewalTerms       String? @db.Text // Renewal terms
+
+  // Documents
+  contractDocument String? // File path/URL for contract document
+  attachments      String? @db.Text // JSON array of attachment paths
+
+  // Metadata
+  createdBy  String?
+  creator    User?     @relation("ContractCreator", fields: [createdBy], references: [id])
+  approvedBy String?
+  approver   User?     @relation("ContractApprover", fields: [approvedBy], references: [id])
+  approvedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("contracts")
+}
+
+enum ContractStatus {
+  DRAFT
+  PENDING_REVIEW
+  PENDING_SIGNATURE
+  ACTIVE
+  EXPIRED
+  TERMINATED
+  CANCELLED
+  COMPLETED
+}

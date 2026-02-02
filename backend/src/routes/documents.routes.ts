@@ -10,8 +10,12 @@ router.use(authenticate);
 
 // Upload routes must come before /:id routes to avoid conflicts
 // Upload a new document - support both /upload and root POST
+// Accept both 'file' and 'document' field names
 router.post('/upload', (req, res, next) => {
-  upload.single('file')(req, res, (err) => {
+  upload.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'document', maxCount: 1 }
+  ])(req, res, (err) => {
     if (err) {
       console.error('❌ Document upload multer error:', err);
       res.status(400).json({
@@ -20,12 +24,18 @@ router.post('/upload', (req, res, next) => {
       });
       return;
     }
+    // Normalize the file to req.file for backward compatibility
+    const files = (req as any).files || {};
+    (req as any).file = files.file?.[0] || files.document?.[0] || null;
     next();
   });
 }, documentsController.uploadDocument);
 
 router.post('/', (req, res, next) => {
-  upload.single('file')(req, res, (err) => {
+  upload.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'document', maxCount: 1 }
+  ])(req, res, (err) => {
     if (err) {
       console.error('❌ Document upload multer error:', err);
       res.status(400).json({
@@ -34,6 +44,9 @@ router.post('/', (req, res, next) => {
       });
       return;
     }
+    // Normalize the file to req.file for backward compatibility
+    const files = (req as any).files || {};
+    (req as any).file = files.file?.[0] || files.document?.[0] || null;
     next();
   });
 }, documentsController.uploadDocument);
