@@ -414,6 +414,7 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
     console.log('📝 Request files:', req.files ? Object.keys(req.files) : 'No files');
     console.log('📝 Request file (single):', req.file ? req.file.filename : 'No single file');
     console.log('📝 Content-Type:', req.headers['content-type']);
+    console.log('📝 Project Manager Name from request:', req.body?.projectManagerName);
     console.log('📝 User authentication:', {
       hasUser: !!req.user,
       userId: req.user?.id,
@@ -958,6 +959,8 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
 
       console.log('✅ Contract created successfully:', contract.referenceNumber);
       console.log('✅ Contract ID:', contract.id);
+      console.log('✅ Project Manager saved:', contract.projectManager);
+      console.log('✅ Project Manager Name from request was:', projectManagerName);
 
       res.status(201).json({
         success: true,
@@ -1650,8 +1653,17 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // Generate unique project reference number
-    const generateProjectRef = async (): Promise<string> => {
+    // Use contract reference number as project reference number
+    // Check if a project with this reference number already exists
+    const existingProjectWithRef = await prisma.project.findUnique({
+      where: { referenceNumber: contract.referenceNumber },
+    });
+
+    let projectReferenceNumber: string;
+
+    if (existingProjectWithRef) {
+      // If project already exists with this reference number, generate a unique one
+      // This shouldn't happen normally, but handle it gracefully
       const prefix = 'PRJ-';
       let referenceNumber: string;
       let exists = true;
@@ -1659,11 +1671,9 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
       const maxAttempts = 100;
 
       while (exists && attempts < maxAttempts) {
-        // Generate a random alphanumeric string (8 characters)
         const randomPart = Math.random().toString(36).substring(2, 10).toUpperCase();
         referenceNumber = `${prefix}${randomPart}`;
 
-        // Check if it already exists
         const existing = await prisma.project.findUnique({
           where: { referenceNumber },
         });
@@ -1675,15 +1685,16 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
       }
 
       if (attempts >= maxAttempts) {
-        // Fallback: use timestamp-based reference
         const timestamp = Date.now().toString(36).toUpperCase();
         referenceNumber = `${prefix}${timestamp}`;
       }
 
-      return referenceNumber!;
-    };
-
-    const projectReferenceNumber = await generateProjectRef();
+      projectReferenceNumber = referenceNumber!;
+      console.warn(`⚠️ Project with reference number ${contract.referenceNumber} already exists. Using generated reference: ${projectReferenceNumber}`);
+    } else {
+      // Use contract reference number as project reference number
+      projectReferenceNumber = contract.referenceNumber;
+    }
 
     // Calculate plan days from contract dates if available
     let planDays: number | null = null;

@@ -57,7 +57,35 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
         orderBy: {
           [sortBy as string]: sortOrder as 'asc' | 'desc',
         },
-        include: {
+        select: {
+          // Include all base fields including projectManager
+          id: true,
+          name: true,
+          referenceNumber: true,
+          pin: true,
+          clientId: true,
+          owner: true,
+          description: true,
+          status: true,
+          projectManager: true, // Explicitly include projectManager field
+          startDate: true,
+          endDate: true,
+          deadline: true,
+          planDays: true,
+          remarks: true,
+          assigneeNotes: true,
+          createdAt: true,
+          updatedAt: true,
+          createdBy: true,
+          // Location fields
+          location: true,
+          makaniNumber: true,
+          plotNumber: true,
+          community: true,
+          projectType: true,
+          projectFloor: true,
+          developerProject: true,
+          // Relations
           client: {
             select: {
               id: true,
@@ -96,6 +124,11 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               endDate: true,
               contractValue: true,
               currency: true,
+              plotNumber: true,
+              community: true,
+              numberOfFloors: true,
+              makaniNumber: true,
+              developerName: true,
             },
             orderBy: {
               createdAt: 'desc',
