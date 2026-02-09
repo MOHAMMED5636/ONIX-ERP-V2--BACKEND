@@ -9,7 +9,7 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
     const { 
       status, 
       clientId, 
-      projectManagerId, 
+      projectManager, // Text search filter (not projectManagerId)
       search,
       page = '1',
       limit = '10',
@@ -31,8 +31,9 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
       where.clientId = clientId;
     }
 
-    if (projectManagerId) {
-      where.projectManagerId = projectManagerId;
+    // Filter by project manager name (text search)
+    if (projectManager) {
+      where.projectManager = { contains: projectManager as string, mode: 'insensitive' };
     }
 
     if (search) {
@@ -40,7 +41,12 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
         { name: { contains: search as string, mode: 'insensitive' } },
         { referenceNumber: { contains: search as string, mode: 'insensitive' } },
         { pin: { contains: search as string, mode: 'insensitive' } },
+        { projectManager: { contains: search as string, mode: 'insensitive' } }, // Include projectManager in search
       ];
+    }
+
+    if (req.user?.role === 'EMPLOYEE') {
+      where.assignedEmployees = { some: { employeeId: req.user.id } };
     }
 
     const [projects, total] = await Promise.all([
@@ -58,14 +64,6 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               name: true,
               email: true,
               phone: true,
-            },
-          },
-          projectManager: {
-            select: {
-              id: true,
-              firstName: true,
-              lastName: true,
-              email: true,
             },
           },
           creator: {
@@ -87,11 +85,28 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               },
             },
           },
+          contracts: {
+            select: {
+              id: true,
+              referenceNumber: true,
+              title: true,
+              status: true,
+              contractType: true,
+              startDate: true,
+              endDate: true,
+              contractValue: true,
+              currency: true,
+            },
+            orderBy: {
+              createdAt: 'desc',
+            },
+          },
           _count: {
             select: {
               tasks: true,
               documents: true,
               tenders: true,
+              contracts: true,
             },
           },
         },
@@ -124,15 +139,6 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
       where: { id },
       include: {
         client: true,
-        projectManager: {
-          select: {
-            id: true,
-            firstName: true,
-            lastName: true,
-            email: true,
-            phone: true,
-          },
-        },
         creator: {
           select: {
             id: true,
@@ -200,6 +206,27 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
             status: true,
           },
         },
+        contracts: {
+          select: {
+            id: true,
+            referenceNumber: true,
+            title: true,
+            status: true,
+            contractType: true,
+            startDate: true,
+            endDate: true,
+            contractValue: true,
+            currency: true,
+            developerName: true,
+            plotNumber: true,
+            community: true,
+            numberOfFloors: true,
+            makaniNumber: true,
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+        },
         _count: {
           select: {
             tasks: true,
@@ -207,6 +234,7 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
             tenders: true,
             checklists: true,
             attachments: true,
+            contracts: true,
           },
         },
       },
@@ -215,6 +243,14 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
     if (!project) {
       res.status(404).json({ success: false, message: 'Project not found' });
       return;
+    }
+
+    if (req.user?.role === 'EMPLOYEE') {
+      const isAssigned = project.assignedEmployees?.some((a: { employeeId: string }) => a.employeeId === req.user!.id);
+      if (!isAssigned) {
+        res.status(403).json({ success: false, message: 'You do not have access to this project' });
+        return;
+      }
     }
 
     res.json({
@@ -230,6 +266,16 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
 // Create new project
 export const createProject = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Employee role: Cannot create projects
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to create projects. Please contact your manager.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
     const {
       name,
       referenceNumber,
@@ -238,7 +284,7 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
       owner,
       description,
       status,
-      projectManagerId,
+      projectManager, // Plain text string (not projectManagerId)
       startDate,
       endDate,
       deadline,
@@ -247,6 +293,14 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
       assigneeNotes,
       employeeIds, // Array of employee IDs to assign
       contractReferenceNumber, // Contract reference number for auto-population
+      // Location & Project Details
+      location,
+      makaniNumber,
+      plotNumber,
+      community,
+      projectType,
+      projectFloor,
+      developerProject,
     } = req.body;
 
     // If contract reference number is provided, fetch contract and auto-populate fields
@@ -258,6 +312,13 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
     let finalStartDate = startDate;
     let finalEndDate = endDate;
     let finalDescription = description;
+    let finalLocation = location;
+    let finalMakaniNumber = makaniNumber;
+    let finalPlotNumber = plotNumber;
+    let finalCommunity = community;
+    let finalProjectType = projectType;
+    let finalProjectFloor = projectFloor;
+    let finalDeveloperProject = developerProject;
     
     if (contractReferenceNumber) {
       try {
@@ -285,6 +346,33 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
           if (!finalDescription && contract.description) {
             finalDescription = contract.description;
           }
+          // Auto-populate location fields from contract if not provided
+          if (!finalMakaniNumber && contract.makaniNumber) {
+            finalMakaniNumber = contract.makaniNumber;
+          }
+          if (!finalPlotNumber && contract.plotNumber) {
+            finalPlotNumber = contract.plotNumber;
+          }
+          if (!finalCommunity && contract.community) {
+            finalCommunity = contract.community;
+          }
+          if (!finalProjectType && contract.contractType) {
+            finalProjectType = contract.contractType;
+          }
+          if (!finalProjectFloor && contract.numberOfFloors) {
+            finalProjectFloor = contract.numberOfFloors.toString();
+          }
+          if (!finalDeveloperProject && contract.developerName) {
+            finalDeveloperProject = contract.developerName;
+          }
+          // Build location string from coordinates or makani number
+          if (!finalLocation) {
+            if (contract.makaniNumber) {
+              finalLocation = contract.makaniNumber;
+            } else if (contract.latitude && contract.longitude) {
+              finalLocation = `${contract.latitude}, ${contract.longitude}`;
+            }
+          }
         } else {
           console.warn(`⚠️ Contract with reference number ${contractReferenceNumber} not found`);
         }
@@ -294,14 +382,21 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
       }
     }
 
-    // Validate required fields
-    if (!name || !referenceNumber) {
+    // Validate required fields - reference number is required, name is optional
+    if (!referenceNumber) {
       res.status(400).json({
         success: false,
-        message: 'Name and reference number are required',
+        message: 'Reference number is required',
       });
       return;
     }
+    
+    // Auto-generate project name if not provided
+    let finalName = name && name.trim() !== '' 
+      ? name.trim() 
+      : (contractData && contractData.title 
+          ? contractData.title 
+          : `Project ${referenceNumber}`);
 
     // Check if reference number already exists
     const existingProject = await prisma.project.findUnique({
@@ -334,28 +429,44 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
     // Determine project status - default to OPEN (which counts as active)
     const projectStatus = status ? (status as ProjectStatus) : ProjectStatus.OPEN;
     
-    console.log(`📝 Creating project: ${name}`);
+    console.log(`📝 Creating project: ${finalName}`);
     console.log(`   Reference Number: ${referenceNumber}`);
     console.log(`   Status: ${projectStatus} (will count as ${projectStatus === ProjectStatus.OPEN || projectStatus === ProjectStatus.IN_PROGRESS ? 'ACTIVE' : 'INACTIVE'})`);
     console.log(`   Created By: ${req.user?.id}`);
+    if (!name || name.trim() === '') {
+      console.log(`   ⚠️ Project name was auto-generated: ${finalName}`);
+    }
+
+    // Validate and trim projectManager (max 100 characters)
+    const projectManagerText = projectManager 
+      ? String(projectManager).trim().substring(0, 100) 
+      : null;
 
     // Create project
     const project = await prisma.project.create({
       data: {
-        name,
+        name: finalName,
         referenceNumber,
         pin: pin || null,
         clientId: finalClientId || null,
         owner: owner || null,
         description: finalDescription || null,
         status: projectStatus,  // Use enum value, not string
-        projectManagerId: projectManagerId || null,
+        projectManager: projectManagerText, // Plain text string
         startDate: finalStartDate ? new Date(finalStartDate) : null,
         endDate: finalEndDate ? new Date(finalEndDate) : null,
         deadline: deadline ? new Date(deadline) : null,
         planDays: planDays ? parseInt(planDays, 10) : null,
         remarks: remarks || null,
         assigneeNotes: assigneeNotes || null,
+        // Location & Project Details
+        location: finalLocation || null,
+        makaniNumber: finalMakaniNumber || null,
+        plotNumber: finalPlotNumber || null,
+        community: finalCommunity || null,
+        projectType: finalProjectType || null,
+        projectFloor: finalProjectFloor || null,
+        developerProject: finalDeveloperProject || null,
         createdBy: req.user?.id || null,
         assignedEmployees: employeeIds && employeeIds.length > 0 ? {
           create: employeeIds.map((employeeId: string) => ({
@@ -366,14 +477,6 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
       },
       include: {
         client: true,
-        projectManager: {
-          select: {
-            id: true,
-            firstName: true,
-            lastName: true,
-            email: true,
-          },
-        },
         assignedEmployees: {
           include: {
             employee: {
@@ -422,14 +525,6 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
       where: { id: project.id },
       include: {
         client: true,
-        projectManager: {
-          select: {
-            id: true,
-            firstName: true,
-            lastName: true,
-            email: true,
-          },
-        },
         assignedEmployees: {
           include: {
             employee: {
@@ -476,23 +571,53 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       owner,
       description,
       status,
-      projectManagerId,
+      projectManager, // Plain text string (not projectManagerId)
       startDate,
       endDate,
       deadline,
       planDays,
       remarks,
       assigneeNotes,
+      // Location & Project Details
+      location,
+      makaniNumber,
+      plotNumber,
+      community,
+      projectType,
+      projectFloor,
+      developerProject,
     } = req.body;
 
     // Check if project exists
     const existingProject = await prisma.project.findUnique({
       where: { id },
+      include: {
+        assignedEmployees: {
+          select: {
+            employeeId: true,
+          },
+        },
+      },
     });
 
     if (!existingProject) {
       res.status(404).json({ success: false, message: 'Project not found' });
       return;
+    }
+
+    // Employee role: Can only update assigned projects
+    if (req.user?.role === 'EMPLOYEE') {
+      const isAssigned = existingProject.assignedEmployees?.some(
+        (a: { employeeId: string }) => a.employeeId === req.user!.id
+      );
+      if (!isAssigned) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: You do not have permission to edit this project. You can only modify projects assigned to you.',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
     }
 
     // Check if reference number is being changed and already exists
@@ -525,6 +650,11 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       }
     }
 
+    // Validate and trim projectManager (max 100 characters)
+    const projectManagerText = projectManager !== undefined
+      ? (projectManager ? String(projectManager).trim().substring(0, 100) : null)
+      : undefined;
+
     // Update project
     const project = await prisma.project.update({
       where: { id },
@@ -536,24 +666,24 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
         ...(owner !== undefined && { owner: owner || null }),
         ...(description !== undefined && { description: description || null }),
         ...(status && { status }),
-        ...(projectManagerId !== undefined && { projectManagerId: projectManagerId || null }),
+        ...(projectManagerText !== undefined && { projectManager: projectManagerText }),
         ...(startDate && { startDate: new Date(startDate) }),
         ...(endDate && { endDate: new Date(endDate) }),
         ...(deadline && { deadline: new Date(deadline) }),
         ...(planDays !== undefined && { planDays: planDays ? parseInt(planDays, 10) : null }),
         ...(remarks !== undefined && { remarks: remarks || null }),
         ...(assigneeNotes !== undefined && { assigneeNotes: assigneeNotes || null }),
+        // Location & Project Details
+        ...(location !== undefined && { location: location || null }),
+        ...(makaniNumber !== undefined && { makaniNumber: makaniNumber || null }),
+        ...(plotNumber !== undefined && { plotNumber: plotNumber || null }),
+        ...(community !== undefined && { community: community || null }),
+        ...(projectType !== undefined && { projectType: projectType || null }),
+        ...(projectFloor !== undefined && { projectFloor: projectFloor || null }),
+        ...(developerProject !== undefined && { developerProject: developerProject || null }),
       },
       include: {
         client: true,
-        projectManager: {
-          select: {
-            id: true,
-            firstName: true,
-            lastName: true,
-            email: true,
-          },
-        },
         assignedEmployees: {
           include: {
             employee: {
@@ -589,7 +719,13 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
 
     const project = await prisma.project.findUnique({
       where: { id },
-      select: { id: true, name: true, referenceNumber: true },
+      include: {
+        assignedEmployees: {
+          select: {
+            employeeId: true,
+          },
+        },
+      },
     });
 
     if (!project) {
@@ -598,7 +734,17 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    console.log(`📋 Deleting project: ${project.name} (${project.referenceNumber})`);
+    // Employee role: Cannot delete projects (even assigned ones)
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to delete projects. Please contact your manager.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
+    console.log(`📋 Deleting project: ${project.name} (${(project as any).referenceNumber})`);
 
     // Delete all related records first (cascade delete)
     // Use a transaction to ensure all deletions succeed or none do
@@ -706,6 +852,15 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
 // Bulk delete projects
 export const deleteProjects = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Employee role: Cannot delete projects
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to delete projects. Please contact your manager.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
     const { ids } = req.body;
 
     if (!ids || !Array.isArray(ids) || ids.length === 0) {

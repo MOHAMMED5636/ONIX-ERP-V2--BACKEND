@@ -74,12 +74,69 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
     }
 
     if (search) {
+      const searchTerm = (search as string).trim();
+      
+      // First, check if search term is an exact reference number match
+      const exactReferenceMatch = await prisma.contract.findUnique({
+        where: { referenceNumber: searchTerm },
+        include: {
+          project: {
+            select: {
+              id: true,
+              name: true,
+              referenceNumber: true,
+              status: true,
+            },
+          },
+          client: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              phone: true,
+            },
+          },
+          creator: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              email: true,
+            },
+          },
+          approver: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              email: true,
+            },
+          },
+        },
+      });
+
+      // If exact match found, return it immediately (for frontend auto-population)
+      if (exactReferenceMatch) {
+        res.json({
+          success: true,
+          data: [exactReferenceMatch], // Return as array to match expected format
+          pagination: {
+            page: pageNum,
+            limit: limitNum,
+            total: 1,
+            totalPages: 1,
+          },
+        });
+        return;
+      }
+
+      // Otherwise, use partial search
       where.OR = [
-        { title: { contains: search as string, mode: 'insensitive' } },
-        { referenceNumber: { contains: search as string, mode: 'insensitive' } },
-        { description: { contains: search as string, mode: 'insensitive' } },
-        { contractorName: { contains: search as string, mode: 'insensitive' } },
-        { clientName: { contains: search as string, mode: 'insensitive' } },
+        { title: { contains: searchTerm, mode: 'insensitive' } },
+        { referenceNumber: { contains: searchTerm, mode: 'insensitive' } },
+        { description: { contains: searchTerm, mode: 'insensitive' } },
+        { contractorName: { contains: searchTerm, mode: 'insensitive' } },
+        { clientName: { contains: searchTerm, mode: 'insensitive' } },
       ];
     }
 
@@ -167,6 +224,7 @@ export const getContractByReferenceNumber = async (req: AuthRequest, res: Respon
     const contract = await prisma.contract.findUnique({
       where: { referenceNumber: referenceNumber as string },
       include: {
+        // Include full client details
         client: {
           select: {
             id: true,
@@ -174,9 +232,23 @@ export const getContractByReferenceNumber = async (req: AuthRequest, res: Respon
             email: true,
             phone: true,
             address: true,
+            referenceNumber: true,
+            isCorporate: true,
+            nationality: true,
           },
         },
+        // Include creator details
         creator: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            phone: true,
+          },
+        },
+        // Include approver details if approved
+        approver: {
           select: {
             id: true,
             firstName: true,
@@ -184,20 +256,63 @@ export const getContractByReferenceNumber = async (req: AuthRequest, res: Respon
             email: true,
           },
         },
+        // Include project details if linked
+        project: {
+          select: {
+            id: true,
+            name: true,
+            referenceNumber: true,
+            status: true,
+            description: true,
+          },
+        },
       },
     });
 
     if (!contract) {
-      res.status(404).json({
+      // Return success: false with data: null to match frontend expectations
+      res.json({
         success: false,
-        message: 'Contract not found',
+        data: null,
+        message: 'Contract not found with the provided reference number. Please verify the reference number and try again.',
       });
       return;
     }
 
+    // Prepare project-ready data for auto-population
+    const projectData = {
+      // Client information
+      clientId: contract.clientId || null,
+      clientName: contract.client?.name || contract.clientName || null,
+      
+      // Project basic info
+      name: contract.title || null, // Contract title becomes project name
+      description: contract.description || null,
+      
+      // Dates
+      startDate: contract.startDate ? contract.startDate.toISOString().split('T')[0] : null, // Format as YYYY-MM-DD
+      endDate: contract.endDate ? contract.endDate.toISOString().split('T')[0] : null,
+      
+      // Project details from contract
+      owner: contract.developerName || null, // Developer name as project owner
+      projectManager: contract.projectManager || (contract.creator ? `${contract.creator.firstName} ${contract.creator.lastName}`.trim() : null),
+      
+      // Additional contract info that might be useful
+      contractType: contract.contractType || null,
+      contractCategory: contract.contractCategory || null,
+      plotNumber: contract.plotNumber || null,
+      numberOfFloors: contract.numberOfFloors || null,
+      region: contract.region || null,
+      community: contract.community || null,
+      makaniNumber: contract.makaniNumber || null,
+    };
+
+    // Return full contract data plus project-ready data
     res.json({
       success: true,
       data: contract,
+      projectData: projectData, // Pre-formatted data ready for project form auto-fill
+      message: 'Contract found. Project form can be auto-filled.',
     });
   } catch (error: any) {
     console.error('❌ Error fetching contract by reference number:', error);
@@ -205,6 +320,7 @@ export const getContractByReferenceNumber = async (req: AuthRequest, res: Respon
       success: false,
       message: 'Failed to fetch contract',
       error: error.message,
+      data: null,
     });
   }
 };
@@ -317,7 +433,7 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
     
     const {
       title,
-      // Note: referenceNumber is auto-generated, not taken from request
+      referenceNumber: manualReferenceNumber, // Allow manual reference number entry
       description,
       contractType,
       contractCategory,
@@ -353,6 +469,8 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
       authorityApprovalStatus,
       developerName,
       authorityApprovalRequired,
+      // Project Manager
+      projectManagerName, // Project manager name (from frontend)
       // Contract fees
       contractFees, // Array of fee objects
       // Payment schedule
@@ -384,9 +502,30 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
 
     console.log('✅ Title validated:', contractTitle);
 
-    // Generate reference number (always auto-generated, never from request)
-    const referenceNumber = await generateReferenceNumber();
-    console.log('✅ Generated reference number:', referenceNumber);
+    // Handle reference number: use manual entry if provided, otherwise auto-generate
+    let referenceNumber: string;
+    if (manualReferenceNumber && manualReferenceNumber.trim()) {
+      // Validate manual reference number is unique
+      const trimmedRef = manualReferenceNumber.trim();
+      const existing = await prisma.contract.findUnique({
+        where: { referenceNumber: trimmedRef },
+      });
+      
+      if (existing) {
+        res.status(400).json({
+          success: false,
+          message: `Reference number "${trimmedRef}" already exists. Please use a different reference number.`,
+        });
+        return;
+      }
+      
+      referenceNumber = trimmedRef;
+      console.log('✅ Using manual reference number:', referenceNumber);
+    } else {
+      // Auto-generate if no manual reference provided
+      referenceNumber = await generateReferenceNumber();
+      console.log('✅ Generated reference number:', referenceNumber);
+    }
 
     // Handle document upload (field name: 'contractDocument') and multiple attachments
     let contractDocument: string | null = null;
@@ -767,6 +906,8 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
         authorityApprovalStatus: authorityApprovalStatus || null,
         developerName: developerName?.trim() || null,
         authorityApprovalRequired: authorityApprovalRequired === true || authorityApprovalRequired === 'true',
+        // Project Manager
+        projectManager: projectManagerName?.trim() ? projectManagerName.trim().substring(0, 100) : null,
         // Contract fees
         contractFees: parsedContractFees,
         // Payment schedule
@@ -918,6 +1059,7 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       companyId,
       companyName,
       contractValue,
+      // referenceNumber is NOT allowed to be updated - it's auto-generated and immutable
       currency,
       paymentTerms,
       startDate,
@@ -939,6 +1081,7 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       authorityApprovalStatus,
       developerName,
       authorityApprovalRequired,
+      projectManagerName, // Project manager name (from frontend)
       contractFees,
       paymentScheduleType,
       totalAmount,
@@ -966,6 +1109,13 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
         message: 'Contract not found',
       });
       return;
+    }
+
+    // Reference number is immutable - preserve it from existing contract
+    // If someone tries to send referenceNumber in the request, ignore it
+    const preservedReferenceNumber = existingContract.referenceNumber;
+    if (req.body.referenceNumber && req.body.referenceNumber !== preservedReferenceNumber) {
+      console.log('⚠️ Warning: Attempted to change referenceNumber from', preservedReferenceNumber, 'to', req.body.referenceNumber, '- ignoring change');
     }
 
     // Handle document upload
@@ -1252,6 +1402,8 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
         authorityApprovalStatus: authorityApprovalStatus !== undefined ? authorityApprovalStatus : undefined,
         developerName: developerName !== undefined ? (developerName?.trim() || null) : undefined,
         authorityApprovalRequired: authorityApprovalRequired !== undefined ? (authorityApprovalRequired === true || authorityApprovalRequired === 'true') : undefined,
+        // Project Manager
+        projectManager: projectManagerName !== undefined ? (projectManagerName?.trim() ? projectManagerName.trim().substring(0, 100) : null) : undefined,
         // Contract fees
         contractFees: contractFees !== undefined ? parsedContractFees : undefined,
         // Payment schedule
@@ -1298,7 +1450,7 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       },
     });
 
-    console.log('✅ Contract updated:', contract.referenceNumber);
+    console.log('✅ Contract updated:', contract.referenceNumber, '(referenceNumber preserved, not changed)');
 
     res.json({
       success: true,
@@ -1405,6 +1557,250 @@ export const deleteContract = async (req: AuthRequest, res: Response): Promise<v
   }
 };
 
+// Load Out: Create project from contract
+export const loadOutContract = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    // Employee role: Cannot create projects
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to create projects. Please contact your manager.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
+    // Fetch contract with all details including location fields
+    const contract = await prisma.contract.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        referenceNumber: true,
+        title: true,
+        description: true,
+        contractType: true,
+        contractCategory: true,
+        status: true,
+        clientId: true,
+        projectId: true,
+        developerName: true,
+        projectManager: true,
+        startDate: true,
+        endDate: true,
+        // Location fields
+        makaniNumber: true,
+        latitude: true,
+        longitude: true,
+        region: true,
+        plotNumber: true,
+        community: true,
+        numberOfFloors: true,
+        // Additional fields
+        specialClauses: true,
+        termsAndConditions: true,
+        paymentTerms: true,
+        client: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true,
+          },
+        },
+        creator: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+          },
+        },
+        project: {
+          select: {
+            id: true,
+            name: true,
+            referenceNumber: true,
+            status: true,
+          },
+        },
+      },
+    });
+
+    if (!contract) {
+      res.status(404).json({
+        success: false,
+        message: 'Contract not found',
+      });
+      return;
+    }
+
+    // Check if project already exists (prevent duplicates)
+    if (contract.projectId && contract.project) {
+      res.status(400).json({
+        success: false,
+        message: `This contract is already linked to project ${contract.project.referenceNumber}. Duplicate entries are not allowed.`,
+        existingProject: {
+          id: contract.project.id,
+          referenceNumber: contract.project.referenceNumber,
+          name: contract.project.name,
+        },
+      });
+      return;
+    }
+
+    // Generate unique project reference number
+    const generateProjectRef = async (): Promise<string> => {
+      const prefix = 'PRJ-';
+      let referenceNumber: string;
+      let exists = true;
+      let attempts = 0;
+      const maxAttempts = 100;
+
+      while (exists && attempts < maxAttempts) {
+        // Generate a random alphanumeric string (8 characters)
+        const randomPart = Math.random().toString(36).substring(2, 10).toUpperCase();
+        referenceNumber = `${prefix}${randomPart}`;
+
+        // Check if it already exists
+        const existing = await prisma.project.findUnique({
+          where: { referenceNumber },
+        });
+
+        if (!existing) {
+          exists = false;
+        }
+        attempts++;
+      }
+
+      if (attempts >= maxAttempts) {
+        // Fallback: use timestamp-based reference
+        const timestamp = Date.now().toString(36).toUpperCase();
+        referenceNumber = `${prefix}${timestamp}`;
+      }
+
+      return referenceNumber!;
+    };
+
+    const projectReferenceNumber = await generateProjectRef();
+
+    // Calculate plan days from contract dates if available
+    let planDays: number | null = null;
+    if (contract.startDate && contract.endDate) {
+      const start = new Date(contract.startDate);
+      const end = new Date(contract.endDate);
+      const diffTime = Math.abs(end.getTime() - start.getTime());
+      planDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end days
+    }
+
+    // Map contract fields to project fields
+    const projectName = contract.title || `Project ${contract.referenceNumber}`;
+    const projectManager = contract.projectManager 
+      ? contract.projectManager.trim().substring(0, 100)
+      : (contract.creator 
+        ? `${contract.creator.firstName} ${contract.creator.lastName}`.trim().substring(0, 100)
+        : null);
+
+    // Build location string from coordinates or makani number
+    let locationString: string | null = null;
+    if (contract.makaniNumber) {
+      locationString = contract.makaniNumber;
+    } else if (contract.latitude && contract.longitude) {
+      locationString = `${contract.latitude}, ${contract.longitude}`;
+    }
+
+    // Create project from contract data
+    const project = await prisma.project.create({
+      data: {
+        name: projectName,
+        referenceNumber: projectReferenceNumber,
+        pin: null, // Can be set later if needed
+        clientId: contract.clientId || null,
+        owner: contract.developerName || null,
+        description: contract.description || null,
+        status: 'OPEN', // Default status
+        projectManager: projectManager,
+        startDate: contract.startDate ? new Date(contract.startDate) : null,
+        endDate: contract.endDate ? new Date(contract.endDate) : null,
+        deadline: contract.endDate ? new Date(contract.endDate) : null, // Use end date as deadline
+        planDays: planDays,
+        remarks: contract.specialClauses || contract.termsAndConditions || null,
+        assigneeNotes: contract.paymentTerms || null,
+        // Location & Project Details from contract
+        location: locationString,
+        makaniNumber: contract.makaniNumber || null,
+        plotNumber: contract.plotNumber || null,
+        community: contract.community || null,
+        projectType: contract.contractType || null,
+        projectFloor: contract.numberOfFloors ? contract.numberOfFloors.toString() : null,
+        developerProject: contract.developerName || null,
+        createdBy: req.user?.id || null,
+      },
+      include: {
+        client: true,
+        contracts: {
+          select: {
+            id: true,
+            referenceNumber: true,
+            title: true,
+          },
+        },
+      },
+    });
+
+    // Link contract to the created project
+    await prisma.contract.update({
+      where: { id: contract.id },
+      data: { projectId: project.id },
+    });
+
+    console.log(`✅ Load Out successful: Contract ${contract.referenceNumber} → Project ${project.referenceNumber}`);
+
+    res.json({
+      success: true,
+      message: `Project ${project.referenceNumber} created successfully from contract ${contract.referenceNumber}`,
+      data: {
+        project: {
+          id: project.id,
+          referenceNumber: project.referenceNumber,
+          name: project.name,
+          status: project.status,
+          clientId: project.clientId,
+          clientName: project.client?.name || null,
+          // Location & Project Details (now stored in project)
+          location: project.location || null,
+          makaniNumber: project.makaniNumber || null,
+          plotNumber: project.plotNumber || null,
+          community: project.community || null,
+          projectType: project.projectType || null,
+          projectFloor: project.projectFloor || null,
+          developerProject: project.developerProject || null,
+        },
+        contract: {
+          id: contract.id,
+          referenceNumber: contract.referenceNumber,
+          title: contract.title,
+          // Include full contract data for frontend reference
+          plotNumber: contract.plotNumber,
+          community: contract.community,
+          contractType: contract.contractType,
+          numberOfFloors: contract.numberOfFloors,
+          makaniNumber: contract.makaniNumber,
+          developerName: contract.developerName,
+        },
+      },
+    });
+  } catch (error: any) {
+    console.error('❌ Error loading out contract:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create project from contract',
+      error: error.message,
+    });
+  }
+};
+
 // Get contract statistics
 export const getContractStats = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -1431,6 +1827,14 @@ export const getContractStats = async (req: AuthRequest, res: Response): Promise
       statsMap[stat.status] = stat._count.id;
     });
 
+    // Recent contract reference numbers for display in statistics section
+    const recentContracts = await prisma.contract.findMany({
+      take: 10,
+      orderBy: { createdAt: 'desc' },
+      select: { referenceNumber: true },
+    });
+    const recentReferenceNumbers = recentContracts.map((c) => c.referenceNumber);
+
     res.json({
       success: true,
       data: {
@@ -1439,6 +1843,7 @@ export const getContractStats = async (req: AuthRequest, res: Response): Promise
         expired,
         draft,
         byStatus: statsMap,
+        recentReferenceNumbers,
       },
     });
   } catch (error: any) {

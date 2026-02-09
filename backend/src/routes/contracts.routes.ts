@@ -43,6 +43,9 @@ router.put('/:id', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER'), upload.single(
 // Approve a contract
 router.post('/:id/approve', requireRole('ADMIN', 'HR'), contractsController.approveContract);
 
+// Load Out: Create project from contract
+router.post('/:id/load-out', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER'), contractsController.loadOutContract);
+
 // Delete a contract
 router.delete('/:id', requireRole('ADMIN', 'HR'), contractsController.deleteContract);
 

@@ -82,6 +82,8 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
     const { 
       // Basic fields
       firstName, lastName, role, phone, department, position, jobTitle, employeeId, projectIds,
+      // ERP Access (login credentials)
+      workEmail, password: plainPassword,
       // Employee Directory - Personal Info
       employeeType, status, userAccount,
       // Employee Directory - Personal Details
@@ -263,24 +265,57 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    // Generate unique email
-    const email = await generateUniqueEmail(firstName, lastName);
-    console.log('📧 Generated email:', email);
-
     // Parse boolean values from FormData (they come as strings)
     const userAccountBool = typeof userAccount === 'string' 
       ? (userAccount.toLowerCase().trim() === 'true' || userAccount.toLowerCase().trim() === '1' || userAccount.toLowerCase().trim() === 'yes')
       : Boolean(userAccount);
 
-    // Generate temporary password (only if userAccount is true)
+    // ERP Access: work email (use provided or generate)
+    const emailProvided = typeof workEmail === 'string' && workEmail.trim().length > 0;
+    let email: string;
+    if (userAccountBool && emailProvided) {
+      const trimmed = workEmail.trim().toLowerCase();
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(trimmed)) {
+        res.status(400).json({ success: false, message: 'Work email must be a valid email address.' });
+        return;
+      }
+      const existing = await prisma.user.findUnique({ where: { email: trimmed } });
+      if (existing) {
+        res.status(409).json({ success: false, message: 'An account with this email already exists. Please use a different work email.' });
+        return;
+      }
+      email = trimmed;
+      console.log('📧 Using provided work email:', email);
+    } else {
+      email = await generateUniqueEmail(firstName, lastName);
+      console.log('📧 Generated email:', email);
+    }
+
+    // Password: use provided (when ERP access enabled) or generate temp, or dummy when no access
+    const passwordProvided = typeof plainPassword === 'string' && plainPassword.length > 0;
     let temporaryPassword: string | null = null;
     let hashedPassword: string | null = null;
     if (userAccountBool) {
-      temporaryPassword = generateTemporaryPassword();
-      hashedPassword = await bcrypt.hash(temporaryPassword, 10);
-      console.log('🔐 Generated password hash for user account');
+      if (passwordProvided) {
+        if (plainPassword.length < 8) {
+          res.status(400).json({ success: false, message: 'Password must be at least 8 characters long.' });
+          return;
+        }
+        const hasLetter = /[a-zA-Z]/.test(plainPassword);
+        const hasNumber = /\d/.test(plainPassword);
+        if (!hasLetter || !hasNumber) {
+          res.status(400).json({ success: false, message: 'Password must contain at least one letter and one number.' });
+          return;
+        }
+        hashedPassword = await bcrypt.hash(plainPassword, 10);
+        console.log('🔐 Using provided password (hashed)');
+      } else {
+        temporaryPassword = generateTemporaryPassword();
+        hashedPassword = await bcrypt.hash(temporaryPassword, 10);
+        console.log('🔐 Generated temporary password for user account');
+      }
     } else {
-      // Create a dummy password if no user account needed
       hashedPassword = await bcrypt.hash('NO_ACCOUNT_' + Date.now(), 10);
       console.log('🔐 Generated dummy password hash');
     }
@@ -540,8 +575,8 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
     if (userAccountBool && temporaryPassword) {
       responseData.data.credentials = {
         email: employee.email,
-        temporaryPassword: temporaryPassword, // Show only once
-        message: 'Please save these credentials. They will not be shown again.',
+        temporaryPassword: temporaryPassword,
+        message: 'Please save these credentials. They will not be shown again. User should change password on first login.',
       };
     }
 
@@ -860,6 +895,8 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
     const { 
       // Basic fields
       firstName, lastName, role, phone, department, position, jobTitle, employeeId, isActive, projectIds,
+      // ERP Access (login credentials)
+      workEmail, password: plainPasswordUpdate,
       // Employee Directory - Personal Info
       employeeType, status, userAccount,
       // Employee Directory - Personal Details
@@ -1015,7 +1052,43 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
     // Employee Directory - Personal Info
     if (employeeType !== undefined) updateData.employeeType = employeeType;
     if (status !== undefined) updateData.status = status;
-    if (userAccount !== undefined) updateData.userAccount = parseBoolean(userAccount);
+    if (userAccount !== undefined) {
+      const enableAccess = parseBoolean(userAccount);
+      updateData.userAccount = enableAccess;
+      updateData.isActive = enableAccess ? true : false;
+    }
+    
+    // ERP Access: work email (must be unique)
+    if (workEmail !== undefined && typeof workEmail === 'string' && workEmail.trim().length > 0) {
+      const trimmed = workEmail.trim().toLowerCase();
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(trimmed)) {
+        res.status(400).json({ success: false, message: 'Work email must be a valid email address.' });
+        return;
+      }
+      const existing = await prisma.user.findFirst({ where: { email: trimmed, id: { not: id } } });
+      if (existing) {
+        res.status(409).json({ success: false, message: 'An account with this email already exists.' });
+        return;
+      }
+      updateData.email = trimmed;
+    }
+    
+    // ERP Access: password (when enabling or updating credentials)
+    if (plainPasswordUpdate !== undefined && typeof plainPasswordUpdate === 'string' && plainPasswordUpdate.length > 0) {
+      if (plainPasswordUpdate.length < 8) {
+        res.status(400).json({ success: false, message: 'Password must be at least 8 characters long.' });
+        return;
+      }
+      const hasLetter = /[a-zA-Z]/.test(plainPasswordUpdate);
+      const hasNumber = /\d/.test(plainPasswordUpdate);
+      if (!hasLetter || !hasNumber) {
+        res.status(400).json({ success: false, message: 'Password must contain at least one letter and one number.' });
+        return;
+      }
+      updateData.password = await bcrypt.hash(plainPasswordUpdate, 10);
+      updateData.forcePasswordChange = false;
+    }
     
     // Employee Directory - Personal Details
     if (gender !== undefined) updateData.gender = gender;

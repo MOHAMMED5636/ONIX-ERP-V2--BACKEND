@@ -127,14 +127,7 @@ export const getProjectChatById = async (req: AuthRequest, res: Response): Promi
             name: true,
             referenceNumber: true,
             status: true,
-            projectManager: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-                email: true,
-              },
-            },
+            projectManager: true, // Plain text string field
           },
         },
         messages: {

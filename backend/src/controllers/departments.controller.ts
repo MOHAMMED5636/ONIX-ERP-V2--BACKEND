@@ -146,6 +146,16 @@ export const getDepartmentById = async (req: AuthRequest, res: Response): Promis
  */
 export const createCompanyDepartment = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Employee role: Cannot create departments
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to create this content. Please contact your manager.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
     const { companyId } = req.params;
     const {
       name,
@@ -232,6 +242,16 @@ export const createCompanyDepartment = async (req: AuthRequest, res: Response): 
  */
 export const updateDepartment = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Employee role: Cannot update departments
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to edit this content. Please contact your manager.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
     const { id } = req.params;
     const updateData = req.body;
 
@@ -288,6 +308,16 @@ export const updateDepartment = async (req: AuthRequest, res: Response): Promise
  */
 export const deleteDepartment = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Employee role: Cannot delete departments
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to delete this content. Please contact your manager.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
     const { id } = req.params;
 
     const department = await prisma.department.findUnique({

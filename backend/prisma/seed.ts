@@ -82,6 +82,21 @@ async function main() {
   });
   console.log('✅ Created Ramiz user:', ramiz.email);
 
+  // Create test employee (for Employee ERP login)
+  const employeePassword = await bcrypt.hash('employee123', 10);
+  const employee = await prisma.user.upsert({
+    where: { email: 'employee@onixgroup.ae' },
+    update: {},
+    create: {
+      email: 'employee@onixgroup.ae',
+      password: employeePassword,
+      firstName: 'Test',
+      lastName: 'Employee',
+      role: 'EMPLOYEE',
+    },
+  });
+  console.log('✅ Created test employee user:', employee.email);
+
   // Create sample clients
   const client1 = await prisma.client.upsert({
     where: { referenceNumber: 'CLI-001' },

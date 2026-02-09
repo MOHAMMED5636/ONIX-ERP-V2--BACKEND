@@ -19,11 +19,11 @@ router.get('/stats', clientsController.getClientStats);
 // Get a single client by ID
 router.get('/:id', clientsController.getClientById);
 
-// Create a new client (with document upload)
-router.post('/', requireRole('ADMIN', 'HR'), upload.single('document'), clientsController.createClient);
+// Create a new client (with single or multiple document uploads)
+router.post('/', requireRole('ADMIN', 'HR'), upload.fields([{ name: 'document', maxCount: 1 }, { name: 'documents', maxCount: 19 }]), clientsController.createClient);
 
-// Update a client (with optional document upload)
-router.put('/:id', requireRole('ADMIN', 'HR'), upload.single('document'), clientsController.updateClient);
+// Update a client (with single or multiple document uploads)
+router.put('/:id', requireRole('ADMIN', 'HR'), upload.fields([{ name: 'document', maxCount: 1 }, { name: 'documents', maxCount: 19 }]), clientsController.updateClient);
 
 // Delete all clients (admin only) - must be before /:id route
 router.delete('/all', requireRole('ADMIN'), clientsController.deleteAllClients);

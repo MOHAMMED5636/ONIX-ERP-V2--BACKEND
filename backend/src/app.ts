@@ -23,6 +23,8 @@ import positionsRoutes from './routes/positions.routes';
 import projectChatsRoutes from './routes/projectChats.routes';
 import contractsRoutes from './routes/contracts.routes';
 import mapsRoutes from './routes/maps.routes';
+import attendanceRoutes from './routes/attendance.routes';
+import leaveRoutes from './routes/leave.routes';
 
 const app = express();
 
@@ -167,6 +169,8 @@ app.use('/api', positionsRoutes);
 app.use('/api/project-chats', projectChatsRoutes);
 app.use('/api/contracts', contractsRoutes);
 app.use('/api/maps', mapsRoutes);
+app.use('/api/attendance', attendanceRoutes);
+app.use('/api/leaves', leaveRoutes);
 
 // API root endpoint - list all available endpoints
 app.get('/api', (req, res) => {

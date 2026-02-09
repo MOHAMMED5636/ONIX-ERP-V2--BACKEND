@@ -6,51 +6,43 @@ import { config } from '../config/env';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { getPhotoUrl } from '../utils/photo.utils';
 
+/** Permissions per role for unified login / role-based access */
+function getPermissionsForRole(role: string): string[] {
+  switch (role) {
+    case 'ADMIN':
+    case 'HR':
+    case 'PROJECT_MANAGER':
+    case 'CONTRACTOR':
+    case 'TENDER_ENGINEER':
+      return ['*'];
+    case 'EMPLOYEE':
+      return ['view:dashboard', 'view:profile', 'view:projects', 'view:assigned_tasks', 'view:project_details'];
+    default:
+      return ['view:dashboard', 'view:profile'];
+  }
+}
+
 export const login = async (req: Request, res: Response): Promise<void> => {
   try {
-    // Log login attempt
     console.log('=== LOGIN REQUEST ===');
     console.log(`[${new Date().toISOString()}] POST /api/auth/login`);
-    console.log('Received request body:', { 
-      email: req.body.email, 
-      role: req.body.role, 
-      password: req.body.password ? '***' : undefined 
-    });
-    console.log('Content-Type:', req.headers['content-type']);
+    const bodyRole = req.body.role;
+    console.log('Received request body:', { email: req.body.email, password: req.body.password ? '***' : undefined, role: bodyRole ?? '(optional)' });
     
     let { email, password, role } = req.body;
     
-    // Input validation with better error messages
-    if (!email || !password || !role) {
-      console.log('❌ Missing fields - email:', !!email, 'password:', !!password, 'role:', !!role);
-      res.status(400).json({ 
-        success: false, 
-        message: 'Email, password, and role are required',
-        received: {
-          email: email || null,
-          password: password ? '***' : null,
-          role: role || null,
-          bodyType: typeof req.body,
-          bodyKeys: Object.keys(req.body || {})
-        }
-      });
+    if (!email || !password) {
+      res.status(400).json({ success: false, message: 'Email and password are required' });
       return;
     }
     
-    // Trim whitespace from email
     email = email.trim().toLowerCase();
-    
-    // Email format validation - more robust regex
     const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
     if (!emailRegex.test(email)) {
-      res.status(400).json({ 
-        success: false, 
-        message: 'Invalid email format' 
-      });
+      res.status(400).json({ success: false, message: 'Invalid email format' });
       return;
     }
     
-    // Find user by email
     const user = await prisma.user.findUnique({
       where: { email },
       select: {
@@ -67,11 +59,17 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         position: true,
         isActive: true,
         forcePasswordChange: true,
+        employeeId: true,
       },
     }); 
     
-    if (!user || user.role !== role) {
-      console.log('❌ Invalid credentials - user not found or role mismatch');
+    if (!user) {
+      console.log('❌ Invalid credentials - user not found');
+      res.status(401).json({ success: false, message: 'Invalid credentials' });
+      return;
+    }
+    if (role && user.role !== role) {
+      console.log('❌ Invalid credentials - role mismatch');
       res.status(401).json({ success: false, message: 'Invalid credentials' });
       return;
     }
@@ -108,24 +106,28 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       console.log(`📸 Photo URL for ${user.email}: ${photoUrl}`);
     }
 
-    // Check if password change is required
+    const permissions = getPermissionsForRole(user.role);
+    const userPayload = {
+      id: user.id,
+      email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      role: user.role,
+      jobTitle: user.jobTitle,
+      photo: photoUrl,
+      forcePasswordChange: user.forcePasswordChange ?? false,
+      employeeId: user.employeeId ?? null,
+      permissions,
+    };
+
     if (user.forcePasswordChange) {
       res.status(200).json({
         success: true,
         requiresPasswordChange: true,
         message: 'Password change required. Please change your password to continue.',
         data: {
-          token, // Still provide token for password change endpoint access
-          user: {
-            id: user.id,
-            email: user.email,
-            firstName: user.firstName,
-            lastName: user.lastName,
-            role: user.role,
-            jobTitle: user.jobTitle,
-            photo: photoUrl,
-            forcePasswordChange: true,
-          },
+          token,
+          user: { ...userPayload, forcePasswordChange: true },
         },
       });
       return;
@@ -136,16 +138,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       requiresPasswordChange: false,
       data: {
         token,
-        user: {
-          id: user.id,
-          email: user.email,
-          firstName: user.firstName,
-          lastName: user.lastName,
-          role: user.role,
-          jobTitle: user.jobTitle,
-          photo: photoUrl,
-          forcePasswordChange: false,
-        },
+        user: userPayload,
       },
     });
     console.log('=== LOGIN REQUEST COMPLETED ===\n');
@@ -190,6 +183,7 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
         position: true,
         isActive: true,
         forcePasswordChange: true,
+        employeeId: true,
       },
     });
     
@@ -203,18 +197,19 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
     
-    // Get photo URL - verify file exists before returning URL
     const photoUrl = getPhotoUrl(user.photo, req.protocol, req.get('host') || 'localhost:3001');
-    
     if (user.photo && !photoUrl) {
       console.log(`⚠️  Photo file not found for user ${user.email}: ${user.photo}`);
     }
     
+    const permissions = getPermissionsForRole(user.role);
     res.json({ 
       success: true, 
       data: {
         ...user,
-        photo: photoUrl
+        photo: photoUrl,
+        employeeId: user.employeeId ?? null,
+        permissions,
       }
     });
   } catch (error) {

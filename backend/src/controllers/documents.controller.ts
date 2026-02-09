@@ -113,6 +113,16 @@ export const getDocument = async (req: AuthRequest, res: Response): Promise<void
  */
 export const uploadDocument = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Employee role: Cannot upload documents (including company policies)
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to create or edit this content. Please contact your manager.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
     console.log('📄 Document upload request received');
     console.log('   User ID:', req.user?.id);
     console.log('   Has file:', !!req.file);
@@ -227,6 +237,16 @@ export const uploadDocument = async (req: AuthRequest, res: Response): Promise<v
  */
 export const deleteDocument = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Employee role: Cannot delete documents (including company policies)
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to delete this content. Please contact your manager.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
     const { id } = req.params;
 
     const document = await prisma.document.findUnique({

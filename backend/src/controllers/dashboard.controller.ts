@@ -44,8 +44,8 @@ export const getDashboardStats = async (req: AuthRequest, res: Response): Promis
       userRole
     });
 
-    // Get recent projects
-    const recentProjects = await dashboardService.getRecentProjects(5);
+    // Get recent projects (employee gets only assigned projects)
+    const recentProjects = await dashboardService.getRecentProjects(5, userId, userRole);
 
     res.json({
       success: true,

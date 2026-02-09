@@ -122,6 +122,39 @@ export const getTaskById = async (req: AuthRequest, res: Response): Promise<void
   try {
     const { id } = req.params;
 
+    // First, check if task exists and if employee has access
+    const taskCheck = await prisma.task.findUnique({
+      where: { id },
+      include: {
+        assignments: {
+          select: {
+            employeeId: true,
+          },
+        },
+      },
+    });
+
+    if (!taskCheck) {
+      res.status(404).json({ success: false, message: 'Task not found' });
+      return;
+    }
+
+    // Employee role: Can only view tasks assigned to them
+    if (req.user?.role === 'EMPLOYEE') {
+      const isAssigned = taskCheck.assignments?.some(
+        (assignment: { employeeId: string }) => assignment.employeeId === req.user!.id
+      );
+      if (!isAssigned) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: You do not have permission to view this task. You can only view tasks assigned to you by the project manager.',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+    }
+
+    // Fetch full task details with all relations
     const task = await prisma.task.findUnique({
       where: { id },
       include: {
@@ -170,15 +203,6 @@ export const getTaskById = async (req: AuthRequest, res: Response): Promise<void
       },
     });
 
-    if (!task) {
-      res.status(404).json({ success: false, message: 'Task not found' });
-      return;
-    }
-
-    res.json({
-      success: true,
-      data: task,
-    });
   } catch (error) {
     console.error('Get task by ID error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
@@ -188,6 +212,16 @@ export const getTaskById = async (req: AuthRequest, res: Response): Promise<void
 // Create new task
 export const createTask = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Employee role: Cannot create tasks (only project managers can create tasks)
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to create tasks. Only project managers can create tasks.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
     const {
       title,
       description,
@@ -297,11 +331,44 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
     // Check if task exists
     const existingTask = await prisma.task.findUnique({
       where: { id },
+      include: {
+        assignments: {
+          select: {
+            employeeId: true,
+          },
+        },
+      },
     });
 
     if (!existingTask) {
       res.status(404).json({ success: false, message: 'Task not found' });
       return;
+    }
+
+    // Employee role: Can only update tasks assigned to them, and only certain fields
+    if (req.user?.role === 'EMPLOYEE') {
+      const isAssigned = existingTask.assignments?.some(
+        (assignment: { employeeId: string }) => assignment.employeeId === req.user!.id
+      );
+      if (!isAssigned) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: You do not have permission to update this task. You can only update tasks assigned to you.',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+      // Employees can only update: status, actualHours, and comments (not title, description, priority, dates, etc.)
+      // Restrict certain fields for employees
+      if (title !== undefined || description !== undefined || priority !== undefined || 
+          startDate !== undefined || dueDate !== undefined || estimatedHours !== undefined) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: You can only update task status and actual hours. Please contact your project manager to modify other fields.',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
     }
 
     // If status is being changed to COMPLETED, set completedAt
@@ -364,6 +431,16 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
 // Delete task
 export const deleteTask = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Employee role: Cannot delete tasks (only project managers can delete tasks)
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to delete tasks. Only project managers can delete tasks.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
     const { id } = req.params;
 
     const task = await prisma.task.findUnique({
@@ -392,6 +469,16 @@ export const deleteTask = async (req: AuthRequest, res: Response): Promise<void>
 // Assign employees to task
 export const assignEmployees = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    // Employee role: Cannot assign employees to tasks (only project managers can assign)
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to assign employees to tasks. Only project managers can assign tasks.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
     const { id } = req.params;
     const { employeeIds } = req.body;
 
@@ -567,8 +654,8 @@ export const getTaskStats = async (req: AuthRequest, res: Response): Promise<voi
       }
     }
 
-    // If user is not admin, filter by assigned tasks
-    if (req.user && req.user.role !== 'ADMIN' && req.user.role !== 'PROJECT_MANAGER') {
+    // Employee role: Can only see stats for tasks assigned to them
+    if (req.user && req.user.role === 'EMPLOYEE') {
       where.assignments = {
         some: {
           employeeId: req.user.id,
@@ -625,8 +712,8 @@ export const getKanbanTasks = async (req: AuthRequest, res: Response): Promise<v
       where.projectId = projectId as string;
     }
 
-    // If user is not admin, filter by assigned tasks
-    if (req.user && req.user.role !== 'ADMIN' && req.user.role !== 'PROJECT_MANAGER') {
+    // Employee role: Can only see tasks assigned to them
+    if (req.user && req.user.role === 'EMPLOYEE') {
       where.assignments = {
         some: {
           employeeId: req.user.id,

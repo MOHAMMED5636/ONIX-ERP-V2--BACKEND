@@ -119,6 +119,7 @@ export const getCompanyById = async (req: AuthRequest, res: Response): Promise<v
  */
 export const createCompany = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const body = req.body || {};
     const {
       name,
       tag,
@@ -144,10 +145,14 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
       header,
       footer,
       employees,
-    } = req.body;
+      officeLatitude,
+      officeLongitude,
+      attendanceRadius,
+    } = body;
 
-    // Validate required fields
-    if (!name) {
+    // Validate required fields (name may be missing when using FormData)
+    const companyName = typeof name === 'string' ? name.trim() : '';
+    if (!companyName) {
       res.status(400).json({
         success: false,
         message: 'Company name is required',
@@ -173,7 +178,11 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
       ? `/uploads/companies/${footerFile.filename}`
       : (footer && typeof footer === 'string' ? footer : null);
 
-    console.log(`📝 Creating company: ${name}`);
+    const lat = officeLatitude != null && officeLatitude !== '' ? parseFloat(String(officeLatitude)) : null;
+    const lng = officeLongitude != null && officeLongitude !== '' ? parseFloat(String(officeLongitude)) : null;
+    const radius = attendanceRadius != null && attendanceRadius !== '' ? parseInt(String(attendanceRadius), 10) : null;
+
+    console.log(`📝 Creating company: ${companyName}`);
     console.log(`   Tag: ${tag || 'N/A'}`);
     console.log(`   Status: ${status || 'ACTIVE'}`);
     console.log(`   Created By: ${req.user?.id}`);
@@ -184,7 +193,7 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
     // Create company
     const company = await prisma.company.create({
       data: {
-        name,
+        name: companyName,
         tag: tag || null,
         address: address || null,
         industry: industry || null,
@@ -208,9 +217,17 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
         header: headerPath,
         footer: footerPath,
         employees: employees ? (typeof employees === 'number' ? employees : parseInt(String(employees), 10)) : 0,
-        createdBy: req.user?.id || null,
+        createdBy: req.user?.id ?? null,
+        officeLatitude: lat != null && !isNaN(lat) ? lat : null,
+        officeLongitude: lng != null && !isNaN(lng) ? lng : null,
+        attendanceRadius: radius != null && !isNaN(radius) && radius > 0 ? radius : null,
       },
     });
+
+    if (!company) {
+      res.status(500).json({ success: false, message: 'Failed to create company' });
+      return;
+    }
 
     console.log(`✅ Company created successfully: ${company.id}`);
     console.log(`   Final Status: ${company.status}`);
@@ -320,6 +337,24 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
       updateData.employees = parseInt(updateData.employees, 10);
     }
 
+    // Convert office location (may come as strings from FormData)
+    if (updateData.officeLatitude !== undefined && updateData.officeLatitude !== null && updateData.officeLatitude !== '') {
+      updateData.officeLatitude = parseFloat(updateData.officeLatitude as string);
+    } else if (updateData.officeLatitude === '') {
+      updateData.officeLatitude = null;
+    }
+    if (updateData.officeLongitude !== undefined && updateData.officeLongitude !== null && updateData.officeLongitude !== '') {
+      updateData.officeLongitude = parseFloat(updateData.officeLongitude as string);
+    } else if (updateData.officeLongitude === '') {
+      updateData.officeLongitude = null;
+    }
+    if (updateData.attendanceRadius !== undefined && updateData.attendanceRadius !== null && updateData.attendanceRadius !== '') {
+      const r = parseInt(String(updateData.attendanceRadius), 10);
+      updateData.attendanceRadius = !isNaN(r) && r > 0 ? r : null;
+    } else if (updateData.attendanceRadius === '') {
+      updateData.attendanceRadius = null;
+    }
+
     const company = await prisma.company.update({
       where: { id },
       data: updateData,
@@ -343,29 +378,144 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
 };
 
 /**
+ * Update company office location (for attendance check-in)
+ * PATCH /api/companies/:id/office-location
+ */
+export const updateCompanyOfficeLocation = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const { latitude, longitude, radius } = req.body;
+
+    if (latitude === undefined || longitude === undefined) {
+      res.status(400).json({
+        success: false,
+        message: 'latitude and longitude are required',
+      });
+      return;
+    }
+
+    const lat = parseFloat(latitude);
+    const lng = parseFloat(longitude);
+    if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid latitude or longitude',
+      });
+      return;
+    }
+
+    const updateData: { officeLatitude: number; officeLongitude: number; attendanceRadius?: number } = {
+      officeLatitude: lat,
+      officeLongitude: lng,
+    };
+    if (radius !== undefined && radius !== null && radius !== '') {
+      const r = parseInt(String(radius), 10);
+      if (!isNaN(r) && r > 0) updateData.attendanceRadius = r;
+    }
+
+    await prisma.company.update({
+      where: { id },
+      data: updateData,
+    });
+
+    res.json({
+      success: true,
+      message: 'Office location updated successfully',
+      data: {
+        latitude: updateData.officeLatitude as number,
+        longitude: updateData.officeLongitude as number,
+        radius: updateData.attendanceRadius ?? 200,
+      },
+    });
+  } catch (error) {
+    console.error('Update office location error:', error);
+    if (error instanceof Error && error.message.includes('Record to update not found')) {
+      res.status(404).json({ success: false, message: 'Company not found' });
+    } else {
+      res.status(500).json({ success: false, message: 'Internal server error' });
+    }
+  }
+};
+
+/**
  * Delete company
  * DELETE /api/companies/:id
+ * Cascades: Deletes all employees associated with the company, then deletes the company
+ * (Departments are automatically deleted via onDelete: Cascade in schema)
  */
 export const deleteCompany = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
 
+    // First, get the company to find its name
+    const company = await prisma.company.findUnique({
+      where: { id },
+      select: { id: true, name: true },
+    });
+
+    if (!company) {
+      res.status(404).json({ success: false, message: 'Company not found' });
+      return;
+    }
+
+    console.log(`🗑️  Deleting company: ${company.name} (ID: ${id})`);
+
+    // Find all employees (users) associated with this company
+    // Employees are linked via the 'company' string field (company name)
+    const employeesToDelete = await prisma.user.findMany({
+      where: {
+        company: company.name, // Match by company name
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+      },
+    });
+
+    console.log(`   Found ${employeesToDelete.length} employee(s) to delete`);
+
+    // Delete all employees associated with this company
+    if (employeesToDelete.length > 0) {
+      const employeeIds = employeesToDelete.map(emp => emp.id);
+      
+      // Delete employees (this will cascade delete their assignments, tasks, etc. via Prisma relations)
+      const deleteResult = await prisma.user.deleteMany({
+        where: {
+          id: { in: employeeIds },
+        },
+      });
+
+      console.log(`   ✅ Deleted ${deleteResult.count} employee(s)`);
+      employeesToDelete.forEach(emp => {
+        console.log(`      - ${emp.firstName} ${emp.lastName} (${emp.email})`);
+      });
+    }
+
+    // Now delete the company
+    // This will automatically cascade delete departments (via onDelete: Cascade in schema)
     await prisma.company.delete({
       where: { id },
     });
 
-    console.log(`✅ Company deleted: ${id}`);
+    console.log(`✅ Company deleted: ${company.name} (ID: ${id})`);
 
     res.json({
       success: true,
-      message: 'Company deleted successfully',
+      message: `Company deleted successfully. ${employeesToDelete.length} employee(s) were also deleted.`,
+      deletedEmployees: employeesToDelete.length,
     });
   } catch (error) {
-    console.error('Delete company error:', error);
+    console.error('❌ Delete company error:', error);
     if (error instanceof Error && error.message.includes('Record to delete does not exist')) {
       res.status(404).json({ success: false, message: 'Company not found' });
     } else {
-      res.status(500).json({ success: false, message: 'Internal server error' });
+      res.status(500).json({ 
+        success: false, 
+        message: 'Internal server error',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      });
     }
   }
 };

@@ -87,7 +87,6 @@ model User {
   createdProjects  Project[]
   assignedProjects ProjectAssignment[] @relation("AssignedEmployee")
   assignedTasks    TaskAssignment[]
-  managedProjects  Project[]           @relation("ProjectManager")
 
   // HR Relations
   managedDepartments    Department[]    @relation("DepartmentManager")
@@ -100,6 +99,17 @@ model User {
   // Contract Relations
   createdContracts  Contract[] @relation("ContractCreator")
   approvedContracts Contract[] @relation("ContractApprover")
+
+  // Attendance Relations
+  attendances Attendance[] @relation("UserAttendances")
+
+  // Leave balance (annual leave days per year; used for balance tracking)
+  annualLeaveBalance Int? @default(25)
+
+  // Leave Relations
+  leaveRequests    Leave[] @relation("LeaveRequester")
+  approvedLeaves   Leave[] @relation("LeaveApprover")
+  rejectedLeaves   Leave[] @relation("LeaveRejector")
 
   @@map("users")
 }
@@ -130,8 +140,9 @@ model Client {
   birthDate       DateTime?
 
   // Document upload fields
-  documentType       String? // Document Type / Category
-  documentAttachment String? // File path/URL for uploaded document
+  documentType       String? // Document Type / Category (primary)
+  documentAttachment String? // File path/URL for primary uploaded document
+  documentAttachments String? @db.Text // JSON array of { documentType, path } for multiple documents
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -154,14 +165,23 @@ model Project {
   owner            String?
   description      String?
   status           ProjectStatus @default(OPEN)
-  projectManagerId String?
-  projectManager   User?         @relation("ProjectManager", fields: [projectManagerId], references: [id])
+  projectManager   String?       @db.VarChar(100) // Free-text project manager name (not linked to users)
   startDate        DateTime?
   endDate          DateTime?
   deadline         DateTime?
   planDays         Int? // Planned duration in days
   remarks          String? // General remarks
   assigneeNotes    String? // Notes from assignee
+  
+  // Location & Project Details (from contracts)
+  location         String? // Location string (can be coordinates or address)
+  makaniNumber     String? // Makani number (UAE addressing system - 10 digits)
+  plotNumber       String? // Plot number
+  community        String? // Community name
+  projectType      String? // Project type (e.g., "Residential", "Commercial", "Industrial")
+  projectFloor     String? // Number of floors (stored as string for flexibility)
+  developerProject String? // Developer name/project
+  
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
 
@@ -497,6 +517,11 @@ model Company {
   heightUnit      String?  @default("meter") // meter | feet
   weightUnit      String?  @default("kg")    // kg | ton (optional)
 
+  // Office Location (for attendance system)
+  officeLatitude  Float? // Office latitude coordinate
+  officeLongitude Float? // Office longitude coordinate
+  attendanceRadius Float? @default(200) // Allowed radius in meters (default 200m)
+
   // Statistics
   employees Int @default(0)
 
@@ -507,6 +532,7 @@ model Company {
 
   // Relations
   departments Department[]
+  attendances Attendance[]
 
   @@map("companies")
 }
@@ -697,6 +723,9 @@ model Contract {
   developerName             String? // Developer name
   authorityApprovalRequired Boolean @default(false) // Whether authority approval is required
 
+  // Project Manager
+  projectManager            String? @db.VarChar(100) // Free-text project manager name (not linked to users)
+
   // Financial Details
   contractValue Decimal? @db.Decimal(15, 2) // Total contract value
   currency      String?  @default("AED") // Currency code
@@ -749,4 +778,100 @@ enum ContractStatus {
   TERMINATED
   CANCELLED
   COMPLETED
+}
+
+// Attendance model for location-based check-in/check-out
+model Attendance {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation("UserAttendances", fields: [userId], references: [id])
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id])
+
+  // Attendance type
+  type AttendanceType @default(CHECK_IN) // CHECK_IN or CHECK_OUT
+
+  // Location data
+  employeeLatitude  Float // Employee's latitude when marking attendance
+  employeeLongitude Float // Employee's longitude when marking attendance
+  distanceFromOffice Float // Calculated distance from office in meters
+  isWithinRadius    Boolean // Whether employee was within allowed radius
+
+  // Timestamps
+  checkInTime  DateTime? // Check-in timestamp
+  checkOutTime DateTime? // Check-out timestamp
+  date         DateTime  @default(now()) @db.Date // Date of attendance (date only, no time)
+
+  // Metadata for audit
+  ipAddress    String? // IP address of the request
+  userAgent    String? @db.Text // User agent/browser info
+  deviceInfo   String? @db.Text // Device information (mobile, desktop, etc.)
+  locationAccuracy Float? // GPS accuracy in meters
+
+  // Status
+  status AttendanceStatus @default(PRESENT)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, date, type]) // One check-in and one check-out per day per user
+  @@index([userId])
+  @@index([date])
+  @@index([companyId])
+  @@map("attendances")
+}
+
+enum AttendanceType {
+  CHECK_IN
+  CHECK_OUT
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  ON_LEAVE
+  LATE
+  EARLY_DEPARTURE
+}
+
+model Leave {
+  id          String      @id @default(uuid())
+  userId      String
+  user        User        @relation("LeaveRequester", fields: [userId], references: [id])
+  type        LeaveType   // ANNUAL, SICK, UNPAID
+  status      LeaveStatus @default(PENDING) // PENDING, APPROVED, REJECTED
+  startDate   DateTime    @db.Date
+  endDate     DateTime    @db.Date
+  days        Int         // Number of days
+  reason      String      @db.Text
+  attachments String?     @db.Text // JSON array of file paths/URLs
+
+  approvedById   String?
+  approvedBy     User?     @relation("LeaveApprover", fields: [approvedById], references: [id])
+  approvedAt     DateTime?
+  rejectedById   String?
+  rejectedBy     User?     @relation("LeaveRejector", fields: [rejectedById], references: [id])
+  rejectedAt     DateTime?
+  rejectionReason String?  @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([type])
+  @@index([startDate])
+  @@map("leaves")
+}
+
+enum LeaveType {
+  ANNUAL
+  SICK
+  UNPAID
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
 }

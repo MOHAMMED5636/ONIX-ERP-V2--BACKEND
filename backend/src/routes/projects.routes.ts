@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.middleware';
+import { requirePermission, ResourceType, PermissionAction } from '../middleware/permissions.middleware';
 import { uploadPhoto } from '../middleware/upload.middleware';
 import * as projectsController from '../controllers/projects.controller';
 import * as checklistsController from '../controllers/checklists.controller';
@@ -36,13 +37,16 @@ const upload = multer({
 router.use(authenticate);
 
 // Project CRUD routes
+// Employees can VIEW projects (GET requests are allowed - filtered to assigned projects in controller)
 router.get('/', projectsController.getAllProjects);
 router.get('/stats', projectsController.getProjectStats);
 router.get('/:id', projectsController.getProjectById);
-router.post('/', projectsController.createProject);
-router.put('/:id', projectsController.updateProject);
-router.delete('/bulk', projectsController.deleteProjects); // Bulk delete must come before /:id
-router.delete('/:id', projectsController.deleteProject);
+// Employees CANNOT create or delete projects
+router.post('/', requirePermission(ResourceType.PROJECT, PermissionAction.CREATE), projectsController.createProject);
+// Employees can UPDATE but only their assigned projects (verified in controller)
+router.put('/:id', requirePermission(ResourceType.PROJECT, PermissionAction.UPDATE), projectsController.updateProject);
+router.delete('/bulk', requirePermission(ResourceType.PROJECT, PermissionAction.DELETE), projectsController.deleteProjects); // Bulk delete must come before /:id
+router.delete('/:id', requirePermission(ResourceType.PROJECT, PermissionAction.DELETE), projectsController.deleteProject);
 
 // Project employee assignment
 router.post('/:id/assign', projectsController.assignEmployees);

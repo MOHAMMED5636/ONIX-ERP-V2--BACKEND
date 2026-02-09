@@ -81,8 +81,7 @@ export const sendTenderInvitationEmail = async (
           <p>This is an automated message. Please do not reply to this email.</p>
         </div>
       </div>
-    </body>
-    </html>
+        </html>
   `;
   
   const attachments = attachmentPath ? [{ path: attachmentPath }] : undefined;

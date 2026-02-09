@@ -37,118 +37,96 @@ export interface DashboardSummary {
  */
 export const getDashboardStats = async (userId?: string, userRole?: string): Promise<DashboardStats> => {
   try {
-    // Count Active Projects (OPEN or IN_PROGRESS status)
-    // Using Prisma enum values for type safety
-    // IMPORTANT: This query counts ONLY from the projects table - no caching, no fallbacks
-    // Only projects with status OPEN or IN_PROGRESS count as active
-    const activeProjects = await prisma.project.count({
-      where: {
-        status: {
-          in: [ProjectStatus.OPEN, ProjectStatus.IN_PROGRESS]
-        }
-      }
-    });
+    const isEmployee = userRole === 'EMPLOYEE' && userId;
 
-    // Log for debugging - helps identify if query is working correctly
-    console.log(`📊 Dashboard Stats Query - Active Projects Count: ${activeProjects}`);
-    
-    // Also log total projects for comparison
-    const totalProjects = await prisma.project.count();
-    console.log(`📊 Dashboard Stats Query - Total Projects: ${totalProjects}`);
-    
-    // Log projects by status for debugging
-    const projectsByStatus = await prisma.project.groupBy({
-      by: ['status'],
-      _count: {
-        id: true
-      }
-    });
-    console.log(`📊 Dashboard Stats Query - Projects by Status:`, projectsByStatus);
-    
-    // Log which projects are counted as active
-    const activeProjectsList = await prisma.project.findMany({
-      where: {
-        status: {
-          in: [ProjectStatus.OPEN, ProjectStatus.IN_PROGRESS]
-        }
-      },
-      select: {
-        id: true,
-        name: true,
-        referenceNumber: true,
-        status: true
-      }
-    });
-    console.log(`📊 Dashboard Stats Query - Active Projects List (${activeProjectsList.length}):`, 
-      activeProjectsList.map(p => `${p.referenceNumber} (${p.status})`));
+    let activeProjects: number;
+    let activeTasks: number;
+    let completedTasks: number;
+    let pendingTasks: number;
+    let inProgressTasks: number;
+    let teamMembers: number;
+    let inProgressTenders: number;
+    let totalClients: number;
+    let totalTenders: number;
+    let pendingInvitations: number;
 
-    // Only count tasks that belong to existing projects
-    const existingProjects = await prisma.project.findMany({
-      select: { id: true },
-    });
-    const projectIds = existingProjects.map(p => p.id);
-    
-    // Task where clause - only count tasks from existing projects
-    const taskWhere = projectIds.length > 0 ? {
-      projectId: { in: projectIds }
-    } : {
-      projectId: { in: [] } // No projects, so no tasks
-    };
-
-    // Count Active Tasks (PENDING or IN_PROGRESS status)
-    // Using Prisma enum values for type safety
-    const activeTasks = await prisma.task.count({
-      where: {
-        ...taskWhere,
-        status: {
-          in: [TaskStatus.PENDING, TaskStatus.IN_PROGRESS]
-        }
-      }
-    });
-
-    // Count tasks by status for detailed breakdown
-    // Using Prisma enum values for type safety
-    const [completedTasks, pendingTasks, inProgressTasks] = await Promise.all([
-      prisma.task.count({
-        where: { ...taskWhere, status: TaskStatus.COMPLETED }
-      }),
-      prisma.task.count({
-        where: { ...taskWhere, status: TaskStatus.PENDING }
-      }),
-      prisma.task.count({
-        where: { ...taskWhere, status: TaskStatus.IN_PROGRESS }
-      })
-    ]);
-
-    // Count active team members
-    const teamMembers = await prisma.user.count({
-      where: {
-        isActive: true
-      }
-    });
-
-    // Count in-progress tenders
-    const inProgressTenders = await prisma.tender.count({
-      where: {
-        status: 'OPEN'
-      }
-    });
-
-    // Count total clients
-    const totalClients = await prisma.client.count();
-
-    // Count total tenders
-    const totalTenders = await prisma.tender.count();
-
-    // Count pending invitations (for tender engineers)
-    let pendingInvitations = 0;
-    if (userRole === 'TENDER_ENGINEER' && userId) {
-      pendingInvitations = await prisma.tenderInvitation.count({
+    if (isEmployee) {
+      // Employee: only counts for assigned projects and tasks
+      activeProjects = await prisma.projectAssignment.count({
         where: {
-          engineerId: userId,
-          status: 'PENDING'
+          employeeId: userId,
+          project: {
+            status: { in: [ProjectStatus.OPEN, ProjectStatus.IN_PROGRESS] }
+          }
         }
       });
+
+      const taskCounts = await Promise.all([
+        prisma.taskAssignment.count({
+          where: {
+            employeeId: userId,
+            task: { status: TaskStatus.COMPLETED }
+          }
+        }),
+        prisma.taskAssignment.count({
+          where: {
+            employeeId: userId,
+            task: { status: TaskStatus.PENDING }
+          }
+        }),
+        prisma.taskAssignment.count({
+          where: {
+            employeeId: userId,
+            task: { status: TaskStatus.IN_PROGRESS }
+          }
+        })
+      ]);
+      completedTasks = taskCounts[0];
+      pendingTasks = taskCounts[1];
+      inProgressTasks = taskCounts[2];
+      activeTasks = pendingTasks + inProgressTasks;
+
+      teamMembers = 0;
+      inProgressTenders = 0;
+      totalClients = 0;
+      totalTenders = 0;
+      pendingInvitations = 0;
+    } else {
+      // Admin / other roles: company-wide counts
+      activeProjects = await prisma.project.count({
+        where: {
+          status: { in: [ProjectStatus.OPEN, ProjectStatus.IN_PROGRESS] }
+        }
+      });
+
+      const existingProjects = await prisma.project.findMany({ select: { id: true } });
+      const projectIds = existingProjects.map(p => p.id);
+      const taskWhere = projectIds.length > 0 ? { projectId: { in: projectIds } } : { projectId: { in: [] } };
+
+      activeTasks = await prisma.task.count({
+        where: {
+          ...taskWhere,
+          status: { in: [TaskStatus.PENDING, TaskStatus.IN_PROGRESS] }
+        }
+      });
+
+      [completedTasks, pendingTasks, inProgressTasks] = await Promise.all([
+        prisma.task.count({ where: { ...taskWhere, status: TaskStatus.COMPLETED } }),
+        prisma.task.count({ where: { ...taskWhere, status: TaskStatus.PENDING } }),
+        prisma.task.count({ where: { ...taskWhere, status: TaskStatus.IN_PROGRESS } })
+      ]);
+
+      teamMembers = await prisma.user.count({ where: { isActive: true } });
+      inProgressTenders = await prisma.tender.count({ where: { status: 'OPEN' } });
+      totalClients = await prisma.client.count();
+      totalTenders = await prisma.tender.count();
+
+      pendingInvitations = 0;
+      if (userRole === 'TENDER_ENGINEER' && userId) {
+        pendingInvitations = await prisma.tenderInvitation.count({
+          where: { engineerId: userId, status: 'PENDING' }
+        });
+      }
     }
 
     return {
@@ -213,25 +191,32 @@ export const getDashboardSummary = async (userId?: string, userRole?: string): P
 
 /**
  * Get recent projects for dashboard
+ * For EMPLOYEE role, returns only projects assigned to the user
  */
-export const getRecentProjects = async (limit: number = 5) => {
+export const getRecentProjects = async (limit: number = 5, userId?: string, userRole?: string) => {
   try {
+    const isEmployee = userRole === 'EMPLOYEE' && userId;
+    const where = isEmployee
+      ? { assignedEmployees: { some: { employeeId: userId } } }
+      : {};
+
     const projects = await prisma.project.findMany({
+      where,
       take: limit,
       orderBy: {
         createdAt: 'desc'
       },
-      include: {
+      select: {
+        id: true,
+        name: true,
+        referenceNumber: true,
+        pin: true,
+        status: true,
+        projectManager: true, // Include projectManager field
+        createdAt: true,
         client: {
           select: {
             name: true,
-            email: true
-          }
-        },
-        projectManager: {
-          select: {
-            firstName: true,
-            lastName: true,
             email: true
           }
         },
@@ -252,9 +237,7 @@ export const getRecentProjects = async (limit: number = 5) => {
       pin: project.pin,
       status: project.status,
       clientName: project.client?.name || 'N/A',
-      projectManager: project.projectManager 
-        ? `${project.projectManager.firstName} ${project.projectManager.lastName}`
-        : 'N/A',
+      projectManager: project.projectManager || 'N/A', // Plain text string
       taskCount: project._count.tasks,
       documentCount: project._count.documents,
       tenderCount: project._count.tenders,

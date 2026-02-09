@@ -295,17 +295,28 @@ export const createClient = async (req: AuthRequest, res: Response): Promise<voi
     // Generate reference number
     const referenceNumber = await generateReferenceNumber();
 
-    // Handle document upload (field name: 'document')
+    // Handle document uploads: from upload.fields() we get req.files only (req.file is not set)
     let documentAttachment: string | null = null;
-    if (req.file) {
-      documentAttachment = `/uploads/documents/${req.file.filename}`;
-      console.log('📄 Client document uploaded:', {
-        fieldname: req.file.fieldname,
-        originalname: req.file.originalname,
-        filename: req.file.filename,
-        path: documentAttachment,
-        size: req.file.size,
-      });
+    let documentAttachments: string | null = null;
+    const files: Express.Multer.File[] = [];
+    const filesObj = req.files as { document?: Express.Multer.File[]; documents?: Express.Multer.File[] } | undefined;
+    if (filesObj?.document?.length) files.push(...filesObj.document);
+    if (filesObj?.documents?.length) files.push(...filesObj.documents);
+    if (files.length > 0) {
+      let documentTypes: string[] = [];
+      try {
+        if (typeof req.body.documentTypes === 'string') {
+          documentTypes = JSON.parse(req.body.documentTypes) || [];
+        }
+      } catch (_) {}
+      const attachments = files.map((f, i) => ({
+        documentType: documentTypes[i] || 'DOC',
+        path: `/uploads/documents/${f.filename}`,
+        originalName: f.originalname,
+      }));
+      documentAttachment = attachments[0].path;
+      documentAttachments = JSON.stringify(attachments);
+      console.log('📄 Client documents uploaded:', attachments.length, attachments);
     }
 
     // Parse dates
@@ -352,6 +363,7 @@ export const createClient = async (req: AuthRequest, res: Response): Promise<voi
         birthDate: parsedBirthDate,
         documentType: documentType || null,
         documentAttachment,
+        documentAttachments,
       },
       include: {
         _count: {
@@ -423,17 +435,42 @@ export const updateClient = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
-    // Handle document upload (if new file is uploaded)
+    // Handle document uploads: existing (from body) + new files
     let documentAttachment = existingClient.documentAttachment;
-    if (req.file) {
-      documentAttachment = `/uploads/documents/${req.file.filename}`;
-      console.log('📄 Client document updated:', {
-        fieldname: req.file.fieldname,
-        originalname: req.file.originalname,
-        filename: req.file.filename,
-        path: documentAttachment,
-        size: req.file.size,
-      });
+    let documentAttachments: string | null = existingClient.documentAttachments;
+    let documentsUpdated = false;
+    const filesObj = req.files as { document?: Express.Multer.File[]; documents?: Express.Multer.File[] } | undefined;
+    const files: Express.Multer.File[] = [];
+    if (filesObj?.document?.length) files.push(...filesObj.document);
+    if (filesObj?.documents?.length) files.push(...filesObj.documents);
+
+    if (files.length > 0 || req.body.existingDocumentAttachments !== undefined) {
+      documentsUpdated = true;
+      let existingAttachments: Array<{ documentType: string; path: string; originalName: string }> = [];
+      try {
+        if (typeof req.body.existingDocumentAttachments === 'string' && req.body.existingDocumentAttachments) {
+          existingAttachments = JSON.parse(req.body.existingDocumentAttachments) || [];
+        }
+      } catch (_) {}
+
+      let documentTypes: string[] = [];
+      try {
+        if (typeof req.body.documentTypes === 'string') {
+          documentTypes = JSON.parse(req.body.documentTypes) || [];
+        }
+      } catch (_) {}
+
+      const newAttachments = files.map((f, i) => ({
+        documentType: documentTypes[i] || 'DOC',
+        path: `/uploads/documents/${f.filename}`,
+        originalName: f.originalname,
+      }));
+      const allAttachments = [...existingAttachments, ...newAttachments];
+      documentAttachments = allAttachments.length > 0 ? JSON.stringify(allAttachments) : null;
+      documentAttachment = allAttachments.length > 0 ? allAttachments[0].path : null;
+      if (files.length > 0) {
+        console.log('📄 Client documents updated:', { existing: existingAttachments.length, new: newAttachments.length });
+      }
     }
 
     // Parse dates
@@ -485,7 +522,10 @@ export const updateClient = async (req: AuthRequest, res: Response): Promise<voi
     if (passportNumber !== undefined) updateData.passportNumber = passportNumber?.trim() || null;
     if (parsedBirthDate !== undefined) updateData.birthDate = parsedBirthDate;
     if (documentType !== undefined) updateData.documentType = documentType || null;
-    if (documentAttachment !== undefined) updateData.documentAttachment = documentAttachment;
+    if (documentsUpdated) {
+      updateData.documentAttachment = documentAttachment;
+      updateData.documentAttachments = documentAttachments;
+    }
 
     // Update client
     const updatedClient = await prisma.client.update({

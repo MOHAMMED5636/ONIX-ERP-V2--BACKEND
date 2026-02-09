@@ -11,12 +11,21 @@ import { getPhotoUrl } from '../utils/photo.utils';
 export const updateProfile = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
-    const { jobTitle } = req.body;
+    const { 
+      jobTitle, 
+      phone, 
+      position,
+      nationalIdNumber,
+      nationalIdExpiryDate
+    } = req.body;
     
     // Debug: Log request details
     console.log('📸 Profile update request received');
     console.log('   User ID:', userId);
     console.log('   Job Title:', jobTitle);
+    console.log('   Phone:', phone);
+    console.log('   Position:', position);
+    console.log('   National ID Number:', nationalIdNumber);
     console.log('   Has file:', !!(req as any).file);
     console.log('   Request headers:', {
       'content-type': req.headers['content-type'],
@@ -56,10 +65,23 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
       }
     }
 
-    // Build update data
+    // Build update data - allow employees to update their own profile fields
     const updateData: any = {};
     if (jobTitle !== undefined && jobTitle !== null) {
       updateData.jobTitle = jobTitle;
+    }
+    if (phone !== undefined && phone !== null) {
+      updateData.phone = phone;
+    }
+    if (position !== undefined && position !== null) {
+      updateData.position = position;
+    }
+    if (nationalIdNumber !== undefined && nationalIdNumber !== null) {
+      updateData.nationalIdNumber = nationalIdNumber;
+    }
+    if (nationalIdExpiryDate !== undefined && nationalIdExpiryDate !== null) {
+      // Parse date string if provided
+      updateData.nationalIdExpiryDate = nationalIdExpiryDate ? new Date(nationalIdExpiryDate) : null;
     }
     if (photoFilename) {
       updateData.photo = photoFilename;
@@ -92,6 +114,9 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
         phone: true,
         department: true,
         position: true,
+        employeeId: true,
+        nationalIdNumber: true,
+        nationalIdExpiryDate: true,
       }
     });
 
