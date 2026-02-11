@@ -87,6 +87,8 @@ model User {
   createdProjects  Project[]
   assignedProjects ProjectAssignment[] @relation("AssignedEmployee")
   assignedTasks    TaskAssignment[]
+  createdTemplates QuestionnaireTemplate[] @relation("TemplateCreator")
+  questionnaireResponses QuestionnaireResponse[] @relation("QuestionnaireRespondent")
 
   // HR Relations
   managedDepartments    Department[]    @relation("DepartmentManager")
@@ -196,6 +198,8 @@ model Project {
   attachments       ProjectAttachment[]
   chats             ProjectChat[]
   contracts         Contract[]
+  questionnaireQuestions QuestionnaireQuestion[]
+  questionnaireAssignments QuestionnaireAssignment[]
 
   @@map("projects")
 }
@@ -339,6 +343,9 @@ model Task {
   description    String?
   projectId      String
   project        Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  parentTaskId   String?      // For subtasks - references parent task
+  parentTask     Task?        @relation("TaskSubtasks", fields: [parentTaskId], references: [id], onDelete: Cascade)
+  subtasks       Task[]       @relation("TaskSubtasks") // Child tasks/subtasks
   status         TaskStatus   @default(PENDING)
   priority       TaskPriority @default(MEDIUM)
   startDate      DateTime?
@@ -347,6 +354,19 @@ model Task {
   estimatedHours Decimal?     @db.Decimal(10, 2)
   actualHours    Decimal?     @db.Decimal(10, 2)
   tags           String[] // Array of tags
+  // Additional fields for subtasks/child tasks
+  category       String?      // Task category (Design, Development, etc.)
+  referenceNumber String?      // Reference number for subtask
+  planDays       Int?         // Plan days for subtask
+  remarks        String?      @db.Text // Remarks
+  assigneeNotes  String?      @db.Text // Assignee notes
+  location       String?      // Location
+  makaniNumber   String?      // Makani number
+  plotNumber     String?      // Plot number
+  community      String?      // Community
+  projectType    String?      // Project type
+  projectFloor   String?      // Project floor
+  developerProject String?     // Developer project
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
   createdBy      String?
@@ -356,6 +376,8 @@ model Task {
   checklists  TaskChecklist[]
   attachments TaskAttachment[]
   comments    TaskComment[]
+  questionnaireQuestions QuestionnaireQuestion[]
+  questionnaireAssignments QuestionnaireAssignment[]
 
   @@map("tasks")
 }
@@ -397,7 +419,116 @@ enum TaskAssignmentStatus {
   CANCELLED
 }
 
-// Project Checklist
+// Questionnaire Template - Reusable checklist templates
+model QuestionnaireTemplate {
+  id          String    @id @default(uuid())
+  name        String    // Template name (e.g., "Safety Checklist", "Quality Control")
+  description String?
+  isActive    Boolean   @default(true)
+  isLocked    Boolean   @default(false) // Locked templates cannot be modified
+  createdBy   String?   // User ID who created the template
+  creator     User?     @relation("TemplateCreator", fields: [createdBy], references: [id])
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  
+  // Questions in this template
+  questions   QuestionnaireQuestion[]
+  
+  // Assignments - where this template is used
+  assignments QuestionnaireAssignment[]
+
+  @@map("questionnaire_templates")
+}
+
+// Questionnaire Question - Questions within a template
+model QuestionnaireQuestion {
+  id           String              @id @default(uuid())
+  templateId   String?
+  template     QuestionnaireTemplate? @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  
+  // Question details
+  questionText String              // The actual question
+  description  String?             // Optional description/instructions
+  order        Int                 @default(0) // Display order
+  isRequired   Boolean             @default(true) // Whether answer is required
+  
+  // Assignment details (if not part of a template)
+  projectId    String?
+  project      Project?            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  taskId       String?
+  task         Task?               @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  subtaskId    String?             // For sub-tasks (if you have a subtask model)
+  
+  // Status
+  isLocked     Boolean             @default(false) // Locked questions cannot be answered
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  createdBy    String?             // User ID who created the question
+  
+  // Responses to this question
+  responses    QuestionnaireResponse[]
+
+  @@map("questionnaire_questions")
+}
+
+// Questionnaire Response - Employee answers to questions
+model QuestionnaireResponse {
+  id          String              @id @default(uuid())
+  questionId  String
+  question    QuestionnaireQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  
+  // Response details
+  answer      QuestionnaireAnswer // Selected option
+  remarks     String?             // Optional remarks/notes
+  
+  // Tracking
+  answeredBy  String              // Employee user ID
+  employee    User                @relation("QuestionnaireRespondent", fields: [answeredBy], references: [id])
+  answeredAt  DateTime            @default(now()) // Date and time of response
+  
+  // Status
+  isLocked    Boolean             @default(false) // Locked responses cannot be modified
+  
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  @@unique([questionId, answeredBy]) // One response per employee per question
+  @@map("questionnaire_responses")
+}
+
+// Enum for questionnaire answers
+enum QuestionnaireAnswer {
+  ACTION_PLAN_APPLIED
+  NOT_AVAILABLE
+  NOT_APPLIED
+  PENDING
+}
+
+// Questionnaire Assignment - Links templates to Projects/Tasks/Sub-Tasks
+model QuestionnaireAssignment {
+  id          String              @id @default(uuid())
+  templateId  String
+  template    QuestionnaireTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  
+  // Assignment target
+  projectId   String?
+  project     Project?            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  taskId      String?
+  task        Task?               @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  subtaskId  String?              // For sub-tasks
+  
+  // Status
+  isActive    Boolean             @default(true)
+  assignedBy  String?             // User ID who assigned this template
+  assignedAt  DateTime            @default(now())
+  
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  @@map("questionnaire_assignments")
+}
+
+// Project Checklist (Legacy - keeping for backward compatibility)
 model ProjectChecklist {
   id          String    @id @default(uuid())
   projectId   String
@@ -414,7 +545,7 @@ model ProjectChecklist {
   @@map("project_checklists")
 }
 
-// Task Checklist
+// Task Checklist (Legacy - keeping for backward compatibility)
 model TaskChecklist {
   id          String    @id @default(uuid())
   taskId      String

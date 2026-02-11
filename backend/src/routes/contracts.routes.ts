@@ -46,6 +46,9 @@ router.post('/:id/approve', requireRole('ADMIN', 'HR'), contractsController.appr
 // Load Out: Create project from contract
 router.post('/:id/load-out', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER'), contractsController.loadOutContract);
 
+// Bulk Load Out: Create multiple projects from multiple contracts
+router.post('/bulk-load-out', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER'), contractsController.bulkLoadOutContracts);
+
 // Delete a contract
 router.delete('/:id', requireRole('ADMIN', 'HR'), contractsController.deleteContract);
 

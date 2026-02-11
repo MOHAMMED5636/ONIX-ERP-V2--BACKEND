@@ -1,7 +1,109 @@
 import { Request, Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { ProjectStatus } from '@prisma/client';
+import { ProjectStatus, TaskStatus, TaskPriority } from '@prisma/client';
+
+// Helper function to map frontend status to TaskStatus enum
+function mapStatusToTaskStatus(status: string): TaskStatus {
+  const statusMap: Record<string, TaskStatus> = {
+    'not started': TaskStatus.PENDING,
+    'pending': TaskStatus.PENDING,
+    'working': TaskStatus.IN_PROGRESS,
+    'in progress': TaskStatus.IN_PROGRESS,
+    'done': TaskStatus.COMPLETED,
+    'completed': TaskStatus.COMPLETED,
+    'stuck': TaskStatus.ON_HOLD,
+    'cancelled': TaskStatus.CANCELLED,
+    'suspended': TaskStatus.ON_HOLD,
+  };
+  return statusMap[status?.toLowerCase()] || TaskStatus.PENDING;
+}
+
+// Helper function to map frontend priority to TaskPriority enum
+function mapPriorityToTaskPriority(priority: string): TaskPriority {
+  const priorityMap: Record<string, TaskPriority> = {
+    'low': TaskPriority.LOW,
+    'medium': TaskPriority.MEDIUM,
+    'high': TaskPriority.HIGH,
+    'urgent': TaskPriority.URGENT,
+  };
+  return priorityMap[priority?.toLowerCase()] || TaskPriority.MEDIUM;
+}
+
+// Helper function to save child subtasks recursively
+async function saveChildSubtasks(parentTaskId: string, projectId: string, childSubtasks: any[]): Promise<void> {
+  if (!childSubtasks || !Array.isArray(childSubtasks) || childSubtasks.length === 0) {
+    return;
+  }
+
+  // Get existing child subtasks for this parent task
+  const whereClause: any = {
+    parentTaskId: parentTaskId,
+    projectId: projectId,
+  };
+  const existingChildSubtasks = await prisma.task.findMany({
+    where: whereClause,
+  });
+
+  const existingChildIds = new Set(existingChildSubtasks.map(cst => cst.id));
+  const incomingChildIds = new Set(childSubtasks.filter(cst => cst.id).map(cst => cst.id));
+
+  // Delete child subtasks that are no longer in the incoming list
+  const childSubtasksToDelete = existingChildSubtasks.filter(cst => !incomingChildIds.has(cst.id));
+  if (childSubtasksToDelete.length > 0) {
+    await prisma.task.deleteMany({
+      where: {
+        id: { in: childSubtasksToDelete.map(cst => cst.id) },
+      },
+    });
+  }
+
+  // Create or update child subtasks
+  for (const childSubtask of childSubtasks) {
+    const childSubtaskData: any = {
+      title: childSubtask.name || childSubtask.title || '',
+      projectId: projectId,
+      parentTaskId: parentTaskId, // Child subtasks have a parent subtask
+      status: mapStatusToTaskStatus(childSubtask.status),
+      priority: mapPriorityToTaskPriority(childSubtask.priority),
+      category: childSubtask.category || null,
+      referenceNumber: childSubtask.referenceNumber || null,
+      planDays: childSubtask.planDays ? parseInt(String(childSubtask.planDays), 10) : null,
+      remarks: childSubtask.remarks || null,
+      assigneeNotes: childSubtask.assigneeNotes || null,
+      location: childSubtask.location || null,
+      makaniNumber: childSubtask.makaniNumber || null,
+      plotNumber: childSubtask.plotNumber || null,
+      community: childSubtask.community || null,
+      projectType: childSubtask.projectType || null,
+      projectFloor: childSubtask.projectFloor || null,
+      developerProject: childSubtask.developerProject || null,
+      description: childSubtask.description || childSubtask.remarks || null,
+    };
+
+    // Handle timeline/dates
+    if (childSubtask.timeline && Array.isArray(childSubtask.timeline) && childSubtask.timeline.length >= 2) {
+      childSubtaskData.startDate = childSubtask.timeline[0] ? new Date(childSubtask.timeline[0]) : null;
+      childSubtaskData.dueDate = childSubtask.timeline[1] ? new Date(childSubtask.timeline[1]) : null;
+    } else if (childSubtask.startDate || childSubtask.endDate) {
+      childSubtaskData.startDate = childSubtask.startDate ? new Date(childSubtask.startDate) : null;
+      childSubtaskData.dueDate = childSubtask.endDate ? new Date(childSubtask.endDate) : null;
+    }
+
+    if (childSubtask.id && existingChildIds.has(childSubtask.id)) {
+      // Update existing child subtask
+      await prisma.task.update({
+        where: { id: childSubtask.id },
+        data: childSubtaskData,
+      });
+    } else {
+      // Create new child subtask
+      await prisma.task.create({
+        data: childSubtaskData,
+      });
+    }
+  }
+}
 
 // Get all projects with filters
 export const getAllProjects = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -619,6 +721,9 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       projectType,
       projectFloor,
       developerProject,
+      // Subtasks and child subtasks
+      subtasks,
+      childSubtasks,
     } = req.body;
 
     // Check if project exists
@@ -731,6 +836,96 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
         },
       },
     });
+
+    // Save/update subtasks and child subtasks if provided
+    if (subtasks && Array.isArray(subtasks)) {
+      try {
+        // Get existing subtasks for this project (tasks with no parentTaskId)
+        const subtaskWhereClause: any = {
+          projectId: id,
+          parentTaskId: null, // Subtasks are direct children of project (no parent task)
+        };
+        const existingSubtasks = await prisma.task.findMany({
+          where: subtaskWhereClause,
+        });
+
+        const existingSubtaskIds = new Set(existingSubtasks.map(st => st.id));
+        const incomingSubtaskIds = new Set(subtasks.filter(st => st.id).map(st => st.id));
+
+        // Delete subtasks that are no longer in the incoming list
+        const subtasksToDelete = existingSubtasks.filter(st => !incomingSubtaskIds.has(st.id));
+        if (subtasksToDelete.length > 0) {
+          await prisma.task.deleteMany({
+            where: {
+              id: { in: subtasksToDelete.map(st => st.id) },
+            },
+          });
+        }
+
+        // Create or update subtasks
+        for (const subtask of subtasks) {
+          const subtaskData: any = {
+            title: subtask.name || subtask.title || '',
+            projectId: id,
+            parentTaskId: null, // Subtasks are direct children of project
+            status: mapStatusToTaskStatus(subtask.status),
+            priority: mapPriorityToTaskPriority(subtask.priority),
+            category: subtask.category || null,
+            referenceNumber: subtask.referenceNumber || null,
+            planDays: subtask.planDays ? parseInt(String(subtask.planDays), 10) : null,
+            remarks: subtask.remarks || null,
+            assigneeNotes: subtask.assigneeNotes || null,
+            location: subtask.location || null,
+            makaniNumber: subtask.makaniNumber || null,
+            plotNumber: subtask.plotNumber || null,
+            community: subtask.community || null,
+            projectType: subtask.projectType || null,
+            projectFloor: subtask.projectFloor || null,
+            developerProject: subtask.developerProject || null,
+            description: subtask.description || subtask.remarks || null,
+          };
+
+          // Handle timeline/dates
+          if (subtask.timeline && Array.isArray(subtask.timeline) && subtask.timeline.length >= 2) {
+            subtaskData.startDate = subtask.timeline[0] ? new Date(subtask.timeline[0]) : null;
+            subtaskData.dueDate = subtask.timeline[1] ? new Date(subtask.timeline[1]) : null;
+          } else if (subtask.startDate || subtask.endDate) {
+            subtaskData.startDate = subtask.startDate ? new Date(subtask.startDate) : null;
+            subtaskData.dueDate = subtask.endDate ? new Date(subtask.endDate) : null;
+          }
+
+          if (subtask.id && existingSubtaskIds.has(subtask.id)) {
+            // Update existing subtask
+            await prisma.task.update({
+              where: { id: subtask.id },
+              data: subtaskData,
+            });
+          } else {
+            // Create new subtask
+            const newSubtask = await prisma.task.create({
+              data: subtaskData,
+            });
+
+            // Save child subtasks for this subtask
+            if (subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0) {
+              await saveChildSubtasks(newSubtask.id, id, subtask.childSubtasks);
+            }
+          }
+        }
+
+        // Handle child subtasks for existing subtasks
+        for (const subtask of subtasks) {
+          if (subtask.id && subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0) {
+            await saveChildSubtasks(subtask.id, id, subtask.childSubtasks);
+          }
+        }
+
+        console.log(`✅ Saved ${subtasks.length} subtasks for project ${id}`);
+      } catch (subtaskError) {
+        console.error('Error saving subtasks:', subtaskError);
+        // Don't fail the entire update if subtask save fails
+      }
+    }
 
     res.json({
       success: true,

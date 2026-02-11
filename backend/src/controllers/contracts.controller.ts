@@ -381,6 +381,7 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
+    // data includes all contract fields (e.g. projectManager, referenceNumber, status, client, etc.)
     res.json({
       success: true,
       data: contract,
@@ -1062,7 +1063,7 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       companyId,
       companyName,
       contractValue,
-      // referenceNumber is NOT allowed to be updated - it's auto-generated and immutable
+      referenceNumber, // Allow reference number to be updated
       currency,
       paymentTerms,
       startDate,
@@ -1114,11 +1115,26 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // Reference number is immutable - preserve it from existing contract
-    // If someone tries to send referenceNumber in the request, ignore it
-    const preservedReferenceNumber = existingContract.referenceNumber;
-    if (req.body.referenceNumber && req.body.referenceNumber !== preservedReferenceNumber) {
-      console.log('⚠️ Warning: Attempted to change referenceNumber from', preservedReferenceNumber, 'to', req.body.referenceNumber, '- ignoring change');
+    // Handle reference number update (if provided and different from current)
+    if (referenceNumber !== undefined && referenceNumber !== null && referenceNumber.trim() !== '') {
+      const newReferenceNumber = referenceNumber.trim();
+      const currentReferenceNumber = existingContract.referenceNumber;
+      
+      // Only validate uniqueness if the reference number is being changed
+      if (newReferenceNumber !== currentReferenceNumber) {
+        // Check if another contract already has this reference number
+        const existingContractWithRef = await prisma.contract.findUnique({
+          where: { referenceNumber: newReferenceNumber },
+        });
+        
+        if (existingContractWithRef && existingContractWithRef.id !== id) {
+          res.status(400).json({
+            success: false,
+            message: `A contract with reference number "${newReferenceNumber}" already exists`,
+          });
+          return;
+        }
+      }
     }
 
     // Handle document upload
@@ -1369,6 +1385,9 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
     const contract = await prisma.contract.update({
       where: { id },
       data: {
+        referenceNumber: referenceNumber !== undefined && referenceNumber !== null && referenceNumber.trim() !== '' 
+          ? referenceNumber.trim() 
+          : undefined,
         title: title !== undefined ? title.trim() : undefined,
         description: description !== undefined ? (description?.trim() || null) : undefined,
         contractType: contractType !== undefined ? contractType : undefined,
@@ -1453,7 +1472,7 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       },
     });
 
-    console.log('✅ Contract updated:', contract.referenceNumber, '(referenceNumber preserved, not changed)');
+    console.log('✅ Contract updated:', contract.referenceNumber);
 
     res.json({
       success: true,
@@ -1639,61 +1658,43 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // Check if project already exists (prevent duplicates)
+    // Allow loading out contracts multiple times - just log if already linked
     if (contract.projectId && contract.project) {
-      res.status(400).json({
-        success: false,
-        message: `This contract is already linked to project ${contract.project.referenceNumber}. Duplicate entries are not allowed.`,
-        existingProject: {
-          id: contract.project.id,
-          referenceNumber: contract.project.referenceNumber,
-          name: contract.project.name,
-        },
-      });
-      return;
+      console.log(`ℹ️ Contract ${contract.referenceNumber} already linked to project ${contract.project.referenceNumber}. Creating new project anyway.`);
     }
 
     // Use contract reference number as project reference number
-    // Check if a project with this reference number already exists
-    const existingProjectWithRef = await prisma.project.findUnique({
-      where: { referenceNumber: contract.referenceNumber },
-    });
+    // If a project with this reference number already exists, append a suffix
+    const baseReferenceNumber = contract.referenceNumber;
+    let projectReferenceNumber: string = baseReferenceNumber;
+    let suffix = 1;
 
-    let projectReferenceNumber: string;
+    // Check if project with base reference number exists, if so, append suffix
+    while (true) {
+      const existingProject = await prisma.project.findUnique({
+        where: { referenceNumber: projectReferenceNumber },
+      });
 
-    if (existingProjectWithRef) {
-      // If project already exists with this reference number, generate a unique one
-      // This shouldn't happen normally, but handle it gracefully
-      const prefix = 'PRJ-';
-      let referenceNumber: string;
-      let exists = true;
-      let attempts = 0;
-      const maxAttempts = 100;
-
-      while (exists && attempts < maxAttempts) {
-        const randomPart = Math.random().toString(36).substring(2, 10).toUpperCase();
-        referenceNumber = `${prefix}${randomPart}`;
-
-        const existing = await prisma.project.findUnique({
-          where: { referenceNumber },
-        });
-
-        if (!existing) {
-          exists = false;
-        }
-        attempts++;
+      if (!existingProject) {
+        // This reference number is available, use it
+        break;
       }
 
-      if (attempts >= maxAttempts) {
-        const timestamp = Date.now().toString(36).toUpperCase();
-        referenceNumber = `${prefix}${timestamp}`;
-      }
+      // Append suffix to make it unique (e.g., "7896-1", "7896-2")
+      projectReferenceNumber = `${baseReferenceNumber}-${suffix}`;
+      suffix++;
 
-      projectReferenceNumber = referenceNumber!;
-      console.warn(`⚠️ Project with reference number ${contract.referenceNumber} already exists. Using generated reference: ${projectReferenceNumber}`);
-    } else {
-      // Use contract reference number as project reference number
-      projectReferenceNumber = contract.referenceNumber;
+      // Safety check to prevent infinite loop
+      if (suffix > 1000) {
+        // Fallback to timestamp-based suffix if too many attempts
+        const timestamp = Date.now().toString(36).toUpperCase().substring(0, 6);
+        projectReferenceNumber = `${baseReferenceNumber}-${timestamp}`;
+        break;
+      }
+    }
+
+    if (suffix > 1) {
+      console.log(`ℹ️ Project with reference number ${baseReferenceNumber} already exists. Using: ${projectReferenceNumber}`);
     }
 
     // Calculate plan days from contract dates if available
@@ -1807,6 +1808,240 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
     res.status(500).json({
       success: false,
       message: 'Failed to create project from contract',
+      error: error.message,
+    });
+  }
+};
+
+// Bulk Load Out: Create multiple projects from multiple contracts
+export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { contractIds } = req.body;
+
+    // Employee role: Cannot create projects
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to create projects. Please contact your manager.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
+    // Validate input
+    if (!contractIds || !Array.isArray(contractIds) || contractIds.length === 0) {
+      res.status(400).json({
+        success: false,
+        message: 'Contract IDs array is required and must not be empty',
+      });
+      return;
+    }
+
+    const results: any[] = [];
+    const errors: any[] = [];
+
+    // Process each contract
+    for (const contractId of contractIds) {
+      try {
+        // Fetch contract with all details
+        const contract = await prisma.contract.findUnique({
+          where: { id: contractId },
+          select: {
+            id: true,
+            referenceNumber: true,
+            title: true,
+            description: true,
+            contractType: true,
+            contractCategory: true,
+            status: true,
+            clientId: true,
+            projectId: true,
+            developerName: true,
+            projectManager: true,
+            startDate: true,
+            endDate: true,
+            makaniNumber: true,
+            latitude: true,
+            longitude: true,
+            region: true,
+            plotNumber: true,
+            community: true,
+            numberOfFloors: true,
+            specialClauses: true,
+            termsAndConditions: true,
+            paymentTerms: true,
+            client: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                phone: true,
+              },
+            },
+            creator: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+              },
+            },
+            project: {
+              select: {
+                id: true,
+                name: true,
+                referenceNumber: true,
+                status: true,
+              },
+            },
+          },
+        });
+
+        if (!contract) {
+          errors.push({
+            contractId,
+            message: 'Contract not found',
+          });
+          continue;
+        }
+
+        // Allow loading out contracts multiple times - just log if already linked
+        if (contract.projectId && contract.project) {
+          console.log(`ℹ️ Contract ${contract.referenceNumber} already linked to project ${contract.project.referenceNumber}. Creating new project anyway.`);
+        }
+
+        // Use contract reference number as project reference number
+        // If a project with this reference number already exists, append a suffix
+        const baseReferenceNumber = contract.referenceNumber;
+        let projectReferenceNumber: string = baseReferenceNumber;
+        let suffix = 1;
+
+        // Check if project with base reference number exists, if so, append suffix
+        while (true) {
+          const existingProject = await prisma.project.findUnique({
+            where: { referenceNumber: projectReferenceNumber },
+          });
+
+          if (!existingProject) {
+            // This reference number is available, use it
+            break;
+          }
+
+          // Append suffix to make it unique (e.g., "7896-1", "7896-2")
+          projectReferenceNumber = `${baseReferenceNumber}-${suffix}`;
+          suffix++;
+
+          // Safety check to prevent infinite loop
+          if (suffix > 1000) {
+            // Fallback to timestamp-based suffix if too many attempts
+            const timestamp = Date.now().toString(36).toUpperCase().substring(0, 6);
+            projectReferenceNumber = `${baseReferenceNumber}-${timestamp}`;
+            break;
+          }
+        }
+
+        if (suffix > 1) {
+          console.log(`ℹ️ Project with reference number ${baseReferenceNumber} already exists. Using: ${projectReferenceNumber}`);
+        }
+
+        // Calculate plan days
+        let planDays: number | null = null;
+        if (contract.startDate && contract.endDate) {
+          const start = new Date(contract.startDate);
+          const end = new Date(contract.endDate);
+          const diffTime = Math.abs(end.getTime() - start.getTime());
+          planDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+        }
+
+        // Map contract fields to project fields
+        const projectName = contract.title || `Project ${contract.referenceNumber}`;
+        const projectManager = contract.projectManager 
+          ? contract.projectManager.trim().substring(0, 100)
+          : (contract.creator 
+            ? `${contract.creator.firstName} ${contract.creator.lastName}`.trim().substring(0, 100)
+            : null);
+
+        // Build location string
+        let locationString: string | null = null;
+        if (contract.makaniNumber) {
+          locationString = contract.makaniNumber;
+        } else if (contract.latitude && contract.longitude) {
+          locationString = `${contract.latitude}, ${contract.longitude}`;
+        }
+
+        // Create project from contract data
+        const project = await prisma.project.create({
+          data: {
+            name: projectName,
+            referenceNumber: projectReferenceNumber,
+            pin: null,
+            clientId: contract.clientId || null,
+            owner: contract.developerName || null,
+            description: contract.description || null,
+            status: 'OPEN', // Default status = Active
+            projectManager: projectManager,
+            startDate: contract.startDate ? new Date(contract.startDate) : null,
+            endDate: contract.endDate ? new Date(contract.endDate) : null,
+            deadline: contract.endDate ? new Date(contract.endDate) : null,
+            planDays: planDays,
+            remarks: contract.specialClauses || contract.termsAndConditions || null,
+            assigneeNotes: contract.paymentTerms || null,
+            location: locationString,
+            makaniNumber: contract.makaniNumber || null,
+            plotNumber: contract.plotNumber || null,
+            community: contract.community || null,
+            projectType: contract.contractType || null,
+            projectFloor: contract.numberOfFloors ? contract.numberOfFloors.toString() : null,
+            developerProject: contract.developerName || null,
+            createdBy: req.user?.id || null,
+          },
+          include: {
+            client: true,
+          },
+        });
+
+        // Link contract to the created project
+        await prisma.contract.update({
+          where: { id: contract.id },
+          data: { projectId: project.id },
+        });
+
+        results.push({
+          contractId: contract.id,
+          contractReference: contract.referenceNumber,
+          projectId: project.id,
+          projectReference: project.referenceNumber,
+          projectName: project.name,
+          success: true,
+        });
+
+        console.log(`✅ Load Out successful: Contract ${contract.referenceNumber} → Project ${project.referenceNumber}`);
+      } catch (error: any) {
+        console.error(`❌ Error loading out contract ${contractId}:`, error);
+        errors.push({
+          contractId,
+          message: error.message || 'Failed to create project from contract',
+        });
+      }
+    }
+
+    // Return results
+    res.json({
+      success: errors.length === 0,
+      message: `Processed ${contractIds.length} contract(s). ${results.length} successful, ${errors.length} failed.`,
+      data: {
+        successful: results,
+        failed: errors,
+        totalProcessed: contractIds.length,
+        totalSuccessful: results.length,
+        totalFailed: errors.length,
+      },
+    });
+  } catch (error: any) {
+    console.error('❌ Error in bulk load out:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to process bulk load out',
       error: error.message,
     });
   }
