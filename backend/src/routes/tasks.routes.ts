@@ -44,6 +44,10 @@ router.post('/', tasksController.createTask);
 router.put('/:id', tasksController.updateTask);
 router.delete('/:id', tasksController.deleteTask);
 
+// Hierarchical task endpoints
+router.post('/:parentId/subtask', tasksController.addSubtask); // Add subtask to main task
+router.post('/:parentId/child', tasksController.addChildTask); // Add child task to subtask
+
 // Task employee assignment
 router.post('/:id/assign', tasksController.assignEmployees);
 router.put('/:id/assignments/:assignmentId/status', tasksController.updateAssignmentStatus);

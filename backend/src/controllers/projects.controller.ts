@@ -79,6 +79,7 @@ async function saveChildSubtasks(parentTaskId: string, projectId: string, childS
       projectFloor: childSubtask.projectFloor || null,
       developerProject: childSubtask.developerProject || null,
       description: childSubtask.description || childSubtask.remarks || null,
+      tags: Array.isArray(childSubtask.tags) ? childSubtask.tags : [],
     };
 
     // Handle timeline/dates
@@ -236,6 +237,55 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               createdAt: 'desc',
             },
           },
+          tasks: {
+            where: {
+              parentTaskId: null, // Only get main subtasks (not child tasks)
+            },
+            select: {
+              id: true,
+              title: true,
+              description: true,
+              status: true,
+              priority: true,
+              startDate: true,
+              dueDate: true,
+              category: true,
+              referenceNumber: true,
+              planDays: true,
+              remarks: true,
+              assigneeNotes: true,
+              location: true,
+              makaniNumber: true,
+              plotNumber: true,
+              community: true,
+              projectType: true,
+              projectFloor: true,
+              developerProject: true,
+              subtasks: {
+                select: {
+                  id: true,
+                  title: true,
+                  description: true,
+                  status: true,
+                  priority: true,
+                  startDate: true,
+                  dueDate: true,
+                  category: true,
+                  referenceNumber: true,
+                  planDays: true,
+                  remarks: true,
+                  assigneeNotes: true,
+                  location: true,
+                  makaniNumber: true,
+                  plotNumber: true,
+                  community: true,
+                  projectType: true,
+                  projectFloor: true,
+                  developerProject: true,
+                },
+              },
+            },
+          } as any,
           _count: {
             select: {
               tasks: true,
@@ -244,7 +294,7 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               contracts: true,
             },
           },
-        },
+        } as any,
       }),
       prisma.project.count({ where }),
     ]);
@@ -883,6 +933,7 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             projectFloor: subtask.projectFloor || null,
             developerProject: subtask.developerProject || null,
             description: subtask.description || subtask.remarks || null,
+            tags: Array.isArray(subtask.tags) ? subtask.tags : [],
           };
 
           // Handle timeline/dates

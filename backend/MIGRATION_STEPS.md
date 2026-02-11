@@ -1,83 +1,91 @@
-# 🗄️ Database Migration Steps - Photo & Job Title
+# Migration Steps - After Resolving Failed Migration
 
-## ⚠️ Important: Run Migration First!
+## Step-by-Step Commands
 
-The TypeScript errors you see are because the database hasn't been migrated yet. Follow these steps:
-
----
-
-## Step 1: Run Database Migration
-
-```bash
-cd backend
-npx prisma migrate dev --name add_photo_jobtitle
+### 1. Resolve the Failed Migration (if not done yet)
+```powershell
+cd c:\Users\Lenovo\Desktop\Onix-ERP-Backend\backend
+npx prisma migrate resolve --applied 20260204020000_add_questionnaire_feature
+```
+OR if tables don't exist:
+```powershell
+npx prisma migrate resolve --rolled-back 20260204020000_add_questionnaire_feature
 ```
 
-This will:
-- Create a new migration file
-- Update your database schema
-- Regenerate Prisma Client automatically
+### 2. Apply the New Task Hierarchy Migration
+```powershell
+npx prisma migrate deploy
+```
+This will apply the `20260205000000_add_task_hierarchy_and_fields` migration that adds:
+- `parentTaskId` column
+- All missing fields (category, referenceNumber, planDays, etc.)
+- Foreign keys and indexes
 
----
-
-## Step 2: Verify Migration
-
-After migration, TypeScript errors should disappear. If they persist:
-
-```bash
+### 3. Regenerate Prisma Client
+```powershell
 npx prisma generate
 ```
+This updates TypeScript types to recognize the new fields and relations.
+
+### 4. Verify Migration Status
+```powershell
+npx prisma migrate status
+```
+Should show all migrations as applied.
+
+### 5. Restart Backend Server
+```powershell
+npm run dev
+# or
+npm start
+```
 
 ---
 
-## Step 3: Test the Changes
+## Quick Copy-Paste (All Commands)
 
-1. Start your backend server:
-   ```bash
-   npm run dev
-   ```
-
-2. Test the profile update endpoint:
-   ```bash
-   # Get your token first by logging in
-   curl -X PUT http://localhost:3001/api/auth/profile \
-     -H "Authorization: Bearer YOUR_TOKEN" \
-     -F "jobTitle=Senior Engineer" \
-     -F "photo=@/path/to/your/photo.jpg"
-   ```
+```powershell
+cd c:\Users\Lenovo\Desktop\Onix-ERP-Backend\backend
+npx prisma migrate resolve --applied 20260204020000_add_questionnaire_feature
+npx prisma migrate deploy
+npx prisma generate
+npx prisma migrate status
+npm run dev
+```
 
 ---
 
-## ✅ After Migration
+## What Each Command Does
 
-- ✅ Database will have `photo` and `jobTitle` columns
-- ✅ Prisma Client will include these fields
-- ✅ TypeScript errors will be resolved
-- ✅ API endpoints will work correctly
-
----
-
-## 🐛 If Migration Fails
-
-If you get errors during migration:
-
-1. **Check if database is running:**
-   ```bash
-   # Windows PowerShell
-   Get-Service -Name "*postgresql*"
-   ```
-
-2. **Check DATABASE_URL in .env:**
-   ```env
-   DATABASE_URL="postgresql://postgres:password@localhost:5432/onix_erp?schema=public"
-   ```
-
-3. **Try resetting database (⚠️ WARNING: Deletes all data):**
-   ```bash
-   npx prisma migrate reset
-   ```
+1. **`migrate resolve`** - Marks the failed migration as resolved
+2. **`migrate deploy`** - Applies pending migrations (your new task hierarchy migration)
+3. **`prisma generate`** - Regenerates Prisma client with new schema types
+4. **`migrate status`** - Verifies all migrations are applied
+5. **`npm run dev`** - Starts your server with the updated schema
 
 ---
 
-**Run the migration now to resolve TypeScript errors!** 🚀
+## Expected Output
 
+After `migrate deploy`, you should see:
+```
+✅ Applied migration `20260205000000_add_task_hierarchy_and_fields`
+```
+
+After `prisma generate`, you should see:
+```
+✔ Generated Prisma Client
+```
+
+---
+
+## Troubleshooting
+
+If `migrate deploy` fails:
+- Check PostgreSQL is running
+- Verify DATABASE_URL in `.env` is correct
+- Check if columns already exist (migration uses `IF NOT EXISTS` so should be safe)
+
+If TypeScript errors persist:
+- Restart VS Code TypeScript server (Ctrl+Shift+P → "TypeScript: Restart TS Server")
+- The `as any` assertions in code will work until types are regenerated

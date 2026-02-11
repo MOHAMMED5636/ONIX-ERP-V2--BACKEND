@@ -21,7 +21,10 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
     const limitNum = parseInt(limit as string, 10);
     const skip = (pageNum - 1) * limitNum;
 
-    const where: any = {};
+    const where: any = {
+      // Only fetch main tasks (no parent) - subtasks and child tasks are included via relations
+      parentTaskId: null,
+    };
 
     if (projectId) {
       where.projectId = projectId as string;
@@ -89,6 +92,15 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
               },
             },
           },
+          // Include nested subtasks and their child tasks
+          subtasks: {
+            include: {
+              subtasks: true, // Child tasks nested inside subtasks
+            },
+            orderBy: {
+              createdAt: 'asc',
+            },
+          } as any,
           _count: {
             select: {
               checklists: true,
@@ -96,7 +108,7 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
               comments: true,
             },
           },
-        },
+        } as any,
       }),
       prisma.task.count({ where }),
     ]);
@@ -154,7 +166,7 @@ export const getTaskById = async (req: AuthRequest, res: Response): Promise<void
       }
     }
 
-    // Fetch full task details with all relations
+    // Fetch full task details with all relations including nested subtasks
     const task = await prisma.task.findUnique({
       where: { id },
       include: {
@@ -181,6 +193,15 @@ export const getTaskById = async (req: AuthRequest, res: Response): Promise<void
             },
           },
         },
+        // Include nested subtasks and their child tasks
+        subtasks: {
+          include: {
+            subtasks: true, // Child tasks nested inside subtasks
+          },
+          orderBy: {
+            createdAt: 'asc',
+          },
+        } as any,
         checklists: {
           orderBy: {
             order: 'asc',
@@ -200,7 +221,7 @@ export const getTaskById = async (req: AuthRequest, res: Response): Promise<void
             // You might want to add a relation or fetch user separately
           },
         },
-      },
+      } as any,
     });
 
   } catch (error) {
@@ -233,6 +254,21 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
       estimatedHours,
       tags,
       employeeIds, // Array of employee IDs to assign
+      // Additional fields for subtasks
+      category,
+      referenceNumber,
+      planDays,
+      remarks,
+      assigneeNotes,
+      location,
+      makaniNumber,
+      plotNumber,
+      community,
+      projectType,
+      projectFloor,
+      developerProject,
+      // Nested subtasks and child tasks
+      subtasks, // Array of subtasks with nested childSubtasks
     } = req.body;
 
     // Validate required fields
@@ -257,27 +293,83 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // Create task
+    // Helper function to map subtask data for nested create
+    const mapSubtaskData = (subtask: any) => ({
+      title: subtask.title || subtask.name || '',
+      description: subtask.description || null,
+      projectId,
+      status: subtask.status === 'not started' ? 'PENDING' : 
+              subtask.status === 'working' ? 'IN_PROGRESS' : 
+              subtask.status === 'done' ? 'COMPLETED' : 'PENDING',
+      priority: subtask.priority === 'Low' ? 'LOW' : 
+                subtask.priority === 'High' ? 'HIGH' : 
+                subtask.priority === 'Medium' ? 'MEDIUM' : 'MEDIUM',
+      startDate: subtask.timeline?.[0] ? new Date(subtask.timeline[0]) : 
+                 subtask.startDate ? new Date(subtask.startDate) : null,
+      dueDate: subtask.timeline?.[1] ? new Date(subtask.timeline[1]) : 
+               subtask.endDate ? new Date(subtask.endDate) : null,
+      category: subtask.category || null,
+      referenceNumber: subtask.referenceNumber || null,
+      planDays: subtask.planDays ? parseInt(String(subtask.planDays), 10) : null,
+      remarks: subtask.remarks || null,
+      assigneeNotes: subtask.assigneeNotes || null,
+      location: subtask.location || null,
+      makaniNumber: subtask.makaniNumber || null,
+      plotNumber: subtask.plotNumber || null,
+      community: subtask.community || null,
+      projectType: subtask.projectType || null,
+      projectFloor: subtask.projectFloor || null,
+      developerProject: subtask.developerProject || null,
+      tags: Array.isArray(subtask.tags) ? subtask.tags : [],
+      createdBy: req.user?.id || null,
+      // Nested child subtasks
+      subtasks: subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0
+        ? {
+            create: subtask.childSubtasks.map(mapSubtaskData),
+          }
+        : undefined,
+    });
+
+    // Create task with nested subtasks and child tasks
+    const taskData: any = {
+      title,
+      description: description || null,
+      projectId,
+      status: status || 'PENDING',
+      priority: priority || 'MEDIUM',
+      startDate: startDate ? new Date(startDate) : null,
+      dueDate: dueDate ? new Date(dueDate) : null,
+      estimatedHours: estimatedHours ? parseFloat(estimatedHours) : null,
+      tags: tags || [],
+      referenceNumber: referenceNumber || null,
+      planDays: planDays ? parseInt(String(planDays), 10) : null,
+      remarks: remarks || null,
+      assigneeNotes: assigneeNotes || null,
+      location: location || null,
+      makaniNumber: makaniNumber || null,
+      plotNumber: plotNumber || null,
+      community: community || null,
+      projectType: projectType || null,
+      projectFloor: projectFloor || null,
+      developerProject: developerProject || null,
+      createdBy: req.user?.id || null,
+      assignments: employeeIds && employeeIds.length > 0 ? {
+        create: employeeIds.map((employeeId: string) => ({
+          employeeId,
+          assignedBy: req.user?.id || null,
+          status: 'PENDING',
+        })),
+      } : undefined,
+      // Nested create for subtasks (with their child tasks)
+      subtasks: subtasks && Array.isArray(subtasks) && subtasks.length > 0
+        ? {
+            create: subtasks.map(mapSubtaskData),
+          }
+        : undefined,
+    };
+    
     const task = await prisma.task.create({
-      data: {
-        title,
-        description: description || null,
-        projectId,
-        status: status || 'PENDING',
-        priority: priority || 'MEDIUM',
-        startDate: startDate ? new Date(startDate) : null,
-        dueDate: dueDate ? new Date(dueDate) : null,
-        estimatedHours: estimatedHours ? parseFloat(estimatedHours) : null,
-        tags: tags || [],
-        createdBy: req.user?.id || null,
-        assignments: employeeIds && employeeIds.length > 0 ? {
-          create: employeeIds.map((employeeId: string) => ({
-            employeeId,
-            assignedBy: req.user?.id || null,
-            status: 'PENDING',
-          })),
-        } : undefined,
-      },
+      data: taskData,
       include: {
         project: {
           select: {
@@ -298,7 +390,16 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
             },
           },
         },
-      },
+        // Include nested subtasks and their child tasks
+        subtasks: {
+          include: {
+            subtasks: true, // Child tasks
+          },
+          orderBy: {
+            createdAt: 'asc',
+          },
+        } as any,
+      } as any,
     });
 
     res.status(201).json({
@@ -698,6 +799,255 @@ export const getTaskStats = async (req: AuthRequest, res: Response): Promise<voi
     });
   } catch (error) {
     console.error('Get task stats error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// Add subtask to a main task (requires parentId = main task id)
+export const addSubtask = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { parentId } = req.params; // Main task ID
+    const {
+      title,
+      description,
+      status,
+      priority,
+      startDate,
+      dueDate,
+      category,
+      referenceNumber,
+      planDays,
+      remarks,
+      assigneeNotes,
+      location,
+      makaniNumber,
+      plotNumber,
+      community,
+      projectType,
+      projectFloor,
+      developerProject,
+      tags,
+      timeline, // [startDate, endDate] array
+      childSubtasks, // Nested child tasks
+    } = req.body;
+
+    // Validate required fields
+    if (!title || !parentId) {
+      res.status(400).json({
+        success: false,
+        message: 'Title and parent task ID are required',
+      });
+      return;
+    }
+
+    // Check if parent task exists
+    const parentTask = await prisma.task.findUnique({
+      where: { id: parentId },
+      select: { id: true, projectId: true },
+    });
+
+    if (!parentTask) {
+      res.status(404).json({
+        success: false,
+        message: 'Parent task not found',
+      });
+      return;
+    }
+
+    // Helper to map child subtask data
+    const mapChildSubtaskData = (child: any) => ({
+      title: child.title || child.name || '',
+      description: child.description || null,
+      projectId: parentTask.projectId,
+      status: child.status === 'not started' ? 'PENDING' : 
+              child.status === 'working' ? 'IN_PROGRESS' : 
+              child.status === 'done' ? 'COMPLETED' : 'PENDING',
+      priority: child.priority === 'Low' ? 'LOW' : 
+                child.priority === 'High' ? 'HIGH' : 
+                child.priority === 'Medium' ? 'MEDIUM' : 'MEDIUM',
+      startDate: child.timeline?.[0] ? new Date(child.timeline[0]) : 
+                 child.startDate ? new Date(child.startDate) : null,
+      dueDate: child.timeline?.[1] ? new Date(child.timeline[1]) : 
+               child.endDate ? new Date(child.endDate) : null,
+      category: child.category || null,
+      referenceNumber: child.referenceNumber || null,
+      planDays: child.planDays ? parseInt(String(child.planDays), 10) : null,
+      remarks: child.remarks || null,
+      assigneeNotes: child.assigneeNotes || null,
+      location: child.location || null,
+      makaniNumber: child.makaniNumber || null,
+      plotNumber: child.plotNumber || null,
+      community: child.community || null,
+      projectType: child.projectType || null,
+      projectFloor: child.projectFloor || null,
+      developerProject: child.developerProject || null,
+      tags: Array.isArray(child.tags) ? child.tags : [],
+      createdBy: req.user?.id || null,
+    });
+
+    // Create subtask with nested child tasks
+    const subtask = await prisma.task.create({
+      data: {
+        title,
+        description: description || null,
+        projectId: parentTask.projectId,
+        parentTaskId: parentId as any, // Link to parent task
+        status: status === 'not started' ? 'PENDING' : 
+                status === 'working' ? 'IN_PROGRESS' : 
+                status === 'done' ? 'COMPLETED' : 'PENDING',
+        priority: priority === 'Low' ? 'LOW' : 
+                  priority === 'High' ? 'HIGH' : 
+                  priority === 'Medium' ? 'MEDIUM' : 'MEDIUM',
+        startDate: timeline?.[0] ? new Date(timeline[0]) : 
+                   startDate ? new Date(startDate) : null,
+        dueDate: timeline?.[1] ? new Date(timeline[1]) : 
+                 dueDate ? new Date(dueDate) : null,
+        category: category || null as any,
+        referenceNumber: referenceNumber || null as any,
+        planDays: planDays ? parseInt(String(planDays), 10) : null as any,
+        remarks: remarks || null as any,
+        assigneeNotes: assigneeNotes || null as any,
+        location: location || null as any,
+        makaniNumber: makaniNumber || null as any,
+        plotNumber: plotNumber || null as any,
+        community: community || null as any,
+        projectType: projectType || null as any,
+        projectFloor: projectFloor || null as any,
+        developerProject: developerProject || null as any,
+        tags: Array.isArray(tags) ? tags : [],
+        createdBy: req.user?.id || null,
+        // Nested create for child tasks
+        subtasks: childSubtasks && Array.isArray(childSubtasks) && childSubtasks.length > 0
+          ? {
+              create: childSubtasks.map(mapChildSubtaskData),
+            }
+          : undefined,
+      } as any,
+      include: {
+        parentTask: {
+          select: {
+            id: true,
+            title: true,
+          },
+        } as any,
+        subtasks: {
+          orderBy: {
+            createdAt: 'asc',
+          },
+        },
+      } as any,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Subtask created successfully',
+      data: subtask,
+    });
+  } catch (error) {
+    console.error('Add subtask error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+// Add child task to a subtask (requires parentId = subtask id)
+export const addChildTask = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { parentId } = req.params; // Subtask ID
+    const {
+      title,
+      description,
+      status,
+      priority,
+      startDate,
+      dueDate,
+      category,
+      referenceNumber,
+      planDays,
+      remarks,
+      assigneeNotes,
+      location,
+      makaniNumber,
+      plotNumber,
+      community,
+      projectType,
+      projectFloor,
+      developerProject,
+      tags,
+      timeline, // [startDate, endDate] array
+    } = req.body;
+
+    // Validate required fields
+    if (!title || !parentId) {
+      res.status(400).json({
+        success: false,
+        message: 'Title and parent subtask ID are required',
+      });
+      return;
+    }
+
+    // Check if parent subtask exists
+    const parentSubtask = await prisma.task.findUnique({
+      where: { id: parentId },
+      select: { id: true, projectId: true, parentTaskId: true } as any,
+    });
+
+    if (!parentSubtask) {
+      res.status(404).json({
+        success: false,
+        message: 'Parent subtask not found',
+      });
+      return;
+    }
+
+    // Create child task
+    const childTask = await prisma.task.create({
+      data: {
+        title,
+        description: description || null,
+        projectId: parentSubtask.projectId,
+        parentTaskId: parentId as any, // Link to parent subtask
+        status: status === 'not started' ? 'PENDING' : 
+                status === 'working' ? 'IN_PROGRESS' : 
+                status === 'done' ? 'COMPLETED' : 'PENDING',
+        priority: priority === 'Low' ? 'LOW' : 
+                  priority === 'High' ? 'HIGH' : 
+                  priority === 'Medium' ? 'MEDIUM' : 'MEDIUM',
+        startDate: timeline?.[0] ? new Date(timeline[0]) : 
+                   startDate ? new Date(startDate) : null,
+        dueDate: timeline?.[1] ? new Date(timeline[1]) : 
+                 dueDate ? new Date(dueDate) : null,
+        category: category || null as any,
+        referenceNumber: referenceNumber || null as any,
+        planDays: planDays ? parseInt(String(planDays), 10) : null as any,
+        remarks: remarks || null as any,
+        assigneeNotes: assigneeNotes || null as any,
+        location: location || null as any,
+        makaniNumber: makaniNumber || null as any,
+        plotNumber: plotNumber || null as any,
+        community: community || null as any,
+        projectType: projectType || null as any,
+        projectFloor: projectFloor || null as any,
+        developerProject: developerProject || null as any,
+        tags: Array.isArray(tags) ? tags : [],
+        createdBy: req.user?.id || null,
+      } as any,
+      include: {
+        parentTask: {
+          select: {
+            id: true,
+            title: true,
+          },
+        } as any,
+      } as any,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Child task created successfully',
+      data: childTask,
+    });
+  } catch (error) {
+    console.error('Add child task error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
