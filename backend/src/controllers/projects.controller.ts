@@ -738,14 +738,10 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
                       },
                     },
                   },
-                  orderBy: {
-                    createdAt: 'asc',
-                  },
+                  orderBy: { createdAt: 'asc' },
                 },
               },
-              orderBy: {
-                createdAt: 'asc',
-              },
+              orderBy: { createdAt: 'asc' },
             },
             _count: {
               select: {
@@ -754,24 +750,16 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
               },
             },
           },
-          orderBy: {
-            createdAt: 'desc',
-          },
+          orderBy: { createdAt: 'desc' },
         },
         checklists: {
-          orderBy: {
-            order: 'asc',
-          },
+          orderBy: { order: 'asc' },
         },
         attachments: {
-          orderBy: {
-            uploadedAt: 'desc',
-          },
+          orderBy: { uploadedAt: 'desc' },
         },
         documents: {
-          orderBy: {
-            uploadedAt: 'desc',
-          },
+          orderBy: { uploadedAt: 'desc' },
         },
         tenders: {
           select: {
@@ -797,8 +785,8 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
             community: true,
             numberOfFloors: true,
             makaniNumber: true,
-            assignedManagerId: true as any,
-            assignedManagerEmail: true as any,
+            assignedManagerId: true,
+            assignedManagerEmail: true,
             assignedManager: {
               select: {
                 id: true,
@@ -807,9 +795,7 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
               },
             },
           },
-          orderBy: {
-            createdAt: 'desc',
-          },
+          orderBy: { createdAt: 'desc' },
         },
         _count: {
           select: {
