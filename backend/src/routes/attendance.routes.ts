@@ -1,11 +1,15 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.middleware';
+import { requireRole } from '../middleware/role.middleware';
 import * as attendanceController from '../controllers/attendance.controller';
 
 const router = Router();
 
 // All attendance routes require authentication
 router.use(authenticate);
+
+// Admin: all employees' attendance (date filter, working hours)
+router.get('/all', requireRole('ADMIN', 'HR'), attendanceController.getAllAttendanceForAdmin);
 
 // Get office location (for frontend proximity check)
 router.get('/office-location', attendanceController.getOfficeLocation);

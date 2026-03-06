@@ -30,27 +30,63 @@ function mapPriorityToTaskPriority(priority: string): TaskPriority {
   return priorityMap[priority?.toLowerCase()] || TaskPriority.MEDIUM;
 }
 
-// Helper function to save child subtasks recursively
-async function saveChildSubtasks(parentTaskId: string, projectId: string, childSubtasks: any[]): Promise<void> {
+// Project/parent location fields to inherit into child tasks (plot number, community, project type, etc.)
+type ProjectLocationDefaults = {
+  location?: string | null;
+  makaniNumber?: string | null;
+  plotNumber?: string | null;
+  community?: string | null;
+  projectType?: string | null;
+  projectFloor?: string | null;
+  developerProject?: string | null;
+};
+
+// Helper function to save child subtasks recursively; inherits plot number, community, project type, etc. from project/parent
+async function saveChildSubtasks(
+  parentTaskId: string,
+  projectId: string,
+  childSubtasks: any[],
+  createdById?: string | null,
+  projectDefaults?: ProjectLocationDefaults | null
+): Promise<void> {
   if (!childSubtasks || !Array.isArray(childSubtasks) || childSubtasks.length === 0) {
     return;
   }
 
-  // Get existing child subtasks for this parent task
-  const whereClause: any = {
-    parentTaskId: parentTaskId,
-    projectId: projectId,
-  };
-  const existingChildSubtasks = await prisma.task.findMany({
-    where: whereClause,
-  });
+  console.log(`📝 saveChildSubtasks: Saving ${childSubtasks.length} child tasks under parent ${parentTaskId}`);
+
+  // Get existing child subtasks and parent task (for inheriting location fields)
+  const [existingChildSubtasks, parentTask] = await Promise.all([
+    prisma.task.findMany({ where: { parentTaskId, projectId } }),
+    prisma.task.findUnique({ where: { id: parentTaskId }, select: { location: true, makaniNumber: true, plotNumber: true, community: true, projectType: true, projectFloor: true, developerProject: true } }),
+  ]);
+
+  console.log(`📝 Found ${existingChildSubtasks.length} existing child tasks for parent ${parentTaskId}`);
 
   const existingChildIds = new Set(existingChildSubtasks.map(cst => cst.id));
-  const incomingChildIds = new Set(childSubtasks.filter(cst => cst.id).map(cst => cst.id));
+  // Filter out null/undefined IDs and create set of incoming IDs
+  const incomingChildIds = new Set(
+    childSubtasks
+      .filter(cst => cst.id && cst.id !== null && cst.id !== undefined && cst.id !== '')
+      .map(cst => String(cst.id))
+  );
+
+  console.log(`📝 Incoming child task IDs:`, Array.from(incomingChildIds));
+  console.log(`📝 Existing child task IDs:`, Array.from(existingChildIds));
 
   // Delete child subtasks that are no longer in the incoming list
-  const childSubtasksToDelete = existingChildSubtasks.filter(cst => !incomingChildIds.has(cst.id));
+  // IMPORTANT: Only delete if the child task ID is explicitly missing from incoming list
+  // This prevents deletion when frontend sends child tasks without IDs due to assignment changes
+  const childSubtasksToDelete = existingChildSubtasks.filter(cst => {
+    const shouldDelete = !incomingChildIds.has(cst.id);
+    if (shouldDelete) {
+      console.log(`🗑️ Marking child task ${cst.id} for deletion (not in incoming list)`);
+    }
+    return shouldDelete;
+  });
+  
   if (childSubtasksToDelete.length > 0) {
+    console.log(`🗑️ Deleting ${childSubtasksToDelete.length} removed child tasks:`, childSubtasksToDelete.map(c => c.id));
     await prisma.task.deleteMany({
       where: {
         id: { in: childSubtasksToDelete.map(cst => cst.id) },
@@ -59,11 +95,37 @@ async function saveChildSubtasks(parentTaskId: string, projectId: string, childS
   }
 
   // Create or update child subtasks
+  let childCreatedCount = 0;
+  let childUpdatedCount = 0;
   for (const childSubtask of childSubtasks) {
+    // Allow child tasks even without explicit title - use default if needed
+    // This ensures employees can save child tasks even if title is not provided initially
+    let childTitle = (childSubtask.name || childSubtask.title || '').trim();
+    if (!childTitle || childTitle === '') {
+      console.warn(`⚠️ Child task has empty title, using default title under parent ${parentTaskId}`);
+      // Use a default title instead of skipping
+      childTitle = `Child Task ${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    }
+    
+    // Normalize child task ID - handle various formats (string, UUID, null, undefined)
+    // Use let instead of const because we might update it if we find a match by title
+    let childTaskId = childSubtask.id 
+      ? String(childSubtask.id).trim() 
+      : null;
+    
+    // Extract assigned employee ID - handle various field names
+    const assignedEmpId = childSubtask.assignedEmployeeId 
+      ?? childSubtask.assignedEmployee 
+      ?? childSubtask.assignedTo
+      ?? null;
+    
+    console.log(`📝 Processing child task: id=${childTaskId || 'NEW'}, title=${childTitle}, assignedEmployeeId=${assignedEmpId || 'NONE'}`);
+    
+    // Inherit from parent task then project (manager project list): plot number, community, project type, no. of floors, developer name
     const childSubtaskData: any = {
-      title: childSubtask.name || childSubtask.title || '',
+      title: childTitle,
       projectId: projectId,
-      parentTaskId: parentTaskId, // Child subtasks have a parent subtask
+      parentTaskId: parentTaskId,
       status: mapStatusToTaskStatus(childSubtask.status),
       priority: mapPriorityToTaskPriority(childSubtask.priority),
       category: childSubtask.category || null,
@@ -71,16 +133,21 @@ async function saveChildSubtasks(parentTaskId: string, projectId: string, childS
       planDays: childSubtask.planDays ? parseInt(String(childSubtask.planDays), 10) : null,
       remarks: childSubtask.remarks || null,
       assigneeNotes: childSubtask.assigneeNotes || null,
-      location: childSubtask.location || null,
-      makaniNumber: childSubtask.makaniNumber || null,
-      plotNumber: childSubtask.plotNumber || null,
-      community: childSubtask.community || null,
-      projectType: childSubtask.projectType || null,
-      projectFloor: childSubtask.projectFloor || null,
-      developerProject: childSubtask.developerProject || null,
+      assignedEmployeeId: assignedEmpId,
+      createdBy: createdById ?? null,
+      location: childSubtask.location ?? parentTask?.location ?? projectDefaults?.location ?? null,
+      makaniNumber: childSubtask.makaniNumber ?? parentTask?.makaniNumber ?? projectDefaults?.makaniNumber ?? null,
+      plotNumber: childSubtask.plotNumber ?? parentTask?.plotNumber ?? projectDefaults?.plotNumber ?? null,
+      community: childSubtask.community ?? parentTask?.community ?? projectDefaults?.community ?? null,
+      projectType: childSubtask.projectType ?? parentTask?.projectType ?? projectDefaults?.projectType ?? null,
+      projectFloor: childSubtask.projectFloor ?? parentTask?.projectFloor ?? projectDefaults?.projectFloor ?? null,
+      developerProject: childSubtask.developerProject ?? parentTask?.developerProject ?? projectDefaults?.developerProject ?? null,
       description: childSubtask.description || childSubtask.remarks || null,
       tags: Array.isArray(childSubtask.tags) ? childSubtask.tags : [],
     };
+    if (childSubtask.predecessors !== undefined) {
+      childSubtaskData.predecessors = (childSubtask.predecessors != null && String(childSubtask.predecessors).trim() !== '') ? String(childSubtask.predecessors).trim() : null;
+    }
 
     // Handle timeline/dates
     if (childSubtask.timeline && Array.isArray(childSubtask.timeline) && childSubtask.timeline.length >= 2) {
@@ -91,19 +158,67 @@ async function saveChildSubtasks(parentTaskId: string, projectId: string, childS
       childSubtaskData.dueDate = childSubtask.endDate ? new Date(childSubtask.endDate) : null;
     }
 
-    if (childSubtask.id && existingChildIds.has(childSubtask.id)) {
-      // Update existing child subtask
-      await prisma.task.update({
-        where: { id: childSubtask.id },
-        data: childSubtaskData,
-      });
+    // Check if this child task already exists (by ID)
+    // Handle both string and UUID formats - normalize for comparison
+    let childTaskExists = childTaskId && existingChildIds.has(childTaskId);
+    
+    // If ID is missing but we have a title, try to match by title + parentTaskId
+    // This prevents deletion when frontend sends child tasks without IDs after assignment changes
+    if (!childTaskExists && !childTaskId && childTitle) {
+      const matchingChildTask = existingChildSubtasks.find(
+        cst => cst.title === childTitle && cst.parentTaskId === parentTaskId
+      );
+      if (matchingChildTask) {
+        console.log(`🔍 Found matching child task by title "${childTitle}" - will update instead of create`);
+        // Use the found ID for update
+        childTaskId = matchingChildTask.id;
+        childTaskExists = true;
+      }
+    }
+    
+    if (childTaskExists && childTaskId) {
+      // Update existing child subtask - preserve ID and createdBy (never overwrite creator)
+      const existingOne = existingChildSubtasks.find((c: any) => c.id === childTaskId);
+      const updateData = { ...childSubtaskData, createdBy: existingOne?.createdBy ?? childSubtaskData.createdBy };
+      console.log(`🔄 Updating existing child task ${childTaskId}: ${childSubtaskData.title}`);
+      console.log(`   Previous assignedEmployeeId: ${existingOne?.assignedEmployeeId || 'NONE'}`);
+      console.log(`   New assignedEmployeeId: ${childSubtaskData.assignedEmployeeId || 'NONE'}`);
+      try {
+        await prisma.task.update({
+          where: { id: childTaskId },
+          data: updateData,
+        });
+        childUpdatedCount++;
+        console.log(`✅ Successfully updated child task ${childTaskId} with new assignment`);
+      } catch (updateError: any) {
+        console.error(`❌ Error updating child task ${childTaskId}:`, updateError);
+        throw updateError;
+      }
     } else {
       // Create new child subtask
-      await prisma.task.create({
-        data: childSubtaskData,
-      });
+      console.log(`➕ Creating new child task: ${childSubtaskData.title} (parent: ${parentTaskId}, project: ${projectId})`);
+      try {
+        const newChild = await prisma.task.create({
+          data: childSubtaskData,
+        });
+        console.log(`✅ Created child task ${newChild.id}: ${newChild.title}`);
+        childCreatedCount++;
+      } catch (createError: any) {
+        console.error(`❌ Error creating child task:`, {
+          error: createError.message,
+          code: createError.code,
+          meta: createError.meta,
+          childSubtaskData: {
+            title: childSubtaskData.title,
+            projectId: childSubtaskData.projectId,
+            parentTaskId: childSubtaskData.parentTaskId,
+          },
+        });
+        throw createError;
+      }
     }
   }
+  console.log(`✅ Saved child tasks for parent ${parentTaskId} (${childCreatedCount} created, ${childUpdatedCount} updated)`);
 }
 
 // Get all projects with filters
@@ -139,17 +254,126 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
       where.projectManager = { contains: projectManager as string, mode: 'insensitive' };
     }
 
-    if (search) {
-      where.OR = [
+    // Store search filter separately to combine with role-based filters
+    const searchFilter: any = search ? {
+      OR: [
         { name: { contains: search as string, mode: 'insensitive' } },
         { referenceNumber: { contains: search as string, mode: 'insensitive' } },
         { pin: { contains: search as string, mode: 'insensitive' } },
         { projectManager: { contains: search as string, mode: 'insensitive' } }, // Include projectManager in search
-      ];
+      ]
+    } : null;
+
+    // Employee/Manager: Same access - see projects where they are assigned or have tasks
+    // Managers use the SAME module as employees
+    if (req.user?.role === 'EMPLOYEE' || req.user?.role === 'MANAGER') {
+      if (req.user?.role === 'MANAGER') {
+        // Manager: Can see ONLY their own projects - from their contracts, or where they are directly assigned
+        // Does NOT include team member projects (each manager sees only their projects)
+        
+        // Fetch manager's full details to get their name for projectManager field matching
+        let managerNameVariations: string[] = [];
+        try {
+          const managerUser = await prisma.user.findUnique({
+            where: { id: req.user.id },
+            select: { firstName: true, lastName: true },
+          });
+          
+          if (managerUser) {
+            const managerFirstName = managerUser.firstName?.trim().toLowerCase() || '';
+            const managerLastName = managerUser.lastName?.trim().toLowerCase() || '';
+            const managerFullName = `${managerFirstName} ${managerLastName}`.trim();
+            
+            // Build name variations for matching (e.g., "obada", "obada saad", "h. obada", etc.)
+            if (managerFirstName) managerNameVariations.push(managerFirstName);
+            if (managerLastName) managerNameVariations.push(managerLastName);
+            if (managerFullName) managerNameVariations.push(managerFullName);
+            // Add variations with first name + last name initial
+            if (managerFirstName && managerLastName) {
+              managerNameVariations.push(`${managerFirstName} ${managerLastName.charAt(0)}`);
+            }
+            // Also add just last name if it's meaningful (more than 1 char)
+            if (managerLastName && managerLastName.length > 1) {
+              managerNameVariations.push(managerLastName);
+            }
+          }
+        } catch (error) {
+          console.error('Error fetching manager details for project filtering:', error);
+        }
+        
+        const orConditions: any[] = [
+          // Projects where manager is directly assigned
+          { assignedEmployees: { some: { employeeId: req.user.id } } },
+          { tasks: { some: { assignedEmployeeId: req.user.id } } },
+          { tasks: { some: { subtasks: { some: { assignedEmployeeId: req.user.id } } } } },
+          { tasks: { some: { subtasks: { some: { subtasks: { some: { assignedEmployeeId: req.user.id } } } } } } },
+          // Projects created by this manager
+          { createdBy: req.user.id },
+        ];
+        
+        // Projects from contracts assigned to this manager (primary - load-out projects)
+        if (req.user.email) {
+          orConditions.push({ contracts: { some: { assignedManagerEmail: req.user.email } } });
+        }
+        if (req.user.id) {
+          orConditions.push({ contracts: { some: { assignedManagerId: req.user.id } } });
+        }
+        
+        // IMPORTANT: Also filter by projectManager text field matching manager's name
+        // This ensures managers only see projects where they are listed as the project manager
+        if (managerNameVariations.length > 0) {
+          const projectManagerConditions = managerNameVariations.map(name => ({
+            projectManager: { contains: name, mode: 'insensitive' as const }
+          }));
+          orConditions.push({ OR: projectManagerConditions });
+        }
+        
+        // Combine manager filter with search filter if present
+        if (searchFilter) {
+          where.AND = [
+            { OR: orConditions },
+            searchFilter
+          ];
+        } else {
+          where.OR = orConditions;
+        }
+      } else {
+        // Employee: See projects by relationship - assigned_to, created_by, or has tasks they own/created
+        where.OR = [
+          { assignedEmployees: { some: { employeeId: req.user.id } } },
+          { createdBy: req.user.id },
+          { tasks: { some: { assignedEmployeeId: req.user.id } } },
+          { tasks: { some: { assignments: { some: { employeeId: req.user.id } } } } },
+          { tasks: { some: { createdBy: req.user.id } } },
+          { tasks: { some: { subtasks: { some: { assignedEmployeeId: req.user.id } } } } },
+          { tasks: { some: { subtasks: { some: { assignments: { some: { employeeId: req.user.id } } } } } } },
+          { tasks: { some: { subtasks: { some: { createdBy: req.user.id } } } } },
+          { tasks: { some: { subtasks: { some: { subtasks: { some: { assignedEmployeeId: req.user.id } } } } } } },
+          { tasks: { some: { subtasks: { some: { subtasks: { some: { assignments: { some: { employeeId: req.user.id } } } } } } } } },
+          { tasks: { some: { subtasks: { some: { subtasks: { some: { createdBy: req.user.id } } } } } } },
+        ];
+      }
     }
 
+    // EMPLOYEE: Pre-fetch main task IDs that the user "owns" (assigned to / created by / in assignments).
+    // Child tasks under these parents must always be visible to the parent owner (Step 2 - relationship-based visibility).
+    let ownedMainTaskIds: string[] = [];
     if (req.user?.role === 'EMPLOYEE') {
-      where.assignedEmployees = { some: { employeeId: req.user.id } };
+      const ownedTasks = await prisma.task.findMany({
+        where: {
+          parentTaskId: null,
+          OR: [
+            { assignedEmployeeId: req.user.id },
+            { createdBy: req.user.id },
+            { assignments: { some: { employeeId: req.user.id } } },
+          ],
+        },
+        select: { id: true },
+      });
+      ownedMainTaskIds = ownedTasks.map((t: { id: string }) => t.id);
+      if (ownedMainTaskIds.length > 0) {
+        console.log('[getAllProjects] EMPLOYEE owned main task IDs (parent-owner visibility):', ownedMainTaskIds.length);
+      }
     }
 
     const [projects, total] = await Promise.all([
@@ -232,6 +456,13 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               numberOfFloors: true,
               makaniNumber: true,
               developerName: true,
+              assignedManager: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                },
+              },
             },
             orderBy: {
               createdAt: 'desc',
@@ -239,7 +470,23 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
           },
           tasks: {
             where: {
-              parentTaskId: null, // Only get main subtasks (not child tasks)
+              parentTaskId: null, // Only parent-level tasks (main tasks)
+              // EMPLOYEE: relationship-based visibility - assigned_to, created_by, or has any descendant assigned/created by user
+              ...(req.user?.role === 'EMPLOYEE' ? {
+                OR: [
+                  { assignedEmployeeId: req.user.id },
+                  { createdBy: req.user.id },
+                  { assignments: { some: { employeeId: req.user.id } } },
+                  { subtasks: { some: { assignedEmployeeId: req.user.id } } },
+                  { subtasks: { some: { assignments: { some: { employeeId: req.user.id } } } } },
+                  { subtasks: { some: { assignedEmployeeId: null, createdBy: req.user.id } } },
+                  { subtasks: { some: { createdBy: req.user.id } } },
+                  { subtasks: { some: { subtasks: { some: { assignedEmployeeId: req.user.id } } } } },
+                  { subtasks: { some: { subtasks: { some: { assignments: { some: { employeeId: req.user.id } } } } } } },
+                  { subtasks: { some: { subtasks: { some: { assignedEmployeeId: null, createdBy: req.user.id } } } } },
+                  { subtasks: { some: { subtasks: { some: { createdBy: req.user.id } } } } },
+                ],
+              } : {}),
             },
             select: {
               id: true,
@@ -254,6 +501,17 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               planDays: true,
               remarks: true,
               assigneeNotes: true,
+              assignedEmployeeId: true,
+              createdBy: true,
+              predecessors: true,
+              assignedEmployee: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  email: true,
+                },
+              },
               location: true,
               makaniNumber: true,
               plotNumber: true,
@@ -262,6 +520,10 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               projectFloor: true,
               developerProject: true,
               subtasks: {
+                // We no longer filter subtasks by employee here; employees can see
+                // all subtasks for a project, but update/delete is still enforced
+                // in the task controllers.
+                where: {},
                 select: {
                   id: true,
                   title: true,
@@ -275,6 +537,19 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
                   planDays: true,
                   remarks: true,
                   assigneeNotes: true,
+                  assignedEmployeeId: true,
+                  parentTaskId: true,
+                  createdAt: true,
+                  createdBy: true,
+                  predecessors: true,
+                  assignedEmployee: {
+                    select: {
+                      id: true,
+                      firstName: true,
+                      lastName: true,
+                      email: true,
+                    },
+                  },
                   location: true,
                   makaniNumber: true,
                   plotNumber: true,
@@ -282,6 +557,51 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
                   projectType: true,
                   projectFloor: true,
                   developerProject: true,
+                  subtasks: {
+                    // Show all child tasks under subtasks the employee can see (so reassigned children don't "disappear" for the parent subtask owner)
+                    // Previously we only showed children assigned to current user or unassigned, which hid children after reassignment (e.g. Ajmal no longer saw task after assign to Khalid)
+                    where: {},
+                    select: {
+                      id: true,
+                      title: true,
+                      description: true,
+                      status: true,
+                      priority: true,
+                      startDate: true,
+                      dueDate: true,
+                      category: true,
+                      referenceNumber: true,
+                      planDays: true,
+                      remarks: true,
+                      assigneeNotes: true,
+                      assignedEmployeeId: true,
+                      parentTaskId: true,
+                      createdAt: true,
+                      createdBy: true,
+                      predecessors: true,
+                      assignedEmployee: {
+                        select: {
+                          id: true,
+                          firstName: true,
+                          lastName: true,
+                          email: true,
+                        },
+                      },
+                      location: true,
+                      makaniNumber: true,
+                      plotNumber: true,
+                      community: true,
+                      projectType: true,
+                      projectFloor: true,
+                      developerProject: true,
+                    },
+                    orderBy: {
+                      createdAt: 'asc',
+                    },
+                  },
+                },
+                orderBy: {
+                  createdAt: 'asc',
                 },
               },
             },
@@ -299,9 +619,40 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
       prisma.project.count({ where }),
     ]);
 
+    // Log task/subtask counts for debugging
+    projects.forEach((p: any) => {
+      const taskCount = p.tasks?.length || 0;
+      const subtaskCounts = p.tasks?.map((t: any) => ({
+        taskId: t.id,
+        taskTitle: t.title,
+        subtaskCount: t.subtasks?.length || 0,
+        childCounts: t.subtasks?.map((st: any) => ({
+          subtaskId: st.id,
+          subtaskTitle: st.title,
+          childCount: st.subtasks?.length || 0,
+        })) || [],
+      })) || [];
+      console.log(`📋 Project ${p.id} (${p.referenceNumber}): ${taskCount} tasks, subtask breakdown:`, JSON.stringify(subtaskCounts, null, 2));
+    });
+
+    // Use assigned manager name from linked contract for display when available (so PM shows e.g. muffazzal not mohammednazar)
+    // Include projectName so main table and details show saved name (e.g. "villa") after refresh, not only reference number
+    const projectsWithDisplayManager = projects.map((p: any) => {
+      const firstContractWithManager = p.contracts?.find((c: any) => c.assignedManager);
+      const displayManager = firstContractWithManager?.assignedManager
+        ? `${firstContractWithManager.assignedManager.firstName} ${firstContractWithManager.assignedManager.lastName}`.trim()
+        : null;
+      const displayName = (p.name != null && String(p.name).trim() !== '') ? p.name : p.referenceNumber;
+      return {
+        ...p,
+        projectManager: displayManager ?? p.projectManager,
+        projectName: displayName,
+      };
+    });
+
     res.json({
       success: true,
-      data: projects,
+      data: projectsWithDisplayManager,
       pagination: {
         page: pageNum,
         limit: limitNum,
@@ -345,6 +696,7 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
           },
         },
         tasks: {
+          where: { parentTaskId: null },
           include: {
             assignments: {
               include: {
@@ -355,6 +707,44 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
                     lastName: true,
                   },
                 },
+              },
+            },
+            assignedEmployee: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+              },
+            },
+            subtasks: {
+              include: {
+                assignedEmployee: {
+                  select: {
+                    id: true,
+                    firstName: true,
+                    lastName: true,
+                    email: true,
+                  },
+                },
+                subtasks: {
+                  include: {
+                    assignedEmployee: {
+                      select: {
+                        id: true,
+                        firstName: true,
+                        lastName: true,
+                        email: true,
+                      },
+                    },
+                  },
+                  orderBy: {
+                    createdAt: 'asc',
+                  },
+                },
+              },
+              orderBy: {
+                createdAt: 'asc',
               },
             },
             _count: {
@@ -407,6 +797,15 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
             community: true,
             numberOfFloors: true,
             makaniNumber: true,
+            assignedManagerId: true as any,
+            assignedManagerEmail: true as any,
+            assignedManager: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+              },
+            },
           },
           orderBy: {
             createdAt: 'desc',
@@ -430,17 +829,85 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    if (req.user?.role === 'EMPLOYEE') {
-      const isAssigned = project.assignedEmployees?.some((a: { employeeId: string }) => a.employeeId === req.user!.id);
-      if (!isAssigned) {
-        res.status(403).json({ success: false, message: 'You do not have access to this project' });
-        return;
+    // Employee/Manager: Check access (managers see ONLY their own projects, not team member projects)
+    if (req.user?.role === 'EMPLOYEE' || req.user?.role === 'MANAGER') {
+      const projectWithRelations = project as any;
+      if (req.user?.role === 'MANAGER') {
+        // Manager: Can see ONLY their own projects - from their contracts, or where they are directly assigned
+        const isAssigned = projectWithRelations.assignedEmployees?.some((a: { employeeId: string }) => 
+          a.employeeId === req.user!.id
+        );
+        
+        const hasTasks = projectWithRelations.tasks?.some((task: any) => 
+          task.assignedEmployeeId === req.user!.id ||
+          task.subtasks?.some((st: any) => st.assignedEmployeeId === req.user!.id) ||
+          task.subtasks?.some((st: any) => st.subtasks?.some((cst: any) => cst.assignedEmployeeId === req.user!.id))
+        );
+        
+        const hasAssignedContract = projectWithRelations.contracts?.some((contract: any) => {
+          return (req.user?.email && contract.assignedManagerEmail === req.user.email) ||
+                 (req.user?.id && contract.assignedManagerId === req.user.id);
+        });
+        
+        const wasCreatedBy = projectWithRelations.createdBy === req.user!.id;
+        
+        // Check if projectManager field matches manager's name
+        let projectManagerMatches = false;
+        try {
+          const managerUser = await prisma.user.findUnique({
+            where: { id: req.user.id },
+            select: { firstName: true, lastName: true },
+          });
+          
+          if (managerUser && projectWithRelations.projectManager) {
+            const managerFirstName = managerUser.firstName?.trim().toLowerCase() || '';
+            const managerLastName = managerUser.lastName?.trim().toLowerCase() || '';
+            const managerFullName = `${managerFirstName} ${managerLastName}`.trim();
+            const projectManagerLower = String(projectWithRelations.projectManager).toLowerCase();
+            
+            // Check if projectManager field contains manager's name variations
+            projectManagerMatches = 
+              (managerFirstName.length > 0 && projectManagerLower.includes(managerFirstName)) ||
+              (managerLastName.length > 0 && projectManagerLower.includes(managerLastName)) ||
+              (managerFullName.length > 0 && projectManagerLower.includes(managerFullName));
+          }
+        } catch (error) {
+          console.error('Error checking projectManager match:', error);
+        }
+        
+        if (!isAssigned && !hasTasks && !hasAssignedContract && !wasCreatedBy && !projectManagerMatches) {
+          res.status(403).json({ success: false, message: 'You do not have access to this project' });
+          return;
+        }
+      } else {
+        // Employee: Can only see assigned projects
+        const isAssigned = projectWithRelations.assignedEmployees?.some((a: { employeeId: string }) => a.employeeId === req.user!.id);
+        const hasTasks = projectWithRelations.tasks?.some((task: any) => task.assignedEmployeeId === req.user!.id);
+        if (!isAssigned && !hasTasks) {
+          res.status(403).json({ success: false, message: 'You do not have access to this project' });
+          return;
+        }
       }
     }
 
+    // Use assigned manager name from linked contract for display when available
+    const projectWithRelationsForManager = project as any;
+    const firstContractWithManager = projectWithRelationsForManager.contracts?.find((c: any) => c.assignedManager);
+    const displayManager = firstContractWithManager?.assignedManager
+      ? `${firstContractWithManager.assignedManager.firstName} ${firstContractWithManager.assignedManager.lastName}`.trim()
+      : null;
+    const projectWithDisplayManager = {
+      ...projectWithRelationsForManager,
+      projectManager: displayManager ?? projectWithRelationsForManager.projectManager,
+      // So Project Details panel shows editable name (e.g. "villa") not only reference number
+      projectName: (projectWithRelationsForManager.name != null && projectWithRelationsForManager.name !== '')
+        ? projectWithRelationsForManager.name
+        : projectWithRelationsForManager.referenceNumber,
+    };
+
     res.json({
       success: true,
-      data: project,
+      data: projectWithDisplayManager,
     });
   } catch (error) {
     console.error('Get project by ID error:', error);
@@ -451,11 +918,12 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
 // Create new project
 export const createProject = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    // Employee role: Cannot create projects
-    if (req.user?.role === 'EMPLOYEE') {
+    // Employee/Manager role: Cannot create projects (only project managers/admins can create)
+    // Managers use the SAME module as employees - they cannot create projects
+    if (req.user?.role === 'EMPLOYEE' || req.user?.role === 'MANAGER') {
       res.status(403).json({
         success: false,
-        message: 'Access Denied: You do not have permission to create projects. Please contact your manager.',
+        message: 'Access Denied: You do not have permission to create projects. Only project managers and admins can create projects.',
         code: 'ACCESS_DENIED',
       });
       return;
@@ -746,10 +1214,21 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
 
 // Update project
 export const updateProject = async (req: AuthRequest, res: Response): Promise<void> => {
+  console.log('🚀 updateProject called');
+  console.log('👤 User:', req.user?.email, 'Role:', req.user?.role);
+  const body = req.body as Record<string, unknown>;
+  console.log('📥 updateProject body keys:', body ? Object.keys(body) : []);
+  if (body && (body.name !== undefined || body.projectName !== undefined || body.title !== undefined)) {
+    console.log('📥 updateProject name-related:', { name: body.name, projectName: body.projectName, title: body.title });
+  }
+
   try {
     const { id } = req.params;
+    console.log(`📋 Updating project ${id}`);
+    
     const {
-      name,
+      name: nameFromBody,
+      projectName, // Frontend may send project name as projectName
       referenceNumber,
       pin,
       clientId,
@@ -776,6 +1255,54 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       childSubtasks,
     } = req.body;
 
+    // Project name: read from every common body key so modal save always persists
+    const b = req.body as any;
+    const nameRaw =
+      nameFromBody !== undefined ? nameFromBody
+      : projectName !== undefined ? projectName
+      : b?.project?.name ?? b?.data?.name ?? b?.title ?? b?.label ?? b?.projectTitle ?? b?.project_name;
+    const projectNameToSave = typeof nameRaw === 'string' ? nameRaw.trim() : (nameRaw != null ? String(nameRaw).trim() : '');
+    const shouldUpdateName =
+      nameFromBody !== undefined || projectName !== undefined ||
+      b?.project?.name !== undefined || b?.data?.name !== undefined || b?.title !== undefined ||
+      b?.label !== undefined || b?.projectTitle !== undefined || b?.project_name !== undefined;
+    if (shouldUpdateName) {
+      console.log(`📝 Project name will be saved: "${projectNameToSave}" (received from body)`);
+    }
+    
+    // Log incoming data structure
+    if (subtasks && Array.isArray(subtasks)) {
+      console.log(`📥 Received ${subtasks.length} subtasks in request`);
+      console.log(`📥 Subtasks summary:`, subtasks.map((st: any) => ({
+        id: st.id || 'NO_ID',
+        name: st.name || st.title || 'NO_NAME',
+        childCount: st.childSubtasks ? st.childSubtasks.length : 0
+      })));
+    } else {
+      console.log(`📥 No subtasks in request body`);
+    }
+
+    // Support "add child task" payload: frontend may send parentSubtaskId + childSubtaskName (or newChildTask)
+    // Use subtasksToSave so add-child-only path (when body has no subtasks) can still run the save block
+    const parentSubtaskId = req.body.parentSubtaskId;
+    const childSubtaskName = req.body.childSubtaskName ?? req.body.newChildTask?.name ?? req.body.newChildTask?.title;
+    let subtasksToSave: any[] | undefined = subtasks && Array.isArray(subtasks) ? [...subtasks] : undefined;
+
+    if (parentSubtaskId && childSubtaskName && subtasksToSave && subtasksToSave.length > 0) {
+      const parentSubtask = subtasksToSave.find((st: any) => String(st.id) === String(parentSubtaskId));
+      if (parentSubtask) {
+        const childArray = Array.isArray(parentSubtask.childSubtasks) ? parentSubtask.childSubtasks : [];
+        const nameStr = String(childSubtaskName).trim();
+        const alreadyHas = childArray.some((c: any) => (c.name || c.title || '').trim() === nameStr);
+        if (!alreadyHas && nameStr) {
+          parentSubtask.childSubtasks = [...childArray, { name: nameStr, title: nameStr }];
+          console.log(`📥 Merged new child task "${nameStr}" into subtask ${parentSubtaskId} (childSubtasks now: ${parentSubtask.childSubtasks.length})`);
+        }
+      } else {
+        console.warn(`⚠️ parentSubtaskId ${parentSubtaskId} not found in subtasks array`);
+      }
+    }
+
     // Check if project exists
     const existingProject = await prisma.project.findUnique({
       where: { id },
@@ -783,6 +1310,30 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
         assignedEmployees: {
           select: {
             employeeId: true,
+          },
+        },
+        contracts: {
+          select: {
+            assignedManagerId: true as any,
+            assignedManagerEmail: true as any,
+          },
+        },
+        tasks: {
+          select: {
+            id: true,
+            assignedEmployeeId: true,
+            subtasks: {
+              select: {
+                id: true,
+                assignedEmployeeId: true,
+                subtasks: {
+                  select: {
+                    id: true,
+                    assignedEmployeeId: true,
+                  },
+                },
+              },
+            },
           },
         },
       },
@@ -793,18 +1344,153 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    // Employee role: Can only update assigned projects
-    if (req.user?.role === 'EMPLOYEE') {
-      const isAssigned = existingProject.assignedEmployees?.some(
-        (a: { employeeId: string }) => a.employeeId === req.user!.id
-      );
-      if (!isAssigned) {
-        res.status(403).json({
-          success: false,
-          message: 'Access Denied: You do not have permission to edit this project. You can only modify projects assigned to you.',
-          code: 'ACCESS_DENIED',
-        });
-        return;
+    // When frontend sends only "add child" (parentSubtaskId + childSubtaskName) without full subtasks array,
+    // load existing task tree from DB, merge the new child, and set subtasksToSave so the save block runs
+    if (parentSubtaskId && childSubtaskName && (!subtasksToSave || subtasksToSave.length === 0)) {
+      const projectWithTasks = await prisma.project.findUnique({
+        where: { id },
+        include: {
+          tasks: {
+            where: { parentTaskId: null },
+            include: {
+              subtasks: {
+                orderBy: { createdAt: 'asc' as const },
+                include: {
+                  subtasks: { orderBy: { createdAt: 'asc' as const } },
+                },
+              },
+            },
+          },
+        },
+      });
+      if (projectWithTasks?.tasks && Array.isArray(projectWithTasks.tasks) && projectWithTasks.tasks.length > 0) {
+        const built = projectWithTasks.tasks.map((t: any) => ({
+          id: t.id,
+          name: t.title,
+          title: t.title,
+          status: t.status,
+          priority: t.priority,
+          category: t.category,
+          referenceNumber: t.referenceNumber,
+          planDays: t.planDays,
+          remarks: t.remarks,
+          assigneeNotes: t.assigneeNotes,
+          assignedEmployeeId: t.assignedEmployeeId,
+          startDate: t.startDate,
+          endDate: t.dueDate,
+          timeline: t.startDate && t.dueDate ? [t.startDate, t.dueDate] : undefined,
+          location: t.location,
+          plotNumber: t.plotNumber,
+          community: t.community,
+          projectType: t.projectType,
+          projectFloor: t.projectFloor,
+          developerProject: t.developerProject,
+          predecessors: t.predecessors ?? null,
+          childSubtasks: (t.subtasks || []).map((st: any) => ({
+            id: st.id,
+            name: st.title,
+            title: st.title,
+            status: st.status,
+            priority: st.priority,
+            assignedEmployeeId: st.assignedEmployeeId,
+            predecessors: st.predecessors ?? null,
+            childSubtasks: (st.subtasks || []).map((c: any) => ({
+              id: c.id,
+              name: c.title,
+              title: c.title,
+              status: c.status,
+              assignedEmployeeId: c.assignedEmployeeId,
+              predecessors: c.predecessors ?? null,
+            })),
+          })),
+        }));
+        const mainTaskParent = built.find((st: any) => String(st.id) === String(parentSubtaskId));
+        let level2Parent: any = null;
+        if (!mainTaskParent) {
+          for (const main of built) {
+            const inChildren = (main.childSubtasks || []).find((st: any) => String(st.id) === String(parentSubtaskId));
+            if (inChildren) {
+              level2Parent = inChildren;
+              break;
+            }
+          }
+        }
+        const parentSubtask = mainTaskParent || level2Parent;
+        if (parentSubtask) {
+          const childArray = Array.isArray(parentSubtask.childSubtasks) ? parentSubtask.childSubtasks : [];
+          const nameStr = String(childSubtaskName).trim();
+          const alreadyHas = childArray.some((c: any) => (c.name || c.title || '').trim() === nameStr);
+          if (!alreadyHas && nameStr) {
+            parentSubtask.childSubtasks = [...childArray, { name: nameStr, title: nameStr }];
+            const projectDefaults: ProjectLocationDefaults = {
+              location: projectWithTasks.location ?? null,
+              makaniNumber: projectWithTasks.makaniNumber ?? null,
+              plotNumber: projectWithTasks.plotNumber ?? null,
+              community: projectWithTasks.community ?? null,
+              projectType: projectWithTasks.projectType ?? null,
+              projectFloor: projectWithTasks.projectFloor ?? null,
+              developerProject: projectWithTasks.developerProject ?? null,
+            };
+            if (level2Parent) {
+              await saveChildSubtasks(parentSubtaskId, id, parentSubtask.childSubtasks, req.user?.id ?? null, projectDefaults);
+              console.log(`📥 Add-child-only: saved new level-3 child "${nameStr}" under parent ${parentSubtaskId}`);
+            } else {
+              subtasksToSave = built;
+              console.log(`📥 Add-child-only: merged new child "${nameStr}" into main task ${parentSubtaskId} (will save with full tree)`);
+            }
+          }
+        } else {
+          console.warn(`⚠️ Add-child-only: parentSubtaskId ${parentSubtaskId} not found in project task tree`);
+        }
+      }
+    }
+
+    // Employee/Manager role: Can update if assigned to project OR assigned to any task/subtask in the project
+    // Managers use the SAME module as employees - same update permissions
+    if (req.user?.role === 'EMPLOYEE' || req.user?.role === 'MANAGER') {
+      if (req.user?.role === 'MANAGER') {
+        // Manager: Can update ONLY their own projects - from contracts, created by them, or where they're directly assigned
+        const existingProjectWithRelations = existingProject as any;
+        const isAssignedToProject = existingProjectWithRelations.assignedEmployees?.some(
+          (a: { employeeId: string }) => a.employeeId === req.user!.id
+        );
+        const isCreator = existingProject.createdBy === req.user!.id;
+        
+        let hasAssignedContract = false;
+        if (existingProjectWithRelations.contracts && Array.isArray(existingProjectWithRelations.contracts) && existingProjectWithRelations.contracts.length > 0) {
+          const managerUser = await prisma.user.findUnique({
+            where: { id: req.user!.id },
+            select: { email: true },
+          });
+          hasAssignedContract = existingProjectWithRelations.contracts.some((c: any) => 
+            (managerUser?.email && c.assignedManagerEmail === managerUser.email) ||
+            c.assignedManagerId === req.user!.id
+          );
+        }
+        
+        if (!isAssignedToProject && !isCreator && !hasAssignedContract) {
+          const hasTaskAssignment = await prisma.task.findFirst({
+            where: {
+              projectId: id,
+              OR: [
+                { assignments: { some: { employeeId: req.user!.id } } },
+                { assignedEmployeeId: req.user!.id },
+              ],
+            },
+            select: { id: true },
+          });
+          
+          if (!hasTaskAssignment) {
+            res.status(403).json({
+              success: false,
+              message: 'Access Denied: You can only edit projects assigned to you.',
+              code: 'ACCESS_DENIED',
+            });
+            return;
+          }
+        }
+      } else {
+        // Employee: No project/task assignment check - allow save (e.g. child tasks) without restriction
       }
     }
 
@@ -843,11 +1529,15 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       ? (projectManager ? String(projectManager).trim().substring(0, 100) : null)
       : undefined;
 
-    // Update project
+    // Update project (name is editable in modal; save whenever name or projectName is sent so it reflects in backend)
+    const nameToWrite = shouldUpdateName && projectNameToSave.length > 0 ? projectNameToSave : undefined;
+    if (nameToWrite) {
+      console.log(`📝 Persisting project name to DB: "${nameToWrite}"`);
+    }
     const project = await prisma.project.update({
       where: { id },
       data: {
-        ...(name && { name }),
+        ...(nameToWrite ? { name: nameToWrite } : {}),
         ...(referenceNumber && { referenceNumber }),
         ...(pin !== undefined && { pin: pin || null }),
         ...(clientId !== undefined && { clientId: clientId || null }),
@@ -887,9 +1577,28 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       },
     });
 
-    // Save/update subtasks and child subtasks if provided
-    if (subtasks && Array.isArray(subtasks)) {
+    // Save/update subtasks and child subtasks if provided (use subtasksToSave so add-child-only path runs save too)
+    // Employees can save child tasks to tasks assigned to them
+    if (subtasksToSave && Array.isArray(subtasksToSave)) {
       try {
+        console.log(`📝 Saving ${subtasksToSave.length} subtasks for project ${id} (user: ${req.user?.id}, role: ${req.user?.role}, email: ${req.user?.email})`);
+        console.log(`📝 Subtasks structure:`, JSON.stringify(subtasksToSave.map((st: any) => ({
+          id: st.id,
+          name: st.name,
+          title: st.title,
+          childSubtasks: st.childSubtasks ? `${st.childSubtasks.length} children` : 'none',
+        })), null, 2));
+        
+        // Log detailed child task information
+        subtasksToSave.forEach((st: any, index: number) => {
+          if (st.childSubtasks && Array.isArray(st.childSubtasks) && st.childSubtasks.length > 0) {
+            console.log(`📋 Subtask ${index} (${st.id || 'NEW'}): ${st.name || st.title} has ${st.childSubtasks.length} child tasks:`);
+            st.childSubtasks.forEach((child: any, childIndex: number) => {
+              console.log(`   Child ${childIndex}: id=${child.id || 'NO_ID'}, name=${child.name || child.title || 'NO_NAME'}, assignedEmployeeId=${child.assignedEmployeeId || child.assignedEmployee || 'NONE'}`);
+            });
+          }
+        });
+        
         // Get existing subtasks for this project (tasks with no parentTaskId)
         const subtaskWhereClause: any = {
           projectId: id,
@@ -900,11 +1609,12 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
         });
 
         const existingSubtaskIds = new Set(existingSubtasks.map(st => st.id));
-        const incomingSubtaskIds = new Set(subtasks.filter(st => st.id).map(st => st.id));
+        const incomingSubtaskIds = new Set(subtasksToSave.filter((st: any) => st.id).map((st: any) => st.id));
 
         // Delete subtasks that are no longer in the incoming list
         const subtasksToDelete = existingSubtasks.filter(st => !incomingSubtaskIds.has(st.id));
         if (subtasksToDelete.length > 0) {
+          console.log(`🗑️ Deleting ${subtasksToDelete.length} removed subtasks`);
           await prisma.task.deleteMany({
             where: {
               id: { in: subtasksToDelete.map(st => st.id) },
@@ -912,12 +1622,25 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
           });
         }
 
-        // Create or update subtasks
+        // Project defaults from manager project list: inherit into all subtasks and child tasks
+        const projectDefaults: ProjectLocationDefaults = {
+          location: project.location ?? null,
+          makaniNumber: project.makaniNumber ?? null,
+          plotNumber: project.plotNumber ?? null,
+          community: project.community ?? null,
+          projectType: project.projectType ?? null,
+          projectFloor: project.projectFloor ?? null,
+          developerProject: project.developerProject ?? null,
+        };
+
+        // Create or update subtasks (inherit plot number, community, project type, no. of floors, developer name from project)
+        let createdCount = 0;
+        let updatedCount = 0;
         for (const subtask of subtasks) {
           const subtaskData: any = {
             title: subtask.name || subtask.title || '',
             projectId: id,
-            parentTaskId: null, // Subtasks are direct children of project
+            parentTaskId: null,
             status: mapStatusToTaskStatus(subtask.status),
             priority: mapPriorityToTaskPriority(subtask.priority),
             category: subtask.category || null,
@@ -925,16 +1648,22 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             planDays: subtask.planDays ? parseInt(String(subtask.planDays), 10) : null,
             remarks: subtask.remarks || null,
             assigneeNotes: subtask.assigneeNotes || null,
-            location: subtask.location || null,
-            makaniNumber: subtask.makaniNumber || null,
-            plotNumber: subtask.plotNumber || null,
-            community: subtask.community || null,
-            projectType: subtask.projectType || null,
-            projectFloor: subtask.projectFloor || null,
-            developerProject: subtask.developerProject || null,
+            assignedEmployeeId: subtask.assignedEmployeeId ?? subtask.assignedEmployee ?? subtask.assignedTo ?? null,
+            createdBy: req.user?.id ?? null,
+            location: subtask.location ?? projectDefaults.location ?? null,
+            makaniNumber: subtask.makaniNumber ?? projectDefaults.makaniNumber ?? null,
+            plotNumber: subtask.plotNumber ?? projectDefaults.plotNumber ?? null,
+            community: subtask.community ?? projectDefaults.community ?? null,
+            projectType: subtask.projectType ?? projectDefaults.projectType ?? null,
+            projectFloor: subtask.projectFloor ?? projectDefaults.projectFloor ?? null,
+            developerProject: subtask.developerProject ?? projectDefaults.developerProject ?? null,
             description: subtask.description || subtask.remarks || null,
             tags: Array.isArray(subtask.tags) ? subtask.tags : [],
           };
+          // Only update predecessors when explicitly sent (avoid wiping on refresh/save when frontend omits field)
+          if (subtask.predecessors !== undefined) {
+            subtaskData.predecessors = (subtask.predecessors != null && String(subtask.predecessors).trim() !== '') ? String(subtask.predecessors).trim() : null;
+          }
 
           // Handle timeline/dates
           if (subtask.timeline && Array.isArray(subtask.timeline) && subtask.timeline.length >= 2) {
@@ -947,45 +1676,328 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
 
           if (subtask.id && existingSubtaskIds.has(subtask.id)) {
             // Update existing subtask
+            console.log(`🔄 Updating subtask ${subtask.id}: ${subtaskData.title}`);
             await prisma.task.update({
               where: { id: subtask.id },
               data: subtaskData,
             });
+            updatedCount++;
           } else {
             // Create new subtask
+            console.log(`➕ Creating new subtask: ${subtaskData.title}`);
             const newSubtask = await prisma.task.create({
               data: subtaskData,
             });
+            console.log(`✅ Created subtask ${newSubtask.id}: ${newSubtask.title}`);
+            createdCount++;
 
             // Save child subtasks for this subtask
             if (subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0) {
-              await saveChildSubtasks(newSubtask.id, id, subtask.childSubtasks);
+              await saveChildSubtasks(newSubtask.id, id, subtask.childSubtasks, req.user?.id, projectDefaults);
             }
           }
         }
 
+        // IMPORTANT: Refresh existing subtasks list to get IDs of newly created subtasks
+        // This ensures we can process child tasks for subtasks that were just created
+        const allExistingSubtasks = await prisma.task.findMany({
+          where: {
+            projectId: id,
+            parentTaskId: null,
+          },
+        });
+        console.log(`📋 Refreshed subtasks list: Found ${allExistingSubtasks.length} total subtasks`);
+        
+        // Create a map of subtask titles to IDs for newly created subtasks
+        const createdSubtaskMap = new Map<string, string>();
+        allExistingSubtasks.forEach(st => {
+          if (st.title) {
+            createdSubtaskMap.set(st.title, st.id);
+          }
+        });
+        
         // Handle child subtasks for existing subtasks
+        // IMPORTANT: Process child tasks for ALL subtasks (both new and existing) to ensure assignments are preserved
         for (const subtask of subtasks) {
-          if (subtask.id && subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0) {
-            await saveChildSubtasks(subtask.id, id, subtask.childSubtasks);
+          if (subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0) {
+            // Try to get subtask ID from multiple sources
+            let subtaskId = subtask.id ? String(subtask.id).trim() : null;
+            
+            // If no ID but we have a title, try to find it in the refreshed list
+            if (!subtaskId && (subtask.name || subtask.title)) {
+              const subtaskTitle = (subtask.name || subtask.title || '').trim();
+              const foundSubtask = allExistingSubtasks.find(st => st.title === subtaskTitle);
+              if (foundSubtask) {
+                subtaskId = foundSubtask.id;
+                console.log(`🔍 Found subtask ID by title "${subtaskTitle}": ${subtaskId}`);
+              }
+            }
+            
+            console.log(`📝 Processing childSubtasks for subtask ${subtaskId || 'UNKNOWN'}: ${subtask.childSubtasks.length} children`);
+            console.log(`📝 Child subtasks data:`, JSON.stringify(subtask.childSubtasks.map((c: any) => ({ 
+              id: c.id || 'NO_ID', 
+              name: c.name, 
+              title: c.title,
+              assignedEmployeeId: c.assignedEmployeeId || c.assignedEmployee || 'NOT_ASSIGNED',
+              parentSubtaskId: subtaskId 
+            })), null, 2));
+            
+            // Only process child tasks if we have a valid parent subtask ID
+            if (subtaskId) {
+              try {
+                console.log(`💾 Calling saveChildSubtasks for parent ${subtaskId} with ${subtask.childSubtasks.length} children`);
+                await saveChildSubtasks(subtaskId, id, subtask.childSubtasks, req.user?.id, projectDefaults);
+                console.log(`✅ Successfully saved child tasks for subtask ${subtaskId}`);
+              } catch (childError: any) {
+                console.error(`❌ Error saving child tasks for subtask ${subtaskId}:`, childError);
+                console.error(`❌ Child error details:`, {
+                  message: childError?.message,
+                  code: childError?.code,
+                  meta: childError?.meta,
+                  stack: childError?.stack,
+                });
+                throw childError; // Re-throw to be caught by outer catch
+              }
+            } else {
+              console.warn(`⚠️ Skipping child tasks for subtask without ID - subtask:`, {
+                name: subtask.name,
+                title: subtask.title,
+                id: subtask.id,
+                childCount: subtask.childSubtasks.length
+              });
+            }
           }
         }
 
-        console.log(`✅ Saved ${subtasks.length} subtasks for project ${id}`);
-      } catch (subtaskError) {
-        console.error('Error saving subtasks:', subtaskError);
-        // Don't fail the entire update if subtask save fails
+        console.log(`✅ Saved ${subtasks.length} subtasks for project ${id} (${createdCount} created, ${updatedCount} updated)`);
+      } catch (subtaskError: any) {
+        console.error('❌ Error saving subtasks:', subtaskError);
+        console.error('❌ Subtask error details:', {
+          message: subtaskError?.message,
+          code: subtaskError?.code,
+          meta: subtaskError?.meta,
+          stack: subtaskError?.stack,
+        });
+        // Return error instead of silently failing
+        res.status(500).json({
+          success: false,
+          message: 'Failed to save subtasks',
+          error: subtaskError?.message || 'Unknown error',
+          details: subtaskError?.meta,
+        });
+        return;
       }
     }
 
+    // Refetch project with nested subtasks so response includes newly created child tasks
+    const updatedProject = await prisma.project.findUnique({
+      where: { id },
+      include: {
+        client: true,
+        creator: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+          },
+        },
+        assignedEmployees: {
+          include: {
+            employee: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+              },
+            },
+          },
+        },
+        tasks: {
+          where: { parentTaskId: null },
+          include: {
+            assignments: {
+              include: {
+                employee: {
+                  select: {
+                    id: true,
+                    firstName: true,
+                    lastName: true,
+                  },
+                },
+              },
+            },
+            assignedEmployee: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+              },
+            },
+            subtasks: {
+              include: {
+                assignedEmployee: {
+                  select: {
+                    id: true,
+                    firstName: true,
+                    lastName: true,
+                    email: true,
+                  },
+                },
+                subtasks: {
+                  include: {
+                    assignedEmployee: {
+                      select: {
+                        id: true,
+                        firstName: true,
+                        lastName: true,
+                        email: true,
+                      },
+                    },
+                  },
+                  orderBy: {
+                    createdAt: 'asc',
+                  },
+                },
+              },
+              orderBy: {
+                createdAt: 'asc',
+              },
+            },
+            _count: {
+              select: {
+                checklists: true,
+                attachments: true,
+              },
+            },
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+        },
+        checklists: {
+          orderBy: {
+            order: 'asc',
+          },
+        },
+        attachments: {
+          orderBy: {
+            uploadedAt: 'desc',
+          },
+        },
+        documents: {
+          orderBy: {
+            uploadedAt: 'desc',
+          },
+        },
+        tenders: {
+          select: {
+            id: true,
+            name: true,
+            referenceNumber: true,
+            status: true,
+          },
+        },
+        contracts: {
+          select: {
+            id: true,
+            referenceNumber: true,
+            title: true,
+            status: true,
+            contractType: true,
+            startDate: true,
+            endDate: true,
+            contractValue: true,
+            currency: true,
+            developerName: true,
+            plotNumber: true,
+            community: true,
+            numberOfFloors: true,
+            makaniNumber: true,
+            assignedManagerId: true as any,
+            assignedManagerEmail: true as any,
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+        },
+        _count: {
+          select: {
+            tasks: true,
+            documents: true,
+            tenders: true,
+            checklists: true,
+            attachments: true,
+            contracts: true,
+          },
+        },
+      },
+    });
+
+    const responseProject = updatedProject || project;
+    // Ensure frontend can show updated name in Project Details: expose both name and projectName (display = name or referenceNumber)
+    const data = responseProject as any;
+    const projectDisplay = data
+      ? { ...data, projectName: data.name != null && data.name !== '' ? data.name : data.referenceNumber }
+      : data;
     res.json({
       success: true,
       message: 'Project updated successfully',
-      data: project,
+      data: projectDisplay,
     });
-  } catch (error) {
-    console.error('Update project error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
+  } catch (error: any) {
+    console.error('❌ Update project error:', error);
+    console.error('❌ Error details:', {
+      message: error?.message,
+      code: error?.code,
+      meta: error?.meta,
+      stack: error?.stack,
+    });
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update project',
+      error: error?.message || 'Internal server error',
+      details: error?.meta,
+    });
+  }
+};
+
+/**
+ * Update only the project name (so modal save persists and survives refresh).
+ * Frontend can call PUT /projects/:id/name with body { name: "villa" } or { projectName: "villa" }.
+ */
+export const updateProjectName = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const nameRaw = req.body.name ?? req.body.projectName ?? (req.body as any).title;
+    const name = typeof nameRaw === 'string' ? nameRaw.trim() : (nameRaw != null ? String(nameRaw).trim() : '');
+
+    if (!name) {
+      res.status(400).json({ success: false, message: 'Project name is required' });
+      return;
+    }
+
+    const existing = await prisma.project.findUnique({ where: { id }, select: { id: true } });
+    if (!existing) {
+      res.status(404).json({ success: false, message: 'Project not found' });
+      return;
+    }
+
+    const updated = await prisma.project.update({
+      where: { id },
+      data: { name },
+      select: { id: true, name: true, referenceNumber: true },
+    });
+    console.log(`📝 Project name updated: ${id} -> "${updated.name}"`);
+    res.json({
+      success: true,
+      message: 'Project name updated',
+      data: { id: updated.id, name: updated.name, projectName: updated.name, referenceNumber: updated.referenceNumber },
+    });
+  } catch (error: any) {
+    console.error('Update project name error:', error);
+    res.status(500).json({ success: false, message: error?.message || 'Failed to update project name' });
   }
 };
 
@@ -1004,6 +2016,13 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
             employeeId: true,
           },
         },
+        contracts: {
+          select: {
+            id: true,
+            assignedManagerId: true as any,
+            assignedManagerEmail: true as any,
+          },
+        },
       },
     });
 
@@ -1013,7 +2032,7 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    // Employee role: Cannot delete projects (even assigned ones)
+    // Employee role: Cannot delete projects
     if (req.user?.role === 'EMPLOYEE') {
       res.status(403).json({
         success: false,
@@ -1021,6 +2040,30 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
         code: 'ACCESS_DENIED',
       });
       return;
+    }
+
+    // Manager role: Can delete projects they created, are assigned to, or from their contracts
+    if (req.user?.role === 'MANAGER') {
+      const projectWithRelations = project as any;
+      const isCreator = project.createdBy === req.user.id;
+      const isAssigned = projectWithRelations.assignedEmployees?.some(
+        (a: { employeeId: string }) => a.employeeId === req.user!.id
+      );
+      
+      // Check if project was created from a contract assigned to this manager
+      const hasAssignedContract = projectWithRelations.contracts?.some((contract: any) => {
+        return (req.user?.email && contract.assignedManagerEmail === req.user.email) ||
+               (req.user?.id && contract.assignedManagerId === req.user.id);
+      });
+
+      if (!isCreator && !isAssigned && !hasAssignedContract) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: You can only delete projects you created, are assigned to, or that were created from your contracts.',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
     }
 
     console.log(`📋 Deleting project: ${project.name} (${(project as any).referenceNumber})`);
@@ -1130,6 +2173,10 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
 
 // Bulk delete projects
 export const deleteProjects = async (req: AuthRequest, res: Response): Promise<void> => {
+  console.log('🚀 deleteProjects endpoint called');
+  console.log('📥 Request body:', JSON.stringify(req.body, null, 2));
+  console.log('👤 User:', req.user?.email, 'Role:', req.user?.role);
+  
   try {
     // Employee role: Cannot delete projects
     if (req.user?.role === 'EMPLOYEE') {
@@ -1140,7 +2187,16 @@ export const deleteProjects = async (req: AuthRequest, res: Response): Promise<v
       });
       return;
     }
-    const { ids } = req.body;
+
+    // Manager role: Can delete projects (will be validated per project in the loop below)
+    const { ids, selectedTasks, selectedSubtasks } = req.body;
+    
+    // Check if this is actually a task deletion request (frontend might be calling wrong endpoint)
+    if (selectedTasks || selectedSubtasks) {
+      console.warn('⚠️ WARNING: Projects bulk delete endpoint received task deletion data!');
+      console.warn('   This suggests the frontend is calling /api/projects/bulk instead of /api/tasks/bulk');
+      console.warn('   Request body contains selectedTasks or selectedSubtasks:', { selectedTasks, selectedSubtasks });
+    }
 
     if (!ids || !Array.isArray(ids) || ids.length === 0) {
       res.status(400).json({ 
@@ -1150,10 +2206,23 @@ export const deleteProjects = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // Verify all projects exist
+    // Verify all projects exist and check permissions for managers
     const projects = await prisma.project.findMany({
       where: { id: { in: ids } },
-      select: { id: true },
+      include: {
+        assignedEmployees: {
+          select: {
+            employeeId: true,
+          },
+        },
+        contracts: {
+          select: {
+            id: true,
+            assignedManagerId: true as any,
+            assignedManagerEmail: true as any,
+          },
+        },
+      },
     });
 
     if (projects.length !== ids.length) {
@@ -1162,6 +2231,35 @@ export const deleteProjects = async (req: AuthRequest, res: Response): Promise<v
         message: 'Some projects not found' 
       });
       return;
+    }
+
+    // For managers, verify they can delete each project
+    if (req.user?.role === 'MANAGER') {
+      const unauthorizedProjects: string[] = [];
+      for (const project of projects) {
+        const projectWithRelations = project as any;
+        const isCreator = project.createdBy === req.user.id;
+        const isAssigned = projectWithRelations.assignedEmployees?.some(
+          (a: { employeeId: string }) => a.employeeId === req.user!.id
+        );
+        const hasAssignedContract = projectWithRelations.contracts?.some((contract: any) => {
+          return (req.user?.email && contract.assignedManagerEmail === req.user.email) ||
+                 (req.user?.id && contract.assignedManagerId === req.user.id);
+        });
+
+        if (!isCreator && !isAssigned && !hasAssignedContract) {
+          unauthorizedProjects.push(project.id);
+        }
+      }
+
+      if (unauthorizedProjects.length > 0) {
+        res.status(403).json({
+          success: false,
+          message: `Access Denied: You can only delete projects you created, are assigned to, or that were created from your contracts. ${unauthorizedProjects.length} project(s) cannot be deleted.`,
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
     }
 
     // Delete all related records and projects in a transaction

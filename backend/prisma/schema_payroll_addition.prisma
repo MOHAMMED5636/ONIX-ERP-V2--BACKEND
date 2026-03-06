@@ -1,0 +1,176 @@
+// ============================================
+// PAYROLL MODULE - Add these models to schema.prisma
+// ============================================
+// Add these models AFTER the Leave model (around line 1203)
+// Then add the relations to User model (around line 127)
+
+// Payroll Settings - Configurable deduction rules
+model PayrollSettings {
+  id                    String   @id @default(uuid())
+  gracePeriodMinutes    Int      @default(15) // Minutes before late deduction applies
+  lateDeductionPerMinute Decimal @db.Decimal(10, 2) @default(0.5) // AED per minute late
+  absenceDeductionType  String   @default("DAILY") // DAILY or PERCENTAGE
+  absenceDeductionValue Decimal  @db.Decimal(10, 2) @default(1.0) // Daily rate multiplier or percentage
+  unpaidLeaveDeductionType String @default("DAILY") // DAILY or PERCENTAGE
+  unpaidLeaveDeductionValue Decimal @db.Decimal(10, 2) @default(1.0)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  updatedBy             String? // User ID who last updated
+
+  @@map("payroll_settings")
+}
+
+// Payroll Run - Represents one payroll processing period
+model PayrollRun {
+  id              String          @id @default(uuid())
+  periodStart     DateTime        @db.Date // Start date of payroll period
+  periodEnd        DateTime        @db.Date // End date of payroll period
+  periodMonth     Int             // 1-12
+  periodYear      Int             // e.g., 2024
+  status          PayrollStatus   @default(DRAFT)
+  totalEmployees  Int             @default(0)
+  totalGross      Decimal         @db.Decimal(12, 2) @default(0)
+  totalDeductions Decimal         @db.Decimal(12, 2) @default(0)
+  totalNet        Decimal         @db.Decimal(12, 2) @default(0)
+  
+  // Approval workflow
+  hrApprovedById   String?
+  hrApprovedAt     DateTime?
+  financeApprovedById String?
+  financeApprovedAt   DateTime?
+  finalApprovedById   String?
+  finalApprovedAt     DateTime?
+  lockedAt         DateTime? // When payroll is locked (final approval)
+  
+  // Snapshot of settings used (prevent future changes from affecting past payrolls)
+  settingsSnapshot Json? // Store PayrollSettings as JSON at time of run
+  
+  createdById     String? // User ID who created this payroll run
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  lines           PayrollLine[]
+  approvals       PayrollApproval[]
+  auditLogs       PayrollAuditLog[]
+
+  @@unique([periodMonth, periodYear]) // One payroll per month/year
+  @@index([status])
+  @@index([periodYear, periodMonth])
+  @@map("payroll_runs")
+}
+
+enum PayrollStatus {
+  DRAFT
+  HR_PENDING
+  HR_APPROVED
+  FINANCE_PENDING
+  FINANCE_APPROVED
+  FINAL_APPROVED
+  LOCKED
+}
+
+// Payroll Line - One record per employee per payroll run
+model PayrollLine {
+  id              String   @id @default(uuid())
+  payrollRunId    String
+  payrollRun      PayrollRun @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  employeeId      String   // User.id (not employeeId string)
+  employee        User     @relation("PayrollEmployee", fields: [employeeId], references: [id])
+  
+  // Snapshot of employee data at time of payroll (prevent future edits from changing past payrolls)
+  snapshotEmployeeId    String? // employeeId string (e.g., "EMP001")
+  snapshotBasicSalary   Decimal @db.Decimal(12, 2)
+  snapshotAllowance1    Decimal @db.Decimal(12, 2) @default(0)
+  snapshotAllowance2    Decimal @db.Decimal(12, 2) @default(0)
+  snapshotTotalAllowances Decimal @db.Decimal(12, 2) @default(0)
+  snapshotDepartment    String?
+  
+  // Calculated values
+  grossSalary     Decimal @db.Decimal(12, 2) // Basic + Allowances
+  totalDeductions Decimal @db.Decimal(12, 2) @default(0)
+  netSalary       Decimal @db.Decimal(12, 2) // Gross - Deductions
+  
+  // Attendance summary (snapshot)
+  totalWorkingDays    Int @default(0)
+  totalAbsentDays     Int @default(0)
+  totalLateInstances  Int @default(0)
+  totalLateMinutes    Int @default(0)
+  totalEarlyLeaveMinutes Int @default(0)
+  
+  // Leave summary (snapshot)
+  paidLeaveDays       Int @default(0)
+  unpaidLeaveDays     Int @default(0)
+  
+  // Deduction breakdown
+  absenceDeduction     Decimal @db.Decimal(12, 2) @default(0)
+  lateDeduction        Decimal @db.Decimal(12, 2) @default(0)
+  unpaidLeaveDeduction Decimal @db.Decimal(12, 2) @default(0)
+  manualAdjustments    Decimal @db.Decimal(12, 2) @default(0)
+  adjustmentNotes      String? @db.Text
+  
+  // Payslip generation
+  payslipGenerated     Boolean @default(false)
+  payslipGeneratedAt   DateTime?
+  payslipPath          String? // PDF file path
+  
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@unique([payrollRunId, employeeId]) // One line per employee per run
+  @@index([employeeId])
+  @@index([payrollRunId])
+  @@map("payroll_lines")
+}
+
+// Payroll Approval - Tracks approval workflow
+model PayrollApproval {
+  id            String          @id @default(uuid())
+  payrollRunId  String
+  payrollRun    PayrollRun      @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  stage         PayrollApprovalStage
+  approvedById  String? // User ID
+  approvedBy    User?   @relation("PayrollApprover", fields: [approvedById], references: [id])
+  approvedAt    DateTime?
+  comments      String? @db.Text
+  rejected      Boolean @default(false)
+  rejectionReason String? @db.Text
+  
+  createdAt     DateTime @default(now())
+
+  @@index([payrollRunId])
+  @@index([stage])
+  @@map("payroll_approvals")
+}
+
+enum PayrollApprovalStage {
+  HR_REVIEW
+  FINANCE_REVIEW
+  FINAL_APPROVAL
+}
+
+// Payroll Audit Log - Tracks all changes to payroll runs
+model PayrollAuditLog {
+  id            String   @id @default(uuid())
+  payrollRunId  String
+  payrollRun    PayrollRun @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  action        String   // CREATE, UPDATE, APPROVE, REJECT, LOCK, ADJUSTMENT
+  performedById String? // User ID
+  performedBy   User?    @relation("PayrollAuditor", fields: [performedById], references: [id])
+  details       Json?    // Additional details about the action
+  createdAt     DateTime @default(now())
+
+  @@index([payrollRunId])
+  @@index([action])
+  @@map("payroll_audit_logs")
+}
+
+// ============================================
+// ADD THESE RELATIONS TO User MODEL (around line 127):
+// ============================================
+// Add after the Leave Relations section:
+//
+//   // Payroll Relations
+//   payrollLines    PayrollLine[] @relation("PayrollEmployee")
+//   payrollApprovals PayrollApproval[] @relation("PayrollApprover")
+//   payrollAuditLogs PayrollAuditLog[] @relation("PayrollAuditor")

@@ -158,6 +158,44 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
+    // Employee ID: required and unique
+    if (!employeeId || typeof employeeId !== 'string' || employeeId.trim() === '') {
+      res.status(400).json({
+        success: false,
+        message: 'Employee ID is required'
+      });
+      return;
+    }
+    const trimmedEmployeeId = employeeId.trim();
+    const existingByEmployeeId = await prisma.user.findFirst({
+      where: { employeeId: trimmedEmployeeId },
+    });
+    if (existingByEmployeeId) {
+      res.status(409).json({
+        success: false,
+        message: 'An employee with this Employee ID already exists. Please use a unique Employee ID.'
+      });
+      return;
+    }
+
+    // Status: required
+    if (!status || typeof status !== 'string' || status.trim() === '') {
+      res.status(400).json({
+        success: false,
+        message: 'Status is required'
+      });
+      return;
+    }
+
+    // Employee type: required
+    if (!employeeType || typeof employeeType !== 'string' || employeeType.trim() === '') {
+      res.status(400).json({
+        success: false,
+        message: 'Employee type is required'
+      });
+      return;
+    }
+
     // Validate minimum age (18 years)
     if (birthday) {
       const birthDate = new Date(birthday);
@@ -270,23 +308,49 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
       ? (userAccount.toLowerCase().trim() === 'true' || userAccount.toLowerCase().trim() === '1' || userAccount.toLowerCase().trim() === 'yes')
       : Boolean(userAccount);
 
-    // ERP Access: work email (use provided or generate)
-    const emailProvided = typeof workEmail === 'string' && workEmail.trim().length > 0;
+    // ERP Access: work email OR mobile number (use provided or generate email)
+    const emailOrMobileProvided = typeof workEmail === 'string' && workEmail.trim().length > 0;
     let email: string;
-    if (userAccountBool && emailProvided) {
-      const trimmed = workEmail.trim().toLowerCase();
+    let phoneForLogin: string | null = null;
+    if (userAccountBool && emailOrMobileProvided) {
+      const trimmed = workEmail.trim();
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(trimmed)) {
-        res.status(400).json({ success: false, message: 'Work email must be a valid email address.' });
+      const mobileRegex = /^(\+?\d{1,3}[-.\s]?)?\(?\d{1,4}\)?[-.\s]?\d{1,9}[-.\s]?\d{1,9}$/;
+      const normalizedMobile = trimmed.replace(/[-.\s()]/g, '');
+      
+      if (emailRegex.test(trimmed.toLowerCase())) {
+        // Email provided
+        email = trimmed.toLowerCase();
+        const existing = await prisma.user.findUnique({ where: { email } });
+        if (existing) {
+          res.status(409).json({ success: false, message: 'An account with this email already exists. Please use a different work email.' });
+          return;
+        }
+        console.log('📧 Using provided work email:', email);
+      } else if (mobileRegex.test(normalizedMobile)) {
+        // Mobile number provided - store in phone, generate email
+        // Normalize phone: remove spaces, dashes, parentheses for consistent storage
+        phoneForLogin = normalizedMobile;
+        // Check if phone already exists (try both normalized and original format)
+        const existingByPhone = await prisma.user.findFirst({ 
+          where: { 
+            OR: [
+              { phone: trimmed },
+              { phone: normalizedMobile }
+            ]
+          } 
+        });
+        if (existingByPhone) {
+          res.status(409).json({ success: false, message: 'An account with this mobile number already exists. Please use a different mobile number.' });
+          return;
+        }
+        email = await generateUniqueEmail(firstName, lastName);
+        console.log('📱 Using provided mobile number:', phoneForLogin);
+        console.log('📧 Generated email for mobile login:', email);
+      } else {
+        res.status(400).json({ success: false, message: 'Work email or mobile number must be a valid email address or mobile number.' });
         return;
       }
-      const existing = await prisma.user.findUnique({ where: { email: trimmed } });
-      if (existing) {
-        res.status(409).json({ success: false, message: 'An account with this email already exists. Please use a different work email.' });
-        return;
-      }
-      email = trimmed;
-      console.log('📧 Using provided work email:', email);
     } else {
       email = await generateUniqueEmail(firstName, lastName);
       console.log('📧 Generated email:', email);
@@ -402,12 +466,12 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
         firstName: trimmedFirstName,
         lastName: trimmedLastName,
         role: role || 'EMPLOYEE',
-        phone: phone || null,
+        phone: phoneForLogin || phone || null, // Use phoneForLogin (from workEmail mobile) if provided, else use phone field
         department: department || null,
         position: position || null,
         jobTitle: jobTitle || null,
         photo: photoFilename || null,
-        employeeId: employeeId || null,
+        employeeId: trimmedEmployeeId,
         forcePasswordChange: userAccountBool ? true : false,
         isActive: status === 'active' || status === 'Active' || !status ? true : false,
         createdBy: req.user!.id,
@@ -613,22 +677,89 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
 };
 
 /**
+ * Check availability of Employee ID (and optionally email) for validation before create
+ * GET /api/employees/check-availability?employeeId=XXX&email=YYY
+ * Returns { employeeIdAvailable: boolean, emailAvailable?: boolean }
+ */
+export const checkEmployeeAvailability = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { employeeId, email } = req.query;
+    const result: { employeeIdAvailable?: boolean; emailAvailable?: boolean } = {};
+
+    if (employeeId !== undefined && employeeId !== null && String(employeeId).trim() !== '') {
+      const id = String(employeeId).trim();
+      const existing = await prisma.user.findFirst({ where: { employeeId: id } });
+      result.employeeIdAvailable = !existing;
+    }
+
+    if (email !== undefined && email !== null && String(email).trim() !== '') {
+      const e = String(email).trim().toLowerCase();
+      const existing = await prisma.user.findUnique({ where: { email: e } });
+      result.emailAvailable = !existing;
+    }
+
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Check availability error:', error);
+    res.status(500).json({ success: false, message: 'Failed to check availability' });
+  }
+};
+
+/**
  * Get all employees
  * GET /api/employees
  * Access: ADMIN, HR only
  */
 export const getEmployees = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { page = 1, limit = 50, search, role, department } = req.query;
+    // For employee assignment dropdowns, allow fetching more employees (up to 500)
+    // Default limit increased to 200 to show more employees in dropdowns
+    const { page = 1, limit = 200, search, role, department, companyId, companyName, forTaskAssignment } = req.query;
     const skip = (Number(page) - 1) * Number(limit);
+
+    console.log('📋 getEmployees called:', {
+      userRole: req.user?.role,
+      userEmail: req.user?.email,
+      userId: req.user?.id,
+      forTaskAssignment,
+      companyId,
+      companyName
+    });
 
     // Build where clause
     const where: any = {
       // Exclude ADMIN and TENDER_ENGINEER roles - only show actual employees
+      // Also filter by isActive to only show active employees
       role: {
         notIn: ['ADMIN', 'TENDER_ENGINEER']
-      }
+      },
+      isActive: true // Only show active employees
     };
+
+    // For task assignment dropdowns: ALL managers (MANAGER, PROJECT_MANAGER) can see all employees
+    // ADMIN and HR also see all employees
+    // No managerId filter is applied - all managers can assign tasks to any employee
+    if (forTaskAssignment === 'true') {
+      console.log(`✅ ${req.user?.role} role: Showing all employees for task assignment (no managerId filter)`);
+    }
+
+    // Filter by company so each company's Employee Directory shows only its employees
+    // Skip company filtering for task assignment - managers should see their team members regardless of company
+    if (forTaskAssignment !== 'true') {
+      let companyNameFilter: string | null = null;
+      if (companyName && typeof companyName === 'string' && companyName.trim()) {
+        companyNameFilter = companyName.trim();
+      } else if (companyId && typeof companyId === 'string' && companyId.trim()) {
+        const company = await prisma.company.findUnique({
+          where: { id: companyId.trim() },
+          select: { name: true },
+        });
+        if (company) companyNameFilter = company.name.trim();
+      }
+      if (companyNameFilter) {
+        where.company = { equals: companyNameFilter, mode: 'insensitive' };
+      }
+    }
     
     if (search) {
       where.OR = [
@@ -649,6 +780,8 @@ export const getEmployees = async (req: AuthRequest, res: Response): Promise<voi
     if (department) {
       where.department = { contains: department as string, mode: 'insensitive' };
     }
+
+    console.log('🔍 Query where clause:', JSON.stringify(where, null, 2));
 
     // Get employees
     const [employees, total] = await Promise.all([
@@ -734,6 +867,8 @@ export const getEmployees = async (req: AuthRequest, res: Response): Promise<voi
       }),
       prisma.user.count({ where }),
     ]);
+
+    console.log(`✅ Found ${employees.length} employees (total: ${total})`);
 
     res.json({
       success: true,
@@ -892,6 +1027,15 @@ export const getEmployeeById = async (req: AuthRequest, res: Response): Promise<
 export const updateEmployee = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
+    
+    // Log incoming request for debugging
+    console.log('📝 Update employee request received');
+    console.log('📝 Employee ID:', id);
+    console.log('📝 Request body keys:', Object.keys(req.body || {}));
+    console.log('📝 Request body (first 1000 chars):', JSON.stringify(req.body).substring(0, 1000));
+    console.log('📝 Content-Type:', req.headers['content-type']);
+    console.log('📝 Has files:', !!(req as any).file || !!(req as any).files);
+    
     const { 
       // Basic fields
       firstName, lastName, role, phone, department, position, jobTitle, employeeId, isActive, projectIds,
@@ -1047,7 +1191,7 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
     if (jobTitle !== undefined) updateData.jobTitle = jobTitle;
     if (photoFilename !== undefined) updateData.photo = photoFilename;
     if (employeeId !== undefined) updateData.employeeId = employeeId;
-    if (isActive !== undefined) updateData.isActive = isActive;
+    if (isActive !== undefined) updateData.isActive = parseBoolean(isActive);
     
     // Employee Directory - Personal Info
     if (employeeType !== undefined) updateData.employeeType = employeeType;
@@ -1163,6 +1307,50 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
     
     if (remarks !== undefined) updateData.remarks = remarks;
 
+    // Log update data for debugging
+    console.log('📝 Update data being sent to Prisma:', JSON.stringify(updateData, null, 2));
+    console.log('📝 Employee ID:', id);
+    console.log('📝 Update data keys:', Object.keys(updateData));
+
+    // Check if updateData is empty
+    if (Object.keys(updateData).length === 0) {
+      console.warn('⚠️ No fields to update - updateData is empty');
+      // Return existing employee if no updates
+      const existing = await prisma.user.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          role: true,
+          phone: true,
+          department: true,
+          position: true,
+          jobTitle: true,
+          photo: true,
+          employeeId: true,
+          isActive: true,
+          updatedAt: true,
+        }
+      });
+      
+      if (!existing) {
+        res.status(404).json({
+          success: false,
+          message: 'Employee not found'
+        });
+        return;
+      }
+      
+      res.json({
+        success: true,
+        message: 'No changes to update',
+        data: existing
+      });
+      return;
+    }
+
     const employee = await prisma.user.update({
       where: { id },
       data: updateData,
@@ -1255,19 +1443,42 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
       data: employee
     });
   } catch (error: any) {
-    console.error('Update employee error:', error);
+    console.error('❌ Update employee error:', error);
+    console.error('❌ Error details:', {
+      message: error?.message,
+      code: error?.code,
+      meta: error?.meta,
+      stack: error?.stack,
+    });
     
     if (error.code === 'P2002') {
+      const field = error.meta?.target?.[0] || 'field';
       res.status(409).json({
         success: false,
-        message: 'Employee ID or email already exists'
+        message: `${field === 'email' ? 'Email' : field === 'employeeId' ? 'Employee ID' : 'Field'} already exists`
       });
       return;
     }
 
+    if (error.code === 'P2025') {
+      res.status(404).json({
+        success: false,
+        message: 'Employee not found'
+      });
+      return;
+    }
+
+    // Return actual error message for debugging
+    const errorMessage = error?.message || 'Failed to update employee';
+    console.error('❌ Returning error to client:', errorMessage);
+    
     res.status(500).json({
       success: false,
-      message: 'Failed to update employee'
+      message: errorMessage,
+      error: process.env.NODE_ENV === 'development' ? {
+        code: error?.code,
+        meta: error?.meta,
+      } : undefined
     });
   }
 };
@@ -1326,6 +1537,41 @@ export const restoreEmployee = async (req: AuthRequest, res: Response): Promise<
   try {
     const { id } = req.params;
 
+    console.log(`🔄 Restoring employee: ${id}`);
+
+    // Check if employee exists
+    const existingEmployee = await prisma.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        isActive: true,
+        role: true,
+      }
+    });
+
+    if (!existingEmployee) {
+      console.log(`❌ Employee not found: ${id}`);
+      res.status(404).json({
+        success: false,
+        message: 'Employee not found'
+      });
+      return;
+    }
+
+    // Check if employee is already active
+    if (existingEmployee.isActive) {
+      console.log(`ℹ️  Employee already active: ${id}`);
+      res.json({
+        success: true,
+        message: 'Employee is already active',
+        data: existingEmployee
+      });
+      return;
+    }
+
     // Restore - reactivate the employee
     const employee = await prisma.user.update({
       where: { id },
@@ -1336,19 +1582,39 @@ export const restoreEmployee = async (req: AuthRequest, res: Response): Promise<
         firstName: true,
         lastName: true,
         isActive: true,
+        role: true,
+        jobTitle: true,
+        department: true,
+        employeeId: true,
       }
     });
+
+    console.log(`✅ Employee restored successfully: ${employee.email} (${employee.id})`);
 
     res.json({
       success: true,
       message: 'Employee restored successfully',
       data: employee
     });
-  } catch (error) {
-    console.error('Restore employee error:', error);
+  } catch (error: any) {
+    console.error('❌ Restore employee error:', error);
+    console.error('❌ Error details:', {
+      message: error?.message,
+      code: error?.code,
+      meta: error?.meta,
+    });
+    
+    if (error.code === 'P2025') {
+      res.status(404).json({
+        success: false,
+        message: 'Employee not found'
+      });
+      return;
+    }
+
     res.status(500).json({
       success: false,
-      message: 'Failed to restore employee'
+      message: error?.message || 'Failed to restore employee'
     });
   }
 };
@@ -1360,22 +1626,36 @@ export const restoreEmployee = async (req: AuthRequest, res: Response): Promise<
  */
 export const getEmployeeStatistics = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const { companyId, companyName } = req.query;
+
+    // Resolve company filter so stats are per-company when viewing a company's directory
+    let companyNameFilter: string | null = null;
+    if (companyName && typeof companyName === 'string' && companyName.trim()) {
+      companyNameFilter = companyName.trim();
+    } else if (companyId && typeof companyId === 'string' && companyId.trim()) {
+      const company = await prisma.company.findUnique({
+        where: { id: companyId.trim() },
+        select: { name: true },
+      });
+      if (company) companyNameFilter = company.name.trim();
+    }
+
+    const baseWhere: any = {
+      role: { notIn: ['ADMIN', 'TENDER_ENGINEER'] },
+    };
+    if (companyNameFilter) {
+      baseWhere.company = { equals: companyNameFilter, mode: 'insensitive' };
+    }
+
     // Get total employees count (exclude ADMIN and TENDER_ENGINEER roles, only active employees)
     const totalEmployees = await prisma.user.count({
-      where: {
-        role: {
-          notIn: ['ADMIN', 'TENDER_ENGINEER']
-        },
-        isActive: true
-      }
+      where: { ...baseWhere, isActive: true }
     });
 
     // Get active employees count (status = 'Active' or isActive = true)
     const activeEmployees = await prisma.user.count({
       where: {
-        role: {
-          notIn: ['ADMIN', 'TENDER_ENGINEER']
-        },
+        ...baseWhere,
         isActive: true,
         OR: [
           { status: { equals: 'Active', mode: 'insensitive' } },
@@ -1387,9 +1667,7 @@ export const getEmployeeStatistics = async (req: AuthRequest, res: Response): Pr
     // Get inactive employees count
     const inactiveEmployees = await prisma.user.count({
       where: {
-        role: {
-          notIn: ['ADMIN', 'TENDER_ENGINEER']
-        },
+        ...baseWhere,
         OR: [
           { status: { equals: 'Inactive', mode: 'insensitive' } },
           { isActive: false }
@@ -1401,9 +1679,7 @@ export const getEmployeeStatistics = async (req: AuthRequest, res: Response): Pr
     const employeesByDepartment = await prisma.user.groupBy({
       by: ['department'],
       where: {
-        role: {
-          notIn: ['ADMIN', 'TENDER_ENGINEER']
-        },
+        ...baseWhere,
         isActive: true,
         department: {
           not: null
@@ -1417,9 +1693,7 @@ export const getEmployeeStatistics = async (req: AuthRequest, res: Response): Pr
     // Get unique departments count (only from active employees)
     const totalDepartments = await prisma.user.findMany({
       where: {
-        role: {
-          notIn: ['ADMIN', 'TENDER_ENGINEER']
-        },
+        ...baseWhere,
         isActive: true,
         department: {
           not: null

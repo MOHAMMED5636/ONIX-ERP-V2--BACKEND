@@ -35,22 +35,36 @@ const upload = multer({
 // All routes require authentication
 router.use(authenticate);
 
+// Log all DELETE requests for debugging
+router.use((req, res, next) => {
+  if (req.method === 'DELETE') {
+    console.log(`🔍 DELETE request: ${req.path}`);
+    console.log(`   Query params:`, req.query);
+    console.log(`   Body:`, req.body);
+  }
+  next();
+});
+
 // Task CRUD routes
 router.get('/stats', tasksController.getTaskStats);
 router.get('/kanban', tasksController.getKanbanTasks);
 router.get('/', tasksController.getAllTasks);
+router.get('/delegations/report', tasksController.getDelegationsReport);
 router.get('/:id', tasksController.getTaskById);
 router.post('/', tasksController.createTask);
 router.put('/:id', tasksController.updateTask);
+router.delete('/bulk', tasksController.deleteTasks); // Bulk delete must come before /:id
 router.delete('/:id', tasksController.deleteTask);
 
-// Hierarchical task endpoints
+// Hierarchical task endpoints (support both singular and plural for frontend compatibility)
 router.post('/:parentId/subtask', tasksController.addSubtask); // Add subtask to main task
+router.post('/:parentId/subtasks', tasksController.addSubtask); // Alias: some frontends call /subtasks
 router.post('/:parentId/child', tasksController.addChildTask); // Add child task to subtask
 
 // Task employee assignment
 router.post('/:id/assign', tasksController.assignEmployees);
 router.put('/:id/assignments/:assignmentId/status', tasksController.updateAssignmentStatus);
+router.post('/:id/delegate', tasksController.delegateTask);
 
 // Task checklists
 router.get('/:taskId/checklists', checklistsController.getTaskChecklists);

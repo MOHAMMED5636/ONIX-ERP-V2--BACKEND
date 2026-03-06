@@ -16,6 +16,8 @@ model User {
   role                UserRole @default(ADMIN)
   isActive            Boolean  @default(true)
   forcePasswordChange Boolean  @default(false) // Force password change on first login
+  loginOtp            String?  // OTP for passwordless login
+  loginOtpExpiry      DateTime? // OTP expiration time (10 minutes)
   phone               String?
   department          String?
   position            String?
@@ -87,6 +89,10 @@ model User {
   createdProjects  Project[]
   assignedProjects ProjectAssignment[] @relation("AssignedEmployee")
   assignedTasks    TaskAssignment[]
+  assignedTaskSubtasks Task[] @relation("AssignedTaskEmployee") // Subtasks/child tasks assigned to this employee
+  taskDelegationsAsOriginal  TaskDelegation[] @relation("DelegationOriginal")
+  taskDelegationsAsNew       TaskDelegation[] @relation("DelegationNew")
+  taskDelegationsAsDelegator TaskDelegation[] @relation("DelegationBy")
   createdTemplates QuestionnaireTemplate[] @relation("TemplateCreator")
   questionnaireResponses QuestionnaireResponse[] @relation("QuestionnaireRespondent")
 
@@ -101,6 +107,7 @@ model User {
   // Contract Relations
   createdContracts  Contract[] @relation("ContractCreator")
   approvedContracts Contract[] @relation("ContractApprover")
+  assignedContracts Contract[] @relation("AssignedContractManager")
 
   // Attendance Relations
   attendances Attendance[] @relation("UserAttendances")
@@ -113,7 +120,37 @@ model User {
   approvedLeaves   Leave[] @relation("LeaveApprover")
   rejectedLeaves   Leave[] @relation("LeaveRejector")
 
+  // Labour employee flag - when true, LabourDetails record exists
+  isLabour         Boolean  @default(false)
+  labourDetails    LabourDetails?
+
   @@map("users")
+}
+
+model LabourDetails {
+  id                          String    @id @default(uuid())
+  userId                      String    @unique
+  user                        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  molNumber                   String?
+  contractTotalSalary         Decimal?  @db.Decimal(12, 2)
+  basicSalary                 Decimal?  @db.Decimal(12, 2)
+  allowance1                  Decimal?  @db.Decimal(12, 2)
+  allowance2                  Decimal?  @db.Decimal(12, 2)
+  healthInsuranceExpiryDate   DateTime?
+  vehicleNumber               String?
+  vehicleType                 String?
+  vehicleRegistrationExpiry   DateTime?
+  shoeSize                    String?
+  assetsCustodyItems          String?   @db.Text
+  accommodationRoomNumber     String?
+  accommodationContractExpiry DateTime?
+  roomAllocationDate          DateTime?
+
+  createdAt                   DateTime  @default(now())
+  updatedAt                   DateTime  @updatedAt
+
+  @@map("labour_details")
 }
 
 enum UserRole {
@@ -123,6 +160,7 @@ enum UserRole {
   CONTRACTOR
   EMPLOYEE
   HR
+  MANAGER
 }
 
 model Client {
@@ -347,6 +385,8 @@ model Task {
   parentTask     Task?        @relation("TaskSubtasks", fields: [parentTaskId], references: [id], onDelete: Cascade)
   subtasks       Task[]       @relation("TaskSubtasks") // Child tasks/subtasks
   status         TaskStatus   @default(PENDING)
+  // Workflow / dependency status (separate from general status to avoid breaking existing logic)
+  workflowStatus TaskWorkflowStatus @default(NOT_STARTED)
   priority       TaskPriority @default(MEDIUM)
   startDate      DateTime?
   dueDate        DateTime?
@@ -360,6 +400,8 @@ model Task {
   planDays       Int?         // Plan days for subtask
   remarks        String?      @db.Text // Remarks
   assigneeNotes  String?      @db.Text // Assignee notes
+  assignedEmployeeId String?  // Assigned employee ID for subtasks/child tasks
+  assignedEmployee User?      @relation("AssignedTaskEmployee", fields: [assignedEmployeeId], references: [id])
   location       String?      // Location
   makaniNumber   String?      // Makani number
   plotNumber     String?      // Plot number
@@ -367,19 +409,33 @@ model Task {
   projectType    String?      // Project type
   projectFloor   String?      // Project floor
   developerProject String?     // Developer project
+  predecessors   String?      @db.VarChar(500) // Task keys (e.g. "1.1" or "1.1,1.2") that must be completed before this task; used for locking
+  // Normalized predecessor relation (used for strict sequencing)
+  predecessorId  String?
+  predecessor    Task?        @relation("TaskPredecessor", fields: [predecessorId], references: [id])
+  dependents     Task[]       @relation("TaskPredecessor")
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
   createdBy      String?
 
   // Relations
-  assignments TaskAssignment[]
-  checklists  TaskChecklist[]
-  attachments TaskAttachment[]
-  comments    TaskComment[]
+  assignments   TaskAssignment[]
+  checklists    TaskChecklist[]
+  attachments   TaskAttachment[]
+  comments      TaskComment[]
+  delegations   TaskDelegation[]   // Audit trail of task delegations
   questionnaireQuestions QuestionnaireQuestion[]
   questionnaireAssignments QuestionnaireAssignment[]
 
   @@map("tasks")
+}
+
+enum TaskWorkflowStatus {
+  WAITING_FOR_PREDECESSOR
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+  OVERDUE
 }
 
 enum TaskStatus {
@@ -417,6 +473,28 @@ enum TaskAssignmentStatus {
   IN_PROGRESS
   COMPLETED
   CANCELLED
+  DELEGATED  // Original assignee after delegating to someone else
+}
+
+// Task Delegation - Audit trail when employee delegates a child/subtask to another employee
+model TaskDelegation {
+  id                 String   @id @default(uuid())
+  taskId             String
+  task               Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  originalAssigneeId String
+  originalAssignee   User     @relation("DelegationOriginal", fields: [originalAssigneeId], references: [id], onDelete: Cascade)
+  newAssigneeId      String
+  newAssignee        User     @relation("DelegationNew", fields: [newAssigneeId], references: [id], onDelete: Cascade)
+  delegatedById      String   // User who performed delegation (typically original assignee)
+  delegatedBy        User     @relation("DelegationBy", fields: [delegatedById], references: [id], onDelete: Cascade)
+  delegatedAt        DateTime @default(now())
+  reason             String?  @db.Text
+
+  @@index([taskId])
+  @@index([originalAssigneeId])
+  @@index([newAssigneeId])
+  @@index([delegatedAt])
+  @@map("task_delegations")
 }
 
 // Questionnaire Template - Reusable checklist templates
@@ -633,6 +711,104 @@ model Company {
   mainLicenseNo   String? // Main License Number
   dcciNo          String? // DCCI Dubai Chamber number
   trnNumber       String? // TRN (Tax Registration Number) / ESBN
+
+  // ========== Personal & Representative Info ==========
+  fullNameEn             String?
+  fullNameAr             String?
+  delegatedCardNumber    String?
+  businessPartnerNumber  String?
+  emiratesId             String?
+  emiratesIdExpiry       DateTime?
+  passportNumber         String?
+  nationality            String?
+  dateOfBirth            DateTime?
+  gender                 String?
+  mobileNumber           String?
+  phoneNumber            String?
+  email                  String?
+  representativeTitleEn  String?
+  representativeTitleAr  String?
+
+  // ========== Company Info (extended) ==========
+  nameAr           String?
+  businessName     String?
+  branchName       String?
+  companyCategory  String?
+  companyType      String?
+  clientRole        String?
+  websiteUrl        String?
+
+  // ========== Licensing & Regulatory ==========
+  establishmentCode       String?
+  establishmentFileNumber  String?
+  licenseAuthority        String?
+  licenseNumber           String?
+  licenseType             String?
+  licenseIssueDate        DateTime?
+  unifiedDedFileNumber     String?
+  dedLicenseNumber        String?
+  prequalificationSubmitted Boolean?
+  prequalificationExpiry   DateTime?
+  commercialRegisterNumber String?
+  commercialRegisterDate   DateTime?
+  membershipNumber         String?
+  membershipIssueDate      DateTime?
+  membershipExpiry         DateTime?
+  membershipLegalStatus    String?
+  trakheesId               String?
+  practiceRegisterNumber   String?
+  practiceRegisterIssueDate DateTime?
+  practiceRegisterExpiry   DateTime?
+  municipalityClassification String?
+  establishmentMolNumber   String?
+  molCardIssueDate         DateTime?
+  molCardExpiry            DateTime?
+  sponsorName              String?
+  establishmentLocation    String?  @db.Text
+  subscriptionStartDate    DateTime?
+  subscriptionEndDate      DateTime?
+
+  // ========== Tax Info ==========
+  vatRegistrationNumber           String?
+  vatEffectiveRegistrationDate    DateTime?
+  vatReturnPeriod                 String?
+  vatReturnDueDate                String?
+  vatTaxPeriodCycle               String?
+  vatCertificateIssueDate        DateTime?
+  corporateTaxRegistrationNumber  String?
+  corporateTaxEffectiveRegistrationDate DateTime?
+  firstCorporateTaxPeriodStart     DateTime?
+  firstCorporateTaxPeriodEnd       DateTime?
+  firstCorporateTaxFilingDeadline  DateTime?
+
+  // ========== Contact & Address ==========
+  officePhone      String?
+  telephone2       String?
+  faxNumber        String?
+  companyEmail     String?
+  contactPersonName String?
+  contactMobile    String?
+  poBox            String?
+  city             String?
+  region           String?
+  street           String?
+  addressDetails   String?  @db.Text
+  makaniNumber     String?
+  parcelId         String?
+  buildingNumber   String?
+  floorNumber      String?
+  subscriptionExpiryDate DateTime?
+
+  // ========== Ownership ==========
+  ownerName    String?
+  partnersInfo Json?   // [{ partnerName, partnerId, partnerNationality, partnerRole, sharePercentage }]
+
+  // ========== Activities ==========
+  activitiesInfo Json?  // [{ activityCode, activityName, activityDescription, activityStatus }]
+
+  // ========== Notes & Telecom ==========
+  licenseRemarks String?  @db.Text
+  connectionType String?
 
   // Branding
   logo   String? // Logo file path or URL
@@ -887,6 +1063,11 @@ model Contract {
   contractDocument String? // File path/URL for contract document
   attachments      String? @db.Text // JSON array of attachment paths
 
+  // Manager Assignment
+  assignedManagerId    String? // Manager user ID (references User)
+  assignedManagerEmail String? // Manager email (for filtering - matches User.email)
+  assignedManager       User?   @relation("AssignedContractManager", fields: [assignedManagerId], references: [id], onDelete: SetNull)
+
   // Metadata
   createdBy  String?
   creator    User?     @relation("ContractCreator", fields: [createdBy], references: [id])
@@ -922,11 +1103,11 @@ model Attendance {
   // Attendance type
   type AttendanceType @default(CHECK_IN) // CHECK_IN or CHECK_OUT
 
-  // Location data
-  employeeLatitude  Float // Employee's latitude when marking attendance
-  employeeLongitude Float // Employee's longitude when marking attendance
-  distanceFromOffice Float // Calculated distance from office in meters
-  isWithinRadius    Boolean // Whether employee was within allowed radius
+  // Location data (optional - location-based attendance can be disabled)
+  employeeLatitude  Float? // Employee's latitude when marking attendance (optional)
+  employeeLongitude Float? // Employee's longitude when marking attendance (optional)
+  distanceFromOffice Float? // Calculated distance from office in meters (optional)
+  isWithinRadius    Boolean? // Whether employee was within allowed radius (optional)
 
   // Timestamps
   checkInTime  DateTime? // Check-in timestamp
@@ -969,13 +1150,24 @@ model Leave {
   id          String      @id @default(uuid())
   userId      String
   user        User        @relation("LeaveRequester", fields: [userId], references: [id])
-  type        LeaveType   // ANNUAL, SICK, UNPAID
-  status      LeaveStatus @default(PENDING) // PENDING, APPROVED, REJECTED
+  type        LeaveType
+  status      LeaveStatus @default(PENDING)
   startDate   DateTime    @db.Date
   endDate     DateTime    @db.Date
-  days        Int         // Number of days
+  days        Int
   reason      String      @db.Text
   attachments String?     @db.Text // JSON array of file paths/URLs
+
+  // Special leave: relation for bereavement (spouse | first_degree), context for others
+  relationOrContext    String?   @db.Text
+  // Reporting: when employee reported absence (sick/emergency within 24h)
+  reportedAbsenceAt    DateTime? @db.Timestamptz
+  // When documentation/medical report received (sick: within 3 working days)
+  documentationReceivedAt DateTime? @db.Timestamptz
+  // Management reschedule: effective dates when leave was rescheduled (max 3 months from original)
+  rescheduledStartDate  DateTime? @db.Date
+  rescheduledEndDate    DateTime? @db.Date
+  rescheduledAt         DateTime? @db.Timestamptz
 
   approvedById   String?
   approvedBy     User?     @relation("LeaveApprover", fields: [approvedById], references: [id])
@@ -995,10 +1187,27 @@ model Leave {
   @@map("leaves")
 }
 
+model LeavePolicy {
+  id          String   @id @default(uuid())
+  leaveType   LeaveType @unique
+  name        String
+  description String?  @db.Text
+  config      Json     // entitlements, advance notice, carry-forward, reporting rules, UAE compliance
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("leave_policies")
+}
+
 enum LeaveType {
   ANNUAL
   SICK
   UNPAID
+  EMERGENCY
+  BEREAVEMENT
+  PATERNITY
+  MATERNITY
 }
 
 enum LeaveStatus {

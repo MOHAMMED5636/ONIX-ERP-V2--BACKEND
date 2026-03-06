@@ -82,6 +82,66 @@ async function main() {
   });
   console.log('✅ Created Ramiz user:', ramiz.email);
 
+  // Create HR admin user
+  const hrPassword = await bcrypt.hash('159753', 10);
+  const hr = await prisma.user.upsert({
+    where: { email: 'hr@onixgroup.ae' },
+    update: {},
+    create: {
+      email: 'hr@onixgroup.ae',
+      password: hrPassword,
+      firstName: 'HR',
+      lastName: 'Admin',
+      role: 'ADMIN',
+    },
+  });
+  console.log('✅ Created HR admin user:', hr.email);
+
+  // Create H. Obada admin user
+  const obadaPassword = await bcrypt.hash('147369', 10);
+  const obada = await prisma.user.upsert({
+    where: { email: 'h.obada@onixgroup.ae' },
+    update: {},
+    create: {
+      email: 'h.obada@onixgroup.ae',
+      password: obadaPassword,
+      firstName: 'H.',
+      lastName: 'Obada',
+      role: 'ADMIN',
+    },
+  });
+  console.log('✅ Created H. Obada admin user:', obada.email);
+
+  // Create Muffazzal project manager
+  const muffazzalPassword = await bcrypt.hash('muffazzal123', 10);
+  const muffazzal = await prisma.user.upsert({
+    where: { email: 'muffazzal@onixgroup.ae' },
+    update: { role: 'PROJECT_MANAGER' },
+    create: {
+      email: 'muffazzal@onixgroup.ae',
+      password: muffazzalPassword,
+      firstName: 'Muffazzal',
+      lastName: 'User',
+      role: 'PROJECT_MANAGER',
+    },
+  });
+  console.log('✅ Created Muffazzal project manager:', muffazzal.email);
+
+  // Create Info admin user
+  const infoPassword = await bcrypt.hash('123789', 10);
+  const info = await prisma.user.upsert({
+    where: { email: 'info@onixgroup.ae' },
+    update: {},
+    create: {
+      email: 'info@onixgroup.ae',
+      password: infoPassword,
+      firstName: 'Info',
+      lastName: 'Admin',
+      role: 'ADMIN',
+    },
+  });
+  console.log('✅ Created Info admin user:', info.email);
+
   // Create test employee (for Employee ERP login)
   const employeePassword = await bcrypt.hash('employee123', 10);
   const employee = await prisma.user.upsert({
@@ -217,6 +277,109 @@ async function main() {
     },
   });
   console.log('✅ Created tender invitation for engineer');
+
+  // Leave policies (UAE labor law compliant)
+  const leavePolicies = [
+    {
+      leaveType: 'ANNUAL' as const,
+      name: 'Annual Leave',
+      description: 'Paid annual leave. 2 days per month after probation (<12 months service). 30 paid working days after 12 months. Carry-forward max 2 periods. 30 days advance notice. Management may reschedule (max 3 months).',
+      config: {
+        probationMonths: 6,
+        daysPerMonthUnder12Months: 2,
+        annualDaysAfter12Months: 30,
+        carryForwardPeriods: 2,
+        advanceNoticeDays: 30,
+        maxRescheduleMonths: 3,
+        absencesNotCounted: true,
+        compliance: 'UAE_LABOR_LAW',
+      },
+    },
+    {
+      leaveType: 'SICK' as const,
+      name: 'Sick Leave',
+      description: 'Up to 90 days total: 15 full pay, 30 half pay, 45 unpaid. Report absence within 24 hours; medical report within 3 working days.',
+      config: {
+        totalDaysPerYear: 90,
+        fullPayDays: 15,
+        halfPayDays: 30,
+        unpaidDays: 45,
+        reportAbsenceWithinHours: 24,
+        medicalReportWithinWorkingDays: 3,
+        compliance: 'UAE_LABOR_LAW',
+      },
+    },
+    {
+      leaveType: 'UNPAID' as const,
+      name: 'Unpaid Leave',
+      description: 'Unpaid leave. No balance limit. Subject to approval.',
+      config: {
+        noBalanceLimit: true,
+        compliance: 'UAE_LABOR_LAW',
+      },
+    },
+    {
+      leaveType: 'EMERGENCY' as const,
+      name: 'Emergency Leave',
+      description: 'Leave for urgent family or personal circumstances. Report as soon as practicable.',
+      config: {
+        reportRequired: true,
+        documentationRecommended: true,
+        compliance: 'UAE_LABOR_LAW',
+      },
+    },
+    {
+      leaveType: 'BEREAVEMENT' as const,
+      name: 'Bereavement Leave',
+      description: '5 days for spouse; 3 days for first-degree relatives. Documentation may be required.',
+      config: {
+        spouseDays: 5,
+        firstDegreeDays: 3,
+        relationRequired: true,
+        relationOptions: ['spouse', 'first_degree'],
+        compliance: 'UAE_LABOR_LAW',
+      },
+    },
+    {
+      leaveType: 'PATERNITY' as const,
+      name: 'Paternity Leave',
+      description: '5 paid days within the first 6 months of childbirth.',
+      config: {
+        paidDays: 5,
+        withinMonthsOfChildbirth: 6,
+        documentationRequired: true,
+        compliance: 'UAE_LABOR_LAW',
+      },
+    },
+    {
+      leaveType: 'MATERNITY' as const,
+      name: 'Maternity Leave',
+      description: '105 days total: 45 full pay, 15 half pay, 45 unpaid. 45 additional unpaid days if mother or child ill due to childbirth, with proof.',
+      config: {
+        totalDays: 105,
+        maternityFullPayDays: 45,
+        maternityHalfPayDays: 15,
+        maternityUnpaidDays: 45,
+        extraUnpaidWithProof: 45,
+        documentationRequiredForExtra: true,
+        compliance: 'UAE_LABOR_LAW',
+      },
+    },
+  ];
+
+  for (const p of leavePolicies) {
+    await prisma.leavePolicy.upsert({
+      where: { leaveType: p.leaveType },
+      update: { name: p.name, description: p.description, config: p.config as object },
+      create: {
+        leaveType: p.leaveType,
+        name: p.name,
+        description: p.description,
+        config: p.config as object,
+      },
+    });
+  }
+  console.log('✅ Created/updated leave policies (UAE compliant)');
 
   console.log('🎉 Seeding completed!');
 }

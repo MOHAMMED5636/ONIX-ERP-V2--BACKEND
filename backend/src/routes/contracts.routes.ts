@@ -16,13 +16,16 @@ router.get('/', contractsController.getAllContracts);
 // Get contract statistics
 router.get('/stats', contractsController.getContractStats);
 
+// Get managers for dropdown selection (must come before /:id to avoid route conflicts)
+router.get('/managers', contractsController.getManagers);
+
 // Get contract by reference number (must come before /:id to avoid route conflicts)
 router.get('/by-reference', contractsController.getContractByReferenceNumber);
 
 // Get a single contract by ID
 router.get('/:id', contractsController.getContractById);
 
-// Create a new contract (with document upload and multiple attachments)
+// Create a new contract (with document upload and multiple attachments) - ADMIN/HR/PROJECT_MANAGER only (NOT MANAGER)
 router.post('/', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER'), upload.fields([
   { name: 'contractDocument', maxCount: 1 },
   { name: 'attachment_0', maxCount: 1 },
@@ -37,17 +40,17 @@ router.post('/', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER'), upload.fields([
   { name: 'attachment_9', maxCount: 1 },
 ]), contractsController.createContract);
 
-// Update a contract (with optional document upload)
-router.put('/:id', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER'), upload.single('contractDocument'), contractsController.updateContract);
+// Update a contract (with optional document upload) - MANAGER can update their assigned contracts
+router.put('/:id', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER', 'MANAGER'), upload.single('contractDocument'), contractsController.updateContract);
 
 // Approve a contract
 router.post('/:id/approve', requireRole('ADMIN', 'HR'), contractsController.approveContract);
 
-// Load Out: Create project from contract
-router.post('/:id/load-out', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER'), contractsController.loadOutContract);
+// Load Out: Create project from contract - MANAGER can load out their assigned contracts
+router.post('/:id/load-out', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER', 'MANAGER'), contractsController.loadOutContract);
 
-// Bulk Load Out: Create multiple projects from multiple contracts
-router.post('/bulk-load-out', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER'), contractsController.bulkLoadOutContracts);
+// Bulk Load Out: Create multiple projects from multiple contracts - MANAGER can load out their assigned contracts
+router.post('/bulk-load-out', requireRole('ADMIN', 'HR', 'PROJECT_MANAGER', 'MANAGER'), contractsController.bulkLoadOutContracts);
 
 // Delete a contract
 router.delete('/:id', requireRole('ADMIN', 'HR'), contractsController.deleteContract);

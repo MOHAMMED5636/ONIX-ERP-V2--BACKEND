@@ -39,6 +39,7 @@ export const validateMakani = async (req: AuthRequest, res: Response): Promise<v
         isValid: true,
         message: 'Makani number is valid',
       },
+      
     });
   } catch (error) {
     console.error('Error validating Makani number:', error);

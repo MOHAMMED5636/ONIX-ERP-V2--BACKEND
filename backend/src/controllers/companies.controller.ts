@@ -1,7 +1,25 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { CompanyStatus, LicenseStatus } from '@prisma/client';
+import { CompanyStatus, LicenseStatus, Prisma } from '@prisma/client';
+
+/** Parse optional date from string or Date; returns null for empty/invalid. */
+function parseOptionalDate(value: unknown): Date | null {
+  if (value == null || value === '') return null;
+  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;
+  const d = new Date(value as string);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/** Parse optional boolean from string or boolean. */
+function parseOptionalBoolean(value: unknown): boolean | null {
+  if (value == null || value === '') return null;
+  if (typeof value === 'boolean') return value;
+  const s = String(value).toLowerCase();
+  if (s === 'true' || s === '1' || s === 'yes') return true;
+  if (s === 'false' || s === '0' || s === 'no') return false;
+  return null;
+}
 
 /**
  * Get all companies
@@ -148,6 +166,96 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
       officeLatitude,
       officeLongitude,
       attendanceRadius,
+      // Personal & Representative
+      fullNameEn,
+      fullNameAr,
+      delegatedCardNumber,
+      businessPartnerNumber,
+      emiratesId,
+      emiratesIdExpiry,
+      passportNumber,
+      nationality,
+      dateOfBirth,
+      gender,
+      mobileNumber,
+      phoneNumber,
+      email,
+      representativeTitleEn,
+      representativeTitleAr,
+      // Company extended
+      nameAr,
+      businessName,
+      branchName,
+      companyCategory: companyCategoryBody,
+      companyType,
+      clientRole,
+      websiteUrl,
+      // Licensing
+      establishmentCode,
+      establishmentFileNumber,
+      licenseAuthority,
+      licenseNumber,
+      licenseType,
+      licenseIssueDate,
+      unifiedDedFileNumber,
+      dedLicenseNumber,
+      prequalificationSubmitted,
+      prequalificationExpiry,
+      commercialRegisterNumber,
+      commercialRegisterDate,
+      membershipNumber,
+      membershipIssueDate,
+      membershipExpiry,
+      membershipLegalStatus,
+      trakheesId,
+      practiceRegisterNumber,
+      practiceRegisterIssueDate,
+      practiceRegisterExpiry,
+      municipalityClassification,
+      establishmentMolNumber,
+      molCardIssueDate,
+      molCardExpiry,
+      sponsorName,
+      establishmentLocation,
+      subscriptionStartDate,
+      subscriptionEndDate,
+      // Tax
+      vatRegistrationNumber,
+      vatEffectiveRegistrationDate,
+      vatReturnPeriod,
+      vatReturnDueDate,
+      vatTaxPeriodCycle,
+      vatCertificateIssueDate,
+      corporateTaxRegistrationNumber,
+      corporateTaxEffectiveRegistrationDate,
+      firstCorporateTaxPeriodStart,
+      firstCorporateTaxPeriodEnd,
+      firstCorporateTaxFilingDeadline,
+      // Contact & Address
+      officePhone,
+      telephone2,
+      faxNumber,
+      companyEmail,
+      contactPersonName,
+      contactMobile,
+      poBox,
+      city,
+      region,
+      street,
+      addressDetails,
+      makaniNumber,
+      parcelId,
+      buildingNumber,
+      floorNumber,
+      subscriptionExpiryDate,
+      // Ownership
+      ownerName,
+      partnersInfo,
+      // Activities
+      activitiesInfo,
+      // Notes
+      licenseRemarks,
+      connectionType,
     } = body;
 
     // Validate required fields (name may be missing when using FormData)
@@ -190,9 +298,15 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
     console.log(`   Header: ${headerPath || 'null'}`);
     console.log(`   Footer: ${footerPath || 'null'}`);
 
-    // Create company
-    const company = await prisma.company.create({
-      data: {
+    const partnersJson = partnersInfo != null && typeof partnersInfo === 'object'
+      ? (Array.isArray(partnersInfo) ? partnersInfo : (typeof partnersInfo === 'string' ? JSON.parse(partnersInfo) : partnersInfo))
+      : null;
+    const activitiesJson = activitiesInfo != null && typeof activitiesInfo === 'object'
+      ? (Array.isArray(activitiesInfo) ? activitiesInfo : (typeof activitiesInfo === 'string' ? JSON.parse(activitiesInfo) : activitiesInfo))
+      : null;
+
+    // Create company (type assertion: Prisma client may not yet reflect all schema fields in IDE)
+    const createData = {
         name: companyName,
         tag: tag || null,
         address: address || null,
@@ -205,11 +319,11 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
         contactExtension: contactExtension || null,
         licenseCategory: licenseCategory || null,
         legalType: legalType || null,
-        licenseExpiry: licenseExpiry ? (typeof licenseExpiry === 'string' ? new Date(licenseExpiry) : licenseExpiry) : null,
+        licenseExpiry: parseOptionalDate(licenseExpiry),
         licenseStatus: (licenseStatus as LicenseStatus) || LicenseStatus.ACTIVE,
         dunsNumber: dunsNumber || null,
         registerNo: registerNo || null,
-        issueDate: issueDate ? (typeof issueDate === 'string' ? new Date(issueDate) : issueDate) : null,
+        issueDate: parseOptionalDate(issueDate),
         mainLicenseNo: mainLicenseNo || null,
         dcciNo: dcciNo || null,
         trnNumber: trnNumber || null,
@@ -221,8 +335,90 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
         officeLatitude: lat != null && !isNaN(lat) ? lat : null,
         officeLongitude: lng != null && !isNaN(lng) ? lng : null,
         attendanceRadius: radius != null && !isNaN(radius) && radius > 0 ? radius : null,
-      },
-    });
+        fullNameEn: fullNameEn || null,
+        fullNameAr: fullNameAr || null,
+        delegatedCardNumber: delegatedCardNumber || null,
+        businessPartnerNumber: businessPartnerNumber || null,
+        emiratesId: emiratesId || null,
+        emiratesIdExpiry: parseOptionalDate(emiratesIdExpiry),
+        passportNumber: passportNumber || null,
+        nationality: nationality || null,
+        dateOfBirth: parseOptionalDate(dateOfBirth),
+        gender: gender || null,
+        mobileNumber: mobileNumber || null,
+        phoneNumber: phoneNumber || null,
+        email: email || null,
+        representativeTitleEn: representativeTitleEn || null,
+        representativeTitleAr: representativeTitleAr || null,
+        nameAr: nameAr || null,
+        businessName: businessName || null,
+        branchName: branchName || null,
+        companyCategory: companyCategoryBody || null,
+        companyType: companyType || null,
+        clientRole: clientRole || null,
+        websiteUrl: websiteUrl || null,
+        establishmentCode: establishmentCode || null,
+        establishmentFileNumber: establishmentFileNumber || null,
+        licenseAuthority: licenseAuthority || null,
+        licenseNumber: licenseNumber || null,
+        licenseType: licenseType || null,
+        licenseIssueDate: parseOptionalDate(licenseIssueDate),
+        unifiedDedFileNumber: unifiedDedFileNumber || null,
+        dedLicenseNumber: dedLicenseNumber || null,
+        prequalificationSubmitted: parseOptionalBoolean(prequalificationSubmitted),
+        prequalificationExpiry: parseOptionalDate(prequalificationExpiry),
+        commercialRegisterNumber: commercialRegisterNumber || null,
+        commercialRegisterDate: parseOptionalDate(commercialRegisterDate),
+        membershipNumber: membershipNumber || null,
+        membershipIssueDate: parseOptionalDate(membershipIssueDate),
+        membershipExpiry: parseOptionalDate(membershipExpiry),
+        membershipLegalStatus: membershipLegalStatus || null,
+        trakheesId: trakheesId || null,
+        practiceRegisterNumber: practiceRegisterNumber || null,
+        practiceRegisterIssueDate: parseOptionalDate(practiceRegisterIssueDate),
+        practiceRegisterExpiry: parseOptionalDate(practiceRegisterExpiry),
+        municipalityClassification: municipalityClassification || null,
+        establishmentMolNumber: establishmentMolNumber || null,
+        molCardIssueDate: parseOptionalDate(molCardIssueDate),
+        molCardExpiry: parseOptionalDate(molCardExpiry),
+        sponsorName: sponsorName || null,
+        establishmentLocation: establishmentLocation || null,
+        subscriptionStartDate: parseOptionalDate(subscriptionStartDate),
+        subscriptionEndDate: parseOptionalDate(subscriptionEndDate),
+        vatRegistrationNumber: vatRegistrationNumber || null,
+        vatEffectiveRegistrationDate: parseOptionalDate(vatEffectiveRegistrationDate),
+        vatReturnPeriod: vatReturnPeriod || null,
+        vatReturnDueDate: vatReturnDueDate || null,
+        vatTaxPeriodCycle: vatTaxPeriodCycle || null,
+        vatCertificateIssueDate: parseOptionalDate(vatCertificateIssueDate),
+        corporateTaxRegistrationNumber: corporateTaxRegistrationNumber || null,
+        corporateTaxEffectiveRegistrationDate: parseOptionalDate(corporateTaxEffectiveRegistrationDate),
+        firstCorporateTaxPeriodStart: parseOptionalDate(firstCorporateTaxPeriodStart),
+        firstCorporateTaxPeriodEnd: parseOptionalDate(firstCorporateTaxPeriodEnd),
+        firstCorporateTaxFilingDeadline: parseOptionalDate(firstCorporateTaxFilingDeadline),
+        officePhone: officePhone || null,
+        telephone2: telephone2 || null,
+        faxNumber: faxNumber || null,
+        companyEmail: companyEmail || null,
+        contactPersonName: contactPersonName || null,
+        contactMobile: contactMobile || null,
+        poBox: poBox || null,
+        city: city || null,
+        region: region || null,
+        street: street || null,
+        addressDetails: addressDetails || null,
+        makaniNumber: makaniNumber || null,
+        parcelId: parcelId || null,
+        buildingNumber: buildingNumber || null,
+        floorNumber: floorNumber || null,
+        subscriptionExpiryDate: parseOptionalDate(subscriptionExpiryDate),
+        ownerName: ownerName || null,
+        partnersInfo: partnersJson,
+        activitiesInfo: activitiesJson,
+        licenseRemarks: licenseRemarks || null,
+        connectionType: connectionType || null,
+    } as Prisma.CompanyUncheckedCreateInput;
+    const company = await prisma.company.create({ data: createData });
 
     if (!company) {
       res.status(500).json({ success: false, message: 'Failed to create company' });
@@ -273,10 +469,64 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
  * Update company
  * PUT /api/companies/:id
  */
+/** Company model keys that are allowed to be updated via API (excludes id, createdAt, updatedAt, relations). */
+const COMPANY_UPDATE_ALLOWED = new Set([
+  'name', 'tag', 'address', 'industry', 'founded', 'status', 'contactName', 'contactEmail', 'contactPhone', 'contactExtension',
+  'licenseCategory', 'legalType', 'licenseExpiry', 'licenseStatus', 'dunsNumber', 'registerNo', 'issueDate', 'mainLicenseNo', 'dcciNo', 'trnNumber',
+  'fullNameEn', 'fullNameAr', 'delegatedCardNumber', 'businessPartnerNumber', 'emiratesId', 'emiratesIdExpiry', 'passportNumber', 'nationality', 'dateOfBirth', 'gender',
+  'mobileNumber', 'phoneNumber', 'email', 'representativeTitleEn', 'representativeTitleAr', 'nameAr', 'businessName', 'branchName', 'companyCategory', 'companyType', 'clientRole', 'websiteUrl',
+  'establishmentCode', 'establishmentFileNumber', 'licenseAuthority', 'licenseNumber', 'licenseType', 'licenseIssueDate', 'unifiedDedFileNumber', 'dedLicenseNumber',
+  'prequalificationSubmitted', 'prequalificationExpiry', 'commercialRegisterNumber', 'commercialRegisterDate', 'membershipNumber', 'membershipIssueDate', 'membershipExpiry', 'membershipLegalStatus',
+  'trakheesId', 'practiceRegisterNumber', 'practiceRegisterIssueDate', 'practiceRegisterExpiry', 'municipalityClassification', 'establishmentMolNumber', 'molCardIssueDate', 'molCardExpiry',
+  'sponsorName', 'establishmentLocation', 'subscriptionStartDate', 'subscriptionEndDate',
+  'vatRegistrationNumber', 'vatEffectiveRegistrationDate', 'vatReturnPeriod', 'vatReturnDueDate', 'vatTaxPeriodCycle', 'vatCertificateIssueDate',
+  'corporateTaxRegistrationNumber', 'corporateTaxEffectiveRegistrationDate', 'firstCorporateTaxPeriodStart', 'firstCorporateTaxPeriodEnd', 'firstCorporateTaxFilingDeadline',
+  'officePhone', 'telephone2', 'faxNumber', 'companyEmail', 'contactPersonName', 'contactMobile', 'poBox', 'city', 'region', 'street', 'addressDetails',
+  'makaniNumber', 'parcelId', 'buildingNumber', 'floorNumber', 'subscriptionExpiryDate', 'ownerName', 'partnersInfo', 'activitiesInfo', 'licenseRemarks', 'connectionType',
+  'logo', 'header', 'footer', 'defaultCurrency', 'lengthUnit', 'areaUnit', 'volumeUnit', 'heightUnit', 'weightUnit',
+  'officeLatitude', 'officeLongitude', 'attendanceRadius', 'employees', 'createdBy',
+]);
+
+/** Date fields on Company that need parsing when received from request. */
+const COMPANY_DATE_FIELDS = new Set([
+  'licenseExpiry', 'issueDate', 'emiratesIdExpiry', 'dateOfBirth', 'licenseIssueDate',
+  'prequalificationExpiry', 'commercialRegisterDate', 'membershipIssueDate', 'membershipExpiry',
+  'practiceRegisterIssueDate', 'practiceRegisterExpiry', 'molCardIssueDate', 'molCardExpiry',
+  'subscriptionStartDate', 'subscriptionEndDate', 'vatEffectiveRegistrationDate', 'vatReturnDueDate',
+  'vatCertificateIssueDate', 'corporateTaxEffectiveRegistrationDate', 'firstCorporateTaxPeriodStart',
+  'firstCorporateTaxPeriodEnd', 'firstCorporateTaxFilingDeadline', 'subscriptionExpiryDate',
+]);
+
 export const updateCompany = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const updateData = req.body;
+    const updateData = { ...(req.body || {}) };
+
+    // Forbidden keys are omitted when building data below (only COMPANY_UPDATE_ALLOWED keys are passed to Prisma).
+
+    // Parse date fields
+    COMPANY_DATE_FIELDS.forEach((key) => {
+      if (updateData[key] !== undefined && updateData[key] !== null && updateData[key] !== '') {
+        const parsed = parseOptionalDate(updateData[key]);
+        updateData[key] = parsed as never;
+      }
+    });
+    if (updateData.prequalificationSubmitted !== undefined) {
+      const v = parseOptionalBoolean(updateData.prequalificationSubmitted);
+      updateData.prequalificationSubmitted = v as never;
+    }
+    if (updateData.partnersInfo !== undefined) {
+      const v = updateData.partnersInfo;
+      updateData.partnersInfo = (v != null && typeof v === 'object')
+        ? (Array.isArray(v) ? v : (typeof v === 'string' ? JSON.parse(v) : v)) as never
+        : null;
+    }
+    if (updateData.activitiesInfo !== undefined) {
+      const v = updateData.activitiesInfo;
+      updateData.activitiesInfo = (v != null && typeof v === 'object')
+        ? (Array.isArray(v) ? v : (typeof v === 'string' ? JSON.parse(v) : v)) as never
+        : null;
+    }
 
     // Handle file uploads from multer
     // Multer with .fields() returns an object with fieldname as keys
@@ -327,11 +577,6 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
       updateData.licenseStatus = updateData.licenseStatus as LicenseStatus;
     }
 
-    // Convert dates
-    if (updateData.licenseExpiry) {
-      updateData.licenseExpiry = new Date(updateData.licenseExpiry);
-    }
-
     // Convert employees to number
     if (updateData.employees !== undefined) {
       updateData.employees = parseInt(updateData.employees, 10);
@@ -355,9 +600,16 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
       updateData.attendanceRadius = null;
     }
 
+    const data: Record<string, unknown> = {};
+    for (const key of Object.keys(updateData)) {
+      if (COMPANY_UPDATE_ALLOWED.has(key) && updateData[key] !== undefined) {
+        data[key] = updateData[key];
+      }
+    }
+
     const company = await prisma.company.update({
       where: { id },
-      data: updateData,
+      data,
     });
 
     console.log(`✅ Company updated: ${company.id}`);

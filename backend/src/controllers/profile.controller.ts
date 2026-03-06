@@ -37,11 +37,43 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
     let photoFilename = file ? file.filename : undefined;
     
     if (file) {
-      console.log('   File details:', {
+      console.log('   📸 File upload detected:', {
         filename: file.filename,
         originalname: file.originalname,
         mimetype: file.mimetype,
         size: file.size,
+        path: file.path,
+        fieldname: file.fieldname
+      });
+      
+      // Verify the file actually exists
+      const fs = require('fs');
+      const path = require('path');
+      
+      if (!fs.existsSync(file.path)) {
+        console.error('   ❌ CRITICAL: File does not exist at multer path:', file.path);
+        res.status(500).json({
+          success: false,
+          message: 'File upload failed - file was not saved correctly'
+        });
+        return;
+      }
+      
+      // Verify file size is not zero
+      const stats = fs.statSync(file.path);
+      if (stats.size === 0) {
+        console.error('   ❌ CRITICAL: Uploaded file is empty (0 bytes)');
+        fs.unlinkSync(file.path); // Delete empty file
+        res.status(400).json({
+          success: false,
+          message: 'Uploaded file is empty. Please try again.'
+        });
+        return;
+      }
+      
+      console.log('   ✅ File verified:', {
+        exists: true,
+        size: stats.size,
         path: file.path
       });
       
@@ -49,20 +81,17 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
       if (photoFilename) {
         // Remove any path separators that might have been included
         photoFilename = photoFilename.replace(/[\/\\]/g, '_');
-        // Also check the file.path to ensure it's correct
-        const path = require('path');
-        const expectedPath = path.join(process.cwd(), 'uploads', 'photos', photoFilename);
-        console.log('   Expected file path:', expectedPath);
-        console.log('   Actual file path:', file.path);
-        
-        // Verify the file actually exists at the expected location
-        const fs = require('fs');
-        if (fs.existsSync(file.path)) {
-          console.log('   ✅ File exists at multer path');
-        } else {
-          console.log('   ⚠️  File does not exist at multer path');
-        }
+        console.log('   ✅ Sanitized filename:', photoFilename);
+      } else {
+        console.error('   ❌ CRITICAL: No filename in file object');
+        res.status(500).json({
+          success: false,
+          message: 'File upload failed - no filename received'
+        });
+        return;
       }
+    } else {
+      console.log('   ℹ️  No file uploaded in this request');
     }
 
     // Build update data - allow employees to update their own profile fields
@@ -86,23 +115,44 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
     if (photoFilename) {
       updateData.photo = photoFilename;
       console.log('   ✅ Photo will be updated to:', photoFilename);
+      
+      // Double-check file exists before updating database
+      const fs = require('fs');
+      const path = require('path');
+      const filePath = path.join(process.cwd(), 'uploads', 'photos', photoFilename);
+      if (!fs.existsSync(filePath)) {
+        console.error('   ❌ CRITICAL: File does not exist before database update:', filePath);
+        res.status(500).json({
+          success: false,
+          message: 'File upload failed - file was not saved correctly'
+        });
+        return;
+      }
     }
 
-    // If no data to update
+    // If no data to update (but allow photo-only updates)
     if (Object.keys(updateData).length === 0) {
+      console.log('   ⚠️  No update data provided');
       res.status(400).json({
         success: false,
         message: 'No data provided to update'
       });
       return;
     }
+    
+    // Log what will be updated
+    console.log('   📝 Updating profile with:', Object.keys(updateData));
 
     console.log('   Update data:', updateData);
 
-    // Update user profile
-    const user = await prisma.user.update({
+    // Update user profile (persist to DB)
+    await prisma.user.update({
       where: { id: userId },
       data: updateData,
+    });
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
       select: {
         id: true,
         email: true,
@@ -120,8 +170,13 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
       }
     });
 
+    if (!user) {
+      res.status(500).json({ success: false, message: 'Failed to read updated profile' });
+      return;
+    }
+
     console.log('   ✅ User updated in database');
-    console.log('   Photo in database:', user.photo);
+    console.log('   Photo in database (saved):', user.photo);
 
     // Get photo URL - construct URL directly since we just uploaded the file
     const host = req.get('host') || 'localhost:3001';
@@ -130,51 +185,56 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
     // Construct photo URL directly (don't verify since we just uploaded it)
     let photoUrl: string | null = null;
     if (user.photo) {
-      // If it's already a full URL, extract filename and reconstruct to ensure consistency
-      if (user.photo.startsWith('http://') || user.photo.startsWith('https://')) {
-        // Extract filename from URL if it contains /uploads/photos/
-        if (user.photo.includes('/uploads/photos/')) {
-          const filename = user.photo.split('/uploads/photos/')[1].split('?')[0]; // Remove query params
-          photoUrl = `${protocol}://${host}/uploads/photos/${filename}`;
-        } else {
-          photoUrl = user.photo; // External URL, keep as-is
-        }
-      } else {
-        // It's just a filename, construct full URL
-        photoUrl = `${protocol}://${host}/uploads/photos/${user.photo}`;
-      }
-    }
-    
-    console.log('   Photo URL generated:', photoUrl);
-    console.log('   Photo filename in DB:', user.photo);
-    
-    // Verify file exists (for logging only)
-    if (user.photo && photoUrl) {
-      const fs = require('fs');
-      const path = require('path');
       // Extract just the filename (remove any path or URL parts)
       let filename = user.photo;
       if (filename.includes('/uploads/photos/')) {
         filename = filename.split('/uploads/photos/')[1].split('?')[0];
       } else if (filename.includes('\\uploads\\photos\\')) {
         filename = filename.split('\\uploads\\photos\\')[1];
+      } else if (filename.startsWith('http://') || filename.startsWith('https://')) {
+        // Extract filename from full URL
+        const urlParts = filename.split('/');
+        filename = urlParts[urlParts.length - 1].split('?')[0];
       }
+      
+      // Always construct full URL with protocol and host
+      photoUrl = `${protocol}://${host}/uploads/photos/${filename}`;
+      
+      // Verify file exists before returning URL
+      const fs = require('fs');
+      const path = require('path');
       const filePath = path.join(process.cwd(), 'uploads', 'photos', filename);
       const fileExists = fs.existsSync(filePath);
-      console.log('   File exists check:', fileExists ? '✅ YES' : '❌ NO');
-      console.log('   Checking file at:', filePath);
+      
+      console.log('   📸 Photo URL construction:', {
+        filename: filename,
+        filePath: filePath,
+        fileExists: fileExists ? '✅ YES' : '❌ NO',
+        photoUrl: photoUrl
+      });
+      
       if (!fileExists) {
-        console.log(`   ⚠️  Photo file not found at: ${filePath}`);
-        console.log(`   ⚠️  But will still return URL: ${photoUrl}`);
+        console.error(`   ❌ CRITICAL: Photo file not found at: ${filePath}`);
+        console.error(`   ❌ This means the file upload failed or file was deleted`);
+        // Still return the URL but log the error - frontend will handle 404
       }
     }
+    
+    console.log('   ✅ Final photo URL:', photoUrl);
+    console.log('   ✅ Photo filename in DB:', user.photo);
 
+    // Ensure photo URL is always included in response if photo was updated
     const responseData = {
       ...user,
-      photo: photoUrl, // Always return the constructed URL
+      photo: photoUrl || user.photo || null, // Always return the constructed URL or existing photo
     };
 
-    console.log('   ✅ Sending response with photo:', responseData.photo);
+    console.log('   ✅ Sending response:', {
+      success: true,
+      photoInResponse: !!responseData.photo,
+      photoUrl: responseData.photo,
+      photoFilename: user.photo
+    });
 
     res.json({
       success: true,

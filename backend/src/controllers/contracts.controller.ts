@@ -1,7 +1,7 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { ContractStatus } from '@prisma/client';
+import { ContractStatus, UserRole } from '@prisma/client';
 
 // Generate unique reference number for contract
 async function generateReferenceNumber(): Promise<string> {
@@ -49,6 +49,7 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
       limit = '50',
       sortBy = 'createdAt',
       sortOrder = 'desc',
+      forLoadOut, // Query parameter to indicate this is for Load Out modal (filter by assigned manager)
     } = req.query;
 
     const pageNum = Math.max(1, parseInt(page as string, 10));
@@ -56,7 +57,95 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
     const skip = (pageNum - 1) * limitNum;
 
     const where: any = {};
+    let managerFilterApplied = false;
 
+    // STRICT ROLE-BASED FILTERING - Backend enforcement
+    const userRole = req.user?.role;
+    const userEmail = req.user?.email;
+
+    if (userRole === 'MANAGER') {
+      // Manager: Always return ONLY contracts assigned to this manager's email OR ID
+      if (!userEmail || !req.user?.id) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: Manager email or ID not found in session',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+      // Check both assignedManagerEmail (direct match) OR assignedManagerId (via relation)
+      // Store manager filter separately to combine with other filters later
+      managerFilterApplied = true;
+      console.log(`🔒 Manager filtering: Only showing contracts assigned to ${userEmail} (ID: ${req.user.id})`);
+    } else if ((userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') && forLoadOut === 'true') {
+      // For Load Out modal: ADMIN/HR/PROJECT_MANAGER should only see contracts assigned to them
+      // This ensures managers only see their own contracts in the Load Out interface
+      if (!userEmail || !req.user?.id) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: User email or ID not found in session',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+      // Check both assignedManagerEmail (direct match) OR assignedManagerId (via relation)
+      // Store manager filter separately to combine with other filters later
+      managerFilterApplied = true;
+      console.log(`🔒 Load Out filtering: Only showing contracts assigned to ${userEmail} (ID: ${req.user.id})`);
+    } else if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
+      // Admin, HR, Project Manager: Return all contracts (no filtering) for general contract list
+      // where clause remains empty
+    } else if (userRole === 'EMPLOYEE') {
+      // Employee: Do not return contracts unless specifically linked to their tasks
+      // Check if employee has tasks linked to contracts via projects
+      const employeeTasks = await prisma.task.findMany({
+        where: {
+          OR: [
+            { assignments: { some: { employeeId: req.user!.id } } },
+            { assignedEmployeeId: req.user!.id },
+          ],
+        },
+        select: {
+          projectId: true,
+        },
+        distinct: ['projectId'],
+      });
+
+      const projectIds = employeeTasks.map(t => t.projectId).filter(Boolean) as string[];
+      
+      if (projectIds.length === 0) {
+        // No tasks linked to projects, return empty result
+        res.json({
+          success: true,
+          data: {
+            contracts: [],
+            pagination: {
+              page: pageNum,
+              limit: limitNum,
+              total: 0,
+              totalPages: 0,
+            },
+          },
+        });
+        return;
+      }
+
+      // Only return contracts linked to projects where employee has tasks
+      where.projectId = {
+        in: projectIds,
+      };
+      console.log(`🔒 Employee filtering: Only showing contracts linked to projects with employee tasks`);
+    } else {
+      // Other roles: No access
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to view contracts',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
+    // Apply other filters first
     if (status) {
       where.status = status as ContractStatus;
     }
@@ -73,12 +162,28 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
       where.contractType = contractType as string;
     }
 
+    // Build manager filter (if needed)
+    const managerFilterConditions = managerFilterApplied ? [
+      { assignedManagerEmail: userEmail },
+      { assignedManagerId: req.user!.id }
+    ] : null;
+
     if (search) {
       const searchTerm = (search as string).trim();
       
       // First, check if search term is an exact reference number match
-      const exactReferenceMatch = await prisma.contract.findUnique({
-        where: { referenceNumber: searchTerm },
+      const exactReferenceMatchWhere: any = { referenceNumber: searchTerm };
+      
+      // Add manager filter to exact match check if needed
+      if (managerFilterApplied) {
+        exactReferenceMatchWhere.OR = [
+          { assignedManagerEmail: userEmail },
+          { assignedManagerId: req.user!.id }
+        ];
+      }
+
+      const exactReferenceMatch = await prisma.contract.findFirst({
+        where: exactReferenceMatchWhere,
         include: {
           project: {
             select: {
@@ -112,11 +217,79 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
               email: true,
             },
           },
+          assignedManager: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              email: true,
+            },
+          },
         },
       });
 
-      // If exact match found, return it immediately (for frontend auto-population)
+      // If exact match found, check access control before returning
       if (exactReferenceMatch) {
+        // STRICT ROLE-BASED ACCESS CONTROL for exact match
+        // ALL roles (including ADMIN/HR/PROJECT_MANAGER) should only see contracts assigned to them for Load Out
+        if (userRole === 'MANAGER' || userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
+          // Manager, Admin, HR, Project Manager: Can only access contracts assigned to their email OR ID
+          if (!userEmail || !req.user?.id) {
+            res.status(403).json({
+              success: false,
+              message: 'Access Denied: User email or ID not found in session',
+              code: 'ACCESS_DENIED',
+            });
+            return;
+          }
+          // Check both assignedManagerEmail and assignedManagerId
+          if (exactReferenceMatch.assignedManagerEmail !== userEmail && 
+              exactReferenceMatch.assignedManagerId !== req.user.id) {
+            res.status(403).json({
+              success: false,
+              message: 'Access Denied: You can only view contracts assigned to you',
+              code: 'ACCESS_DENIED',
+            });
+            return;
+          }
+        } else if (userRole === 'EMPLOYEE') {
+          // Employee: Can only access contracts linked to projects where they have tasks
+          if (exactReferenceMatch.projectId) {
+            const hasTask = await prisma.task.findFirst({
+              where: {
+                projectId: exactReferenceMatch.projectId,
+                OR: [
+                  { assignments: { some: { employeeId: req.user!.id } } },
+                  { assignedEmployeeId: req.user!.id },
+                ],
+              },
+            });
+
+            if (!hasTask) {
+              res.status(403).json({
+                success: false,
+                message: 'Access Denied: You can only view contracts linked to projects with your assigned tasks',
+                code: 'ACCESS_DENIED',
+              });
+              return;
+            }
+          } else {
+            res.status(403).json({
+              success: false,
+              message: 'Access Denied: You can only view contracts linked to projects with your assigned tasks',
+              code: 'ACCESS_DENIED',
+            });
+            return;
+          }
+        } else {
+          res.status(403).json({
+            success: false,
+            message: 'Access Denied: You do not have permission to view contracts',
+            code: 'ACCESS_DENIED',
+          });
+          return;
+        }
+
         res.json({
           success: true,
           data: [exactReferenceMatch], // Return as array to match expected format
@@ -131,13 +304,70 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
       }
 
       // Otherwise, use partial search
-      where.OR = [
+      const searchOrConditions = [
         { title: { contains: searchTerm, mode: 'insensitive' } },
         { referenceNumber: { contains: searchTerm, mode: 'insensitive' } },
         { description: { contains: searchTerm, mode: 'insensitive' } },
         { contractorName: { contains: searchTerm, mode: 'insensitive' } },
         { clientName: { contains: searchTerm, mode: 'insensitive' } },
       ];
+
+      // Combine manager filter with search filter
+      if (managerFilterApplied) {
+        // Need to combine manager filter AND search filter
+        const combinedFilters: any[] = [];
+        
+        // Add existing filters (status, projectId, etc.) if any
+        const otherFilters: any = {};
+        if (where.status) otherFilters.status = where.status;
+        if (where.projectId) otherFilters.projectId = where.projectId;
+        if (where.clientId) otherFilters.clientId = where.clientId;
+        if (where.contractType) otherFilters.contractType = where.contractType;
+        
+        // Clear where and rebuild with proper structure
+        Object.keys(where).forEach(key => {
+          if (!['status', 'projectId', 'clientId', 'contractType'].includes(key)) {
+            delete where[key];
+          }
+        });
+
+        // Add manager filter AND search filter
+        where.AND = [
+          { OR: managerFilterConditions }, // Manager filter
+          { OR: searchOrConditions } // Search filter
+        ];
+        
+        // Add other filters to AND if they exist
+        if (Object.keys(otherFilters).length > 0) {
+          where.AND.push(otherFilters);
+        }
+      } else {
+        // No manager filter, just use search OR
+        where.OR = searchOrConditions;
+      }
+    } else if (managerFilterApplied) {
+      // No search, but manager filter exists - add it to where
+      // If there are other filters (status, projectId, etc.), combine with AND
+      const hasOtherFilters = where.status || where.projectId || where.clientId || where.contractType;
+      
+      if (hasOtherFilters) {
+        // Combine manager filter with other filters using AND
+        where.AND = [
+          { OR: managerFilterConditions },
+          ...Object.keys(where)
+            .filter(key => !['AND', 'OR'].includes(key))
+            .map(key => ({ [key]: where[key] }))
+        ];
+        // Remove individual filter keys since they're now in AND
+        Object.keys(where).forEach(key => {
+          if (!['AND', 'OR'].includes(key)) {
+            delete where[key];
+          }
+        });
+      } else {
+        // No other filters, just use manager filter OR
+        where.OR = managerFilterConditions;
+      }
     }
 
     const [contracts, total] = await Promise.all([
@@ -174,6 +404,14 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
             },
           },
           approver: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              email: true,
+            },
+          },
+          assignedManager: {
             select: {
               id: true,
               firstName: true,
@@ -330,6 +568,9 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
   try {
     const { id } = req.params;
 
+    const userRole = req.user?.role;
+    const userEmail = req.user?.email;
+
     const contract = await prisma.contract.findUnique({
       where: { id },
       include: {
@@ -370,6 +611,14 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
             email: true,
           },
         },
+        assignedManager: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+          },
+        },
       },
     });
 
@@ -377,6 +626,68 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
       res.status(404).json({
         success: false,
         message: 'Contract not found',
+      });
+      return;
+    }
+
+    // STRICT ROLE-BASED ACCESS CONTROL
+    // ALL roles (including ADMIN/HR/PROJECT_MANAGER) should only see contracts assigned to them for Load Out
+    if (userRole === 'MANAGER' || userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
+      // Manager, Admin, HR, Project Manager: Can only access contracts assigned to their email OR ID
+      if (!userEmail || !req.user?.id) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: User email or ID not found in session',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+      // Check both assignedManagerEmail and assignedManagerId
+      if (contract.assignedManagerEmail !== userEmail && 
+          contract.assignedManagerId !== req.user.id) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: You can only view contracts assigned to you',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+    } else if (userRole === 'EMPLOYEE') {
+      // Employee: Can only access contracts linked to projects where they have tasks
+      if (contract.projectId) {
+        const hasTask = await prisma.task.findFirst({
+          where: {
+            projectId: contract.projectId,
+            OR: [
+              { assignments: { some: { employeeId: req.user!.id } } },
+              { assignedEmployeeId: req.user!.id },
+            ],
+          },
+        });
+
+        if (!hasTask) {
+          res.status(403).json({
+            success: false,
+            message: 'Access Denied: You can only view contracts linked to projects with your assigned tasks',
+            code: 'ACCESS_DENIED',
+          });
+          return;
+        }
+      } else {
+        // Contract not linked to any project, employee cannot access
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: You can only view contracts linked to projects with your assigned tasks',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+    } else {
+      // Other roles: No access
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to view contracts',
+        code: 'ACCESS_DENIED',
       });
       return;
     }
@@ -489,6 +800,8 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
       specialClauses,
       renewalTerms,
       attachments,
+      assignedManagerEmail, // Manager email for assignment
+      assignedManagerId, // Manager ID for assignment (alternative to email)
     } = req.body;
 
     // Validation - ensure title is provided
@@ -867,6 +1180,95 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
     
+    // Validate and resolve manager assignment
+    let finalAssignedManagerId: string | null = null;
+    let finalAssignedManagerEmail: string | null = null;
+
+    if (assignedManagerId) {
+      // If manager ID is provided, validate it exists and is a manager
+      const manager = await prisma.user.findUnique({
+        where: { id: assignedManagerId },
+        select: { id: true, email: true, role: true },
+      });
+
+      if (!manager) {
+        res.status(400).json({
+          success: false,
+          message: `Manager with ID "${assignedManagerId}" not found`,
+        });
+        return;
+      }
+
+      const allowedManagerRoles = ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'];
+      if (!allowedManagerRoles.includes(manager.role)) {
+        res.status(400).json({
+          success: false,
+          message: `User "${manager.email}" is not a manager. Only users with MANAGER, PROJECT_MANAGER, or ADMIN role can be assigned to contracts.`,
+        });
+        return;
+      }
+
+      finalAssignedManagerId = manager.id;
+      finalAssignedManagerEmail = manager.email;
+    } else if (assignedManagerEmail) {
+      // If manager email is provided, find the manager by email
+      const manager = await prisma.user.findUnique({
+        where: { email: assignedManagerEmail.trim() },
+        select: { id: true, email: true, role: true },
+      });
+
+      if (!manager) {
+        res.status(400).json({
+          success: false,
+          message: `Manager with email "${assignedManagerEmail}" not found`,
+        });
+        return;
+      }
+
+      const allowedManagerRoles = ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'];
+      if (!allowedManagerRoles.includes(manager.role)) {
+        res.status(400).json({
+          success: false,
+          message: `User "${assignedManagerEmail}" is not a manager. Only users with MANAGER, PROJECT_MANAGER, or ADMIN role can be assigned to contracts.`,
+        });
+        return;
+      }
+
+      finalAssignedManagerId = manager.id;
+      finalAssignedManagerEmail = manager.email;
+    } else if (projectManagerName && typeof projectManagerName === 'string' && projectManagerName.trim()) {
+      // Admin may have selected a manager by display name only (e.g. "Kamil", "mohammadsourav")
+      // Resolve to assignedManagerId/assignedManagerEmail so the manager sees the contract in Load Out
+      const nameTrimmed = projectManagerName.trim();
+      let resolvedManager: { id: string; email: string } | null = null;
+      if (nameTrimmed.includes('@')) {
+        const byEmail = await prisma.user.findFirst({
+          where: { email: nameTrimmed, role: { in: ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'] } },
+          select: { id: true, email: true },
+        });
+        resolvedManager = byEmail;
+      }
+      if (!resolvedManager) {
+        const managers = await prisma.user.findMany({
+          where: { role: { in: ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'] }, isActive: true },
+          select: { id: true, email: true, firstName: true, lastName: true },
+        });
+        const fullNameLower = nameTrimmed.toLowerCase();
+        resolvedManager = managers.find(m => {
+          const full = `${(m.firstName || '').trim()} ${(m.lastName || '').trim()}`.trim().toLowerCase();
+          const first = (m.firstName || '').trim().toLowerCase();
+          const last = (m.lastName || '').trim().toLowerCase();
+          return full === fullNameLower || first === fullNameLower || last === fullNameLower || full.includes(fullNameLower) || fullNameLower.includes(full);
+        }) as { id: string; email: string } | undefined ?? null;
+      }
+      if (resolvedManager) {
+        finalAssignedManagerId = resolvedManager.id;
+        finalAssignedManagerEmail = resolvedManager.email;
+        console.log('✅ Resolved manager by name:', projectManagerName, '->', resolvedManager.email);
+      }
+    }
+    // If neither is provided (and name resolution found nothing), both remain null
+
     // Create contract in database
     try {
       const contract = await prisma.contract.create({
@@ -910,6 +1312,9 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
         authorityApprovalRequired: authorityApprovalRequired === true || authorityApprovalRequired === 'true',
         // Project Manager
         projectManager: projectManagerName?.trim() ? projectManagerName.trim().substring(0, 100) : null,
+        // Manager Assignment
+        assignedManagerId: finalAssignedManagerId,
+        assignedManagerEmail: finalAssignedManagerEmail,
         // Contract fees
         contractFees: parsedContractFees,
         // Payment schedule
@@ -962,6 +1367,9 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
       console.log('✅ Contract ID:', contract.id);
       console.log('✅ Project Manager saved:', contract.projectManager);
       console.log('✅ Project Manager Name from request was:', projectManagerName);
+      if (finalAssignedManagerEmail) {
+        console.log('✅ Contract assigned to manager:', finalAssignedManagerEmail);
+      }
 
       res.status(201).json({
         success: true,
@@ -1100,6 +1508,8 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       specialClauses,
       renewalTerms,
       attachments,
+      assignedManagerEmail, // Manager email for assignment
+      assignedManagerId, // Manager ID for assignment (alternative to email)
     } = req.body;
 
     // Check if contract exists
@@ -1113,6 +1523,162 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
         message: 'Contract not found',
       });
       return;
+    }
+
+    // STRICT ROLE-BASED ACCESS CONTROL for updates
+    const userRole = req.user?.role;
+    const userEmail = req.user?.email;
+
+    if (userRole === 'ADMIN') {
+      // Admin: Can update all contracts
+    } else if (userRole === 'MANAGER') {
+      // Manager: Can only update contracts assigned to their email OR ID
+      if (!userEmail || !req.user?.id) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: Manager email or ID not found in session',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+      // Check both assignedManagerEmail and assignedManagerId
+      if (existingContract.assignedManagerEmail !== userEmail && 
+          existingContract.assignedManagerId !== req.user.id) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: You can only update contracts assigned to you',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+      // Managers cannot reassign contracts to other managers
+      if (assignedManagerEmail !== undefined || assignedManagerId !== undefined) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: Managers cannot reassign contracts. Only admins can change manager assignments.',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+    } else if (userRole === 'EMPLOYEE') {
+      // Employee: Cannot update contracts
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: Employees cannot update contracts',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    } else {
+      // Other roles: No access
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to update contracts',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
+    // Validate and resolve manager assignment (only for ADMIN)
+    let finalAssignedManagerId: string | null | undefined = undefined;
+    let finalAssignedManagerEmail: string | null | undefined = undefined;
+
+    if (assignedManagerId !== undefined || assignedManagerEmail !== undefined) {
+      // Only ADMIN can change manager assignment
+      if (userRole !== 'ADMIN') {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: Only admins can change manager assignments',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+
+      if (assignedManagerId) {
+        // If manager ID is provided, validate it exists and is a manager
+        const manager = await prisma.user.findUnique({
+          where: { id: assignedManagerId },
+          select: { id: true, email: true, role: true },
+        });
+
+        if (!manager) {
+          res.status(400).json({
+            success: false,
+            message: `Manager with ID "${assignedManagerId}" not found`,
+          });
+          return;
+        }
+
+        const allowedManagerRoles = ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'];
+        if (!allowedManagerRoles.includes(manager.role)) {
+          res.status(400).json({
+            success: false,
+            message: `User "${manager.email}" is not a manager. Only users with MANAGER, PROJECT_MANAGER, or ADMIN role can be assigned to contracts.`,
+          });
+          return;
+        }
+
+        finalAssignedManagerId = manager.id;
+        finalAssignedManagerEmail = manager.email;
+      } else if (assignedManagerEmail) {
+        // If manager email is provided, find the manager by email
+        const manager = await prisma.user.findUnique({
+          where: { email: assignedManagerEmail.trim() },
+          select: { id: true, email: true, role: true },
+        });
+
+        if (!manager) {
+          res.status(400).json({
+            success: false,
+            message: `Manager with email "${assignedManagerEmail}" not found`,
+          });
+          return;
+        }
+
+        const allowedManagerRoles = ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'];
+        if (!allowedManagerRoles.includes(manager.role)) {
+          res.status(400).json({
+            success: false,
+            message: `User "${assignedManagerEmail}" is not a manager. Only users with MANAGER, PROJECT_MANAGER, or ADMIN role can be assigned to contracts.`,
+          });
+          return;
+        }
+
+        finalAssignedManagerId = manager.id;
+        finalAssignedManagerEmail = manager.email;
+      } else {
+        // If explicitly set to null/empty, remove assignment
+        finalAssignedManagerId = null;
+        finalAssignedManagerEmail = null;
+      }
+    } else if (userRole === 'ADMIN' && projectManagerName !== undefined && typeof projectManagerName === 'string' && projectManagerName.trim()) {
+      // Admin may have set/updated only the manager display name; resolve to ID/email so manager sees contract
+      const nameTrimmed = projectManagerName.trim();
+      let resolvedManager: { id: string; email: string } | null = null;
+      if (nameTrimmed.includes('@')) {
+        const byEmail = await prisma.user.findFirst({
+          where: { email: nameTrimmed, role: { in: ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'] } },
+          select: { id: true, email: true },
+        });
+        resolvedManager = byEmail;
+      }
+      if (!resolvedManager) {
+        const managers = await prisma.user.findMany({
+          where: { role: { in: ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'] }, isActive: true },
+          select: { id: true, email: true, firstName: true, lastName: true },
+        });
+        const fullNameLower = nameTrimmed.toLowerCase();
+        resolvedManager = managers.find(m => {
+          const full = `${(m.firstName || '').trim()} ${(m.lastName || '').trim()}`.trim().toLowerCase();
+          const first = (m.firstName || '').trim().toLowerCase();
+          const last = (m.lastName || '').trim().toLowerCase();
+          return full === fullNameLower || first === fullNameLower || last === fullNameLower || full.includes(fullNameLower) || fullNameLower.includes(full);
+        }) as { id: string; email: string } | undefined ?? null;
+      }
+      if (resolvedManager) {
+        finalAssignedManagerId = resolvedManager.id;
+        finalAssignedManagerEmail = resolvedManager.email;
+        console.log('✅ Resolved manager by name (update):', projectManagerName, '->', resolvedManager.email);
+      }
     }
 
     // Handle reference number update (if provided and different from current)
@@ -1426,6 +1992,9 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
         authorityApprovalRequired: authorityApprovalRequired !== undefined ? (authorityApprovalRequired === true || authorityApprovalRequired === 'true') : undefined,
         // Project Manager
         projectManager: projectManagerName !== undefined ? (projectManagerName?.trim() ? projectManagerName.trim().substring(0, 100) : null) : undefined,
+        // Manager Assignment (only if explicitly provided and user is ADMIN)
+        assignedManagerId: finalAssignedManagerId !== undefined ? finalAssignedManagerId : undefined,
+        assignedManagerEmail: finalAssignedManagerEmail !== undefined ? finalAssignedManagerEmail : undefined,
         // Contract fees
         contractFees: contractFees !== undefined ? parsedContractFees : undefined,
         // Payment schedule
@@ -1473,6 +2042,9 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
     });
 
     console.log('✅ Contract updated:', contract.referenceNumber);
+    if (finalAssignedManagerEmail !== undefined) {
+      console.log('✅ Contract manager assignment updated:', finalAssignedManagerEmail || 'removed');
+    }
 
     res.json({
       success: true,
@@ -1584,8 +2156,11 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
   try {
     const { id } = req.params;
 
+    const userRole = req.user?.role;
+    const userEmail = req.user?.email;
+
     // Employee role: Cannot create projects
-    if (req.user?.role === 'EMPLOYEE') {
+    if (userRole === 'EMPLOYEE') {
       res.status(403).json({
         success: false,
         message: 'Access Denied: You do not have permission to create projects. Please contact your manager.',
@@ -1611,6 +2186,15 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
         projectManager: true,
         startDate: true,
         endDate: true,
+        assignedManagerId: true,
+        assignedManagerEmail: true,
+        assignedManager: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+          },
+        },
         // Location fields
         makaniNumber: true,
         latitude: true,
@@ -1654,6 +2238,39 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
       res.status(404).json({
         success: false,
         message: 'Contract not found',
+      });
+      return;
+    }
+
+    // STRICT ROLE-BASED ACCESS CONTROL for load out
+    if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
+      // Admin, HR, and PROJECT_MANAGER can load out any contract
+    } else if (userRole === 'MANAGER') {
+      // Manager: Can only load out contracts assigned to them
+      if (!userEmail || !req.user?.id) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: Manager email or ID not found in session',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+      // Check both assignedManagerEmail and assignedManagerId
+      if (contract.assignedManagerEmail !== userEmail && 
+          contract.assignedManagerId !== req.user.id) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: You can only load out contracts assigned to you',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+    } else {
+      // Other roles: No access
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You do not have permission to load out contracts',
+        code: 'ACCESS_DENIED',
       });
       return;
     }
@@ -1708,11 +2325,13 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
 
     // Map contract fields to project fields
     const projectName = contract.title || `Project ${contract.referenceNumber}`;
-    const projectManager = contract.projectManager 
-      ? contract.projectManager.trim().substring(0, 100)
-      : (contract.creator 
-        ? `${contract.creator.firstName} ${contract.creator.lastName}`.trim().substring(0, 100)
-        : null);
+    // Prefer assigned manager's name so project shows correct PM (e.g. muffazzal not mohammednazar)
+    const contractWithManager = contract as typeof contract & { assignedManager?: { firstName: string; lastName: string } | null };
+    const projectManager = (contractWithManager.assignedManager
+      ? `${contractWithManager.assignedManager.firstName} ${contractWithManager.assignedManager.lastName}`.trim().substring(0, 100)
+      : null)
+      || (contract.projectManager ? contract.projectManager.trim().substring(0, 100) : null)
+      || (contract.creator ? `${contract.creator.firstName} ${contract.creator.lastName}`.trim().substring(0, 100) : null);
 
     // Build location string from coordinates or makani number
     let locationString: string | null = null;
@@ -1818,8 +2437,11 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
   try {
     const { contractIds } = req.body;
 
+    const userRole = req.user?.role;
+    const userEmail = req.user?.email;
+
     // Employee role: Cannot create projects
-    if (req.user?.role === 'EMPLOYEE') {
+    if (userRole === 'EMPLOYEE') {
       res.status(403).json({
         success: false,
         message: 'Access Denied: You do not have permission to create projects. Please contact your manager.',
@@ -1860,6 +2482,15 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
             projectManager: true,
             startDate: true,
             endDate: true,
+            assignedManagerId: true,
+            assignedManagerEmail: true,
+            assignedManager: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+              },
+            },
             makaniNumber: true,
             latitude: true,
             longitude: true,
@@ -1901,6 +2532,35 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
           errors.push({
             contractId,
             message: 'Contract not found',
+          });
+          continue;
+        }
+
+        // STRICT ROLE-BASED ACCESS CONTROL for bulk load out
+        if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
+          // Admin, HR, and PROJECT_MANAGER can load out any contract
+        } else if (userRole === 'MANAGER') {
+          // Manager: Can only load out contracts assigned to them
+          if (!userEmail || !req.user?.id) {
+            errors.push({
+              contractId,
+              message: 'Access Denied: Manager email or ID not found in session',
+            });
+            continue;
+          }
+          // Check both assignedManagerEmail and assignedManagerId
+          if (contract.assignedManagerEmail !== userEmail && 
+              contract.assignedManagerId !== req.user.id) {
+            errors.push({
+              contractId,
+              message: `Access Denied: Contract ${contract.referenceNumber} is not assigned to you`,
+            });
+            continue;
+          }
+        } else {
+          errors.push({
+            contractId,
+            message: 'Access Denied: You do not have permission to load out contracts',
           });
           continue;
         }
@@ -1955,11 +2615,12 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
 
         // Map contract fields to project fields
         const projectName = contract.title || `Project ${contract.referenceNumber}`;
-        const projectManager = contract.projectManager 
-          ? contract.projectManager.trim().substring(0, 100)
-          : (contract.creator 
-            ? `${contract.creator.firstName} ${contract.creator.lastName}`.trim().substring(0, 100)
-            : null);
+        const contractWithManager = contract as typeof contract & { assignedManager?: { firstName: string; lastName: string } | null };
+        const projectManager = (contractWithManager.assignedManager
+          ? `${contractWithManager.assignedManager.firstName} ${contractWithManager.assignedManager.lastName}`.trim().substring(0, 100)
+          : null)
+          || (contract.projectManager ? contract.projectManager.trim().substring(0, 100) : null)
+          || (contract.creator ? `${contract.creator.firstName} ${contract.creator.lastName}`.trim().substring(0, 100) : null);
 
         // Build location string
         let locationString: string | null = null;
@@ -2097,6 +2758,131 @@ export const getContractStats = async (req: AuthRequest, res: Response): Promise
     res.status(500).json({
       success: false,
       message: 'Failed to fetch contract statistics',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Get all managers for dropdown selection
+ * GET /api/contracts/managers
+ * Returns users with MANAGER, PROJECT_MANAGER, or ADMIN role (all can be assigned as project managers)
+ */
+export const getManagers = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { search, companyId } = req.query;
+
+    // Build where clause - MANAGER, PROJECT_MANAGER, or ADMIN role, active users
+    const where: any = {
+      isActive: true,
+      role: {
+        in: ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'] as UserRole[],
+      },
+    };
+
+    // Build AND conditions array for combining filters
+    const andConditions: any[] = [];
+
+    // Filter by company if companyId is provided
+    if (companyId && typeof companyId === 'string' && companyId.trim()) {
+      try {
+        // Look up the company name from companyId
+        const company = await prisma.company.findUnique({
+          where: { id: companyId.trim() },
+          select: { name: true },
+        });
+
+        if (company) {
+          const companyName = company.name.trim();
+          
+          // If "ONIX ENGINEERING CONSULTANCY" is selected, exclude managers from "onix" company
+          if (companyName.toLowerCase() === 'onix engineering consultancy') {
+            // Include managers from "ONIX ENGINEERING CONSULTANCY" or null/empty company
+            // AND exclude managers whose company field is "onix" (case-insensitive)
+            andConditions.push({
+              AND: [
+                {
+                  OR: [
+                    { company: { equals: companyName, mode: 'insensitive' } },
+                    { company: null },
+                    { company: '' },
+                  ],
+                },
+                {
+                  NOT: {
+                    company: {
+                      equals: 'onix',
+                      mode: 'insensitive',
+                    },
+                  },
+                },
+              ],
+            });
+          } else {
+            // For other companies, filter by exact company name match (case-insensitive)
+            andConditions.push({
+              OR: [
+                { company: { equals: companyName, mode: 'insensitive' } },
+                { company: null },
+                { company: '' },
+              ],
+            });
+          }
+        }
+      } catch (error) {
+        console.error('Error looking up company:', error);
+        // Continue without company filter if lookup fails
+      }
+    }
+
+    // Add search filter if provided
+    if (search && typeof search === 'string' && search.trim()) {
+      const searchTerm = search.trim();
+      andConditions.push({
+        OR: [
+          { firstName: { contains: searchTerm, mode: 'insensitive' } },
+          { lastName: { contains: searchTerm, mode: 'insensitive' } },
+          { email: { contains: searchTerm, mode: 'insensitive' } },
+        ],
+      });
+    }
+
+    // Combine all AND conditions
+    if (andConditions.length > 0) {
+      where.AND = andConditions;
+    }
+
+    // Get managers
+    const managers = await prisma.user.findMany({
+      where,
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        phone: true,
+        department: true,
+        position: true,
+        jobTitle: true,
+        photo: true,
+        employeeId: true,
+      },
+      orderBy: [
+        { firstName: 'asc' },
+        { lastName: 'asc' },
+      ],
+    });
+
+    res.json({
+      success: true,
+      data: managers,
+      count: managers.length,
+    });
+  } catch (error: any) {
+    console.error('❌ Error fetching managers:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch managers',
       error: error.message,
     });
   }

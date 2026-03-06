@@ -42,6 +42,13 @@ const isEmployee = (role: string): boolean => {
 };
 
 /**
+ * Check if user is a manager
+ */
+const isManager = (role: string): boolean => {
+  return role === 'MANAGER';
+};
+
+/**
  * Employee permissions configuration
  * Maps resource types to actions employees CAN perform
  */
@@ -112,6 +119,38 @@ export const requirePermission = (
       return;
     }
 
+    // Manager role - allow DELETE for projects (controller will verify ownership/assignment)
+    if (isManager(userRole)) {
+      // For DELETE on projects, allow middleware to pass - controller will verify manager can delete
+      if (resourceType === ResourceType.PROJECT && action === PermissionAction.DELETE) {
+        next();
+        return;
+      }
+      // For UPDATE on projects, allow middleware to pass - controller will verify assignment
+      if (resourceType === ResourceType.PROJECT && action === PermissionAction.UPDATE) {
+        next();
+        return;
+      }
+      // For other actions, check employee permissions (managers have same as employees for most resources)
+      if (!hasEmployeePermission(resourceType, action)) {
+        const resourceId = req.params.id || req.params.documentId || req.params.projectId;
+        logUnauthorizedAttempt(userId, userRole, resourceType, action, resourceId);
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: You do not have permission to perform this action. Please contact your manager.',
+          code: 'ACCESS_DENIED',
+          details: {
+            resourceType,
+            action,
+            userRole,
+          },
+        });
+        return;
+      }
+      next();
+      return;
+    }
+
     // Employee role - check permissions
     if (isEmployee(userRole)) {
       // Check if employee has permission for this action
@@ -170,7 +209,16 @@ export const canUserModify = (
     return true;
   }
 
+  // Manager can DELETE projects (controller will verify ownership/assignment)
+  if (isManager(userRole) && resourceType === ResourceType.PROJECT && action === PermissionAction.DELETE) {
+    return true;
+  }
+
   if (isEmployee(userRole)) {
+    return hasEmployeePermission(resourceType, action);
+  }
+
+  if (isManager(userRole)) {
     return hasEmployeePermission(resourceType, action);
   }
 

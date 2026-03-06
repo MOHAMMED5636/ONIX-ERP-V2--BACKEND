@@ -24,11 +24,15 @@ const logRequestBeforeMulter = (req: any, res: any, next: any) => {
 // Employee CRUD routes
 // Create employee - requires ADMIN or HR role + photo and legal documents uploads
 router.post('/', requireRole('ADMIN', 'HR'), logRequestBeforeMulter, uploadEmployeeFiles, employeeController.createEmployee);
+router.get('/check-availability', requireRole('ADMIN', 'HR'), employeeController.checkEmployeeAvailability);
 router.get('/statistics', requireRole('ADMIN', 'HR'), employeeController.getEmployeeStatistics);
-router.get('/', requireRole('ADMIN', 'HR'), employeeController.getEmployees);
+// Get employees - accessible by ADMIN, HR, MANAGER, PROJECT_MANAGER, and EMPLOYEE (for assigning tasks)
+// Managers and Project Managers use the SAME module as employees - they can see employee list for task assignment
+router.get('/', requireRole('ADMIN', 'HR', 'MANAGER', 'PROJECT_MANAGER', 'EMPLOYEE'), employeeController.getEmployees);
+// Restore route must come BEFORE /:id route to avoid route conflicts
+router.put('/:id/restore', requireRole('ADMIN', 'HR'), employeeController.restoreEmployee);
 router.get('/:id', employeeController.getEmployeeById);
 router.put('/:id', requireRole('ADMIN', 'HR'), logRequestBeforeMulter, uploadEmployeeFiles, employeeController.updateEmployee);
-router.put('/:id/restore', requireRole('ADMIN', 'HR'), employeeController.restoreEmployee);
 router.delete('/:id', requireRole('ADMIN', 'HR'), employeeController.deleteEmployee);
 
 export default router;

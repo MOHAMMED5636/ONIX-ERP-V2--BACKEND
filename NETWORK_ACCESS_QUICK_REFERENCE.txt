@@ -1,0 +1,78 @@
+================================================================================
+           QUICK REFERENCE: SHARE WEB APPLICATION WITH OTHER OFFICES
+================================================================================
+
+YOUR CURRENT IP ADDRESS: 192.168.1.178
+
+================================================================================
+STEP-BY-STEP INSTRUCTIONS:
+================================================================================
+
+1. OPEN FIREWALL PORTS (One-time setup)
+   --------------------------------
+   Right-click: backend\open-firewall-admin.bat → Run as Administrator
+   
+   OR run in PowerShell (Admin):
+   New-NetFirewallRule -DisplayName "ONIX ERP Port 3001" -Direction Inbound -LocalPort 3001 -Protocol TCP -Action Allow
+   New-NetFirewallRule -DisplayName "ONIX ERP Port 3000" -Direction Inbound -LocalPort 3000 -Protocol TCP -Action Allow
+
+2. START BACKEND SERVER
+   --------------------------------
+   cd C:\Users\Lenovo\Desktop\Onix-ERP-Backend\backend
+   npm run dev
+
+3. UPDATE FRONTEND API URL
+   --------------------------------
+   Edit: ERP-FRONTEND\ONIX-ERP-V2\src\services\*.js files
+   Change: http://localhost:3001/api
+   To:     http://192.168.1.178:3001/api
+
+   OR create .env file in ERP-FRONTEND\ONIX-ERP-V2\:
+   REACT_APP_API_URL=http://192.168.1.178:3001/api
+
+4. START FRONTEND ON NETWORK
+   --------------------------------
+   cd C:\Users\Lenovo\Desktop\ERP-FRONTEND\ONIX-ERP-V2
+   set HOST=0.0.0.0 && npm start
+
+5. SHARE THIS URL WITH OFFICE USERS:
+   --------------------------------
+   http://192.168.1.178:3000
+
+================================================================================
+TESTING:
+================================================================================
+
+From your computer:
+  http://192.168.1.178:3000
+
+From other office computers:
+  http://192.168.1.178:3000
+
+Backend health check:
+  http://192.168.1.178:3001/health
+
+================================================================================
+LOGIN CREDENTIALS:
+================================================================================
+
+Email: admin@onixgroup.ae
+Password: admin123
+Role: ADMIN
+
+================================================================================
+TROUBLESHOOTING:
+================================================================================
+
+Can't access from other computers?
+  1. Check firewall ports are open (Step 1)
+  2. Verify backend is running
+  3. Test: http://192.168.1.178:3001/health
+  4. Ensure both computers on same network
+
+Frontend can't connect to backend?
+  1. Check API URL uses network IP (not localhost)
+  2. Verify backend is running
+  3. Check browser console for errors
+
+================================================================================

@@ -14,6 +14,7 @@ export interface AuthRequest extends Request {
   headers: any;
 }
 
+/** Stateless: extract user from JWT only; no global/cached user. */
 export const authenticate = (req: AuthRequest, res: Response, next: NextFunction): void => {
   try {
     const token = req.headers.authorization?.split(' ')[1]; // Bearer <token>

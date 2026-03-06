@@ -155,4 +155,114 @@ export const resetPassword = async (req: AuthRequest, res: Response): Promise<vo
   }
 };
 
+/**
+ * Set password for employee (Admin only)
+ * POST /api/admin/set-password
+ * Access: ADMIN only
+ * Allows admin to create/set a password for any employee without requiring old password
+ */
+export const setPassword = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const adminId = req.user!.id;
+    const { employeeId, newPassword } = req.body;
+
+    // Validation
+    if (!employeeId || !newPassword) {
+      res.status(400).json({
+        success: false,
+        message: 'Employee ID and new password are required'
+      });
+      return;
+    }
+
+    // Password strength validation
+    if (newPassword.length < 8) {
+      res.status(400).json({
+        success: false,
+        message: 'Password must be at least 8 characters long'
+      });
+      return;
+    }
+
+    // Check if password contains at least one letter and one number
+    const hasLetter = /[a-zA-Z]/.test(newPassword);
+    const hasNumber = /\d/.test(newPassword);
+    if (!hasLetter || !hasNumber) {
+      res.status(400).json({
+        success: false,
+        message: 'Password must contain at least one letter and one number'
+      });
+      return;
+    }
+
+    // Check if employee exists
+    const employee = await prisma.user.findUnique({
+      where: { id: employeeId },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        employeeId: true
+      }
+    });
+
+    if (!employee) {
+      res.status(404).json({
+        success: false,
+        message: 'Employee not found'
+      });
+      return;
+    }
+
+    // Get admin info for logging
+    const admin = await prisma.user.findUnique({
+      where: { id: adminId },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true
+      }
+    });
+
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update password and clear forcePasswordChange flag (admin is setting it, so no force change needed)
+    await prisma.user.update({
+      where: { id: employeeId },
+      data: {
+        password: hashedPassword,
+        forcePasswordChange: false, // Admin sets password, so no need to force change
+      }
+    });
+
+    // Log the action for audit purposes
+    console.log(`🔐 [AUDIT] Admin set password for employee:`, {
+      adminId: adminId,
+      adminEmail: admin?.email,
+      adminName: `${admin?.firstName} ${admin?.lastName}`,
+      employeeId: employeeId,
+      employeeEmail: employee.email,
+      employeeName: `${employee.firstName} ${employee.lastName}`,
+      employeeRole: employee.role,
+      timestamp: new Date().toISOString(),
+      action: 'SET_PASSWORD'
+    });
+
+    res.json({
+      success: true,
+      message: `Password set successfully for ${employee.firstName} ${employee.lastName}`
+    });
+  } catch (error) {
+    console.error('Set password error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to set password'
+    });
+  }
+};
+
 

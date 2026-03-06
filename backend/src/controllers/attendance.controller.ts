@@ -25,21 +25,21 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    if (latitude === undefined || longitude === undefined) {
-      res.status(400).json({
-        success: false,
-        message: 'Latitude and longitude are required',
-      });
-      return;
-    }
-
-    // Validate coordinates
-    if (!isValidCoordinates(latitude, longitude)) {
-      res.status(400).json({
-        success: false,
-        message: 'Invalid coordinates provided',
-      });
-      return;
+    // Location is now optional - validate only if provided
+    let isValidLocation = false;
+    let distance = null;
+    let isWithinRadius = null;
+    
+    if (latitude !== undefined && longitude !== undefined) {
+      // Validate coordinates if provided
+      if (!isValidCoordinates(latitude, longitude)) {
+        res.status(400).json({
+          success: false,
+          message: 'Invalid coordinates provided',
+        });
+        return;
+      }
+      isValidLocation = true;
     }
 
     // Get user
@@ -73,38 +73,35 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // Validate office coordinates are configured
-    if (!company.officeLatitude || !company.officeLongitude) {
-      res.status(500).json({
-        success: false,
-        message: 'Office location is not configured. Please contact administrator.',
-      });
-      return;
-    }
+    // Location validation is now optional - only validate if location is provided
+    if (isValidLocation && company.officeLatitude && company.officeLongitude) {
+      const officeLat = company.officeLatitude;
+      const officeLon = company.officeLongitude;
+      const allowedRadius = company.attendanceRadius || 200; // Default 200 meters
 
-    const officeLat = company.officeLatitude;
-    const officeLon = company.officeLongitude;
-    const allowedRadius = company.attendanceRadius || 200; // Default 200 meters
+      // Calculate distance and check proximity
+      const proximityResult = checkProximity(
+        latitude,
+        longitude,
+        officeLat,
+        officeLon,
+        allowedRadius
+      );
+      
+      isWithinRadius = proximityResult.isWithinRadius;
+      distance = proximityResult.distance;
 
-    // Calculate distance and check proximity
-    const { isWithinRadius, distance } = checkProximity(
-      latitude,
-      longitude,
-      officeLat,
-      officeLon,
-      allowedRadius
-    );
-
-    // Server-side validation: reject if outside radius
-    if (!isWithinRadius) {
-      res.status(403).json({
-        success: false,
-        message: `You must be within ${allowedRadius} meters of the office to mark attendance. Your current distance is ${distance.toFixed(2)} meters.`,
-        distance: distance,
-        allowedRadius: allowedRadius,
-        isWithinRadius: false,
-      });
-      return;
+      // Server-side validation: reject if outside radius (only if location is provided)
+      if (!isWithinRadius) {
+        res.status(403).json({
+          success: false,
+          message: `You must be within ${allowedRadius} meters of the office to mark attendance. Your current distance is ${distance.toFixed(2)} meters.`,
+          distance: distance,
+          allowedRadius: allowedRadius,
+          isWithinRadius: false,
+        });
+        return;
+      }
     }
 
     // Get today's date (date only, no time)
@@ -130,9 +127,10 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // For check-in, check if there's already a check-out today (shouldn't happen, but validate)
+    // For check-out: validate check-in exists and enforce minimum duration / no zero or negative duration
+    let checkInToday: { checkInTime: Date | null } | null = null;
     if (type === 'CHECK_OUT') {
-      const checkInToday = await prisma.attendance.findUnique({
+      checkInToday = await prisma.attendance.findUnique({
         where: {
           userId_date_type: {
             userId: userId,
@@ -149,6 +147,35 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
         });
         return;
       }
+
+      const checkInTime = checkInToday.checkInTime ? new Date(checkInToday.checkInTime) : null;
+      const checkOutTime = new Date();
+
+      if (!checkInTime) {
+        res.status(400).json({
+          success: false,
+          message: 'Invalid check-in record. Please contact support.',
+        });
+        return;
+      }
+
+      if (checkOutTime.getTime() <= checkInTime.getTime()) {
+        res.status(400).json({
+          success: false,
+          message: 'Check-out time must be after check-in time. You cannot check out at or before your check-in time.',
+        });
+        return;
+      }
+
+      const durationMs = checkOutTime.getTime() - checkInTime.getTime();
+      const MIN_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+      if (durationMs < MIN_DURATION_MS) {
+        res.status(400).json({
+          success: false,
+          message: 'Minimum working duration is 5 minutes. Please wait at least 5 minutes after check-in before checking out.',
+        });
+        return;
+      }
     }
 
     // Create attendance record
@@ -156,10 +183,10 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
       userId: userId,
       companyId: company.id,
       type: type as 'CHECK_IN' | 'CHECK_OUT',
-      employeeLatitude: latitude,
-      employeeLongitude: longitude,
-      distanceFromOffice: distance,
-      isWithinRadius: true,
+      employeeLatitude: latitude || null,
+      employeeLongitude: longitude || null,
+      distanceFromOffice: distance || null,
+      isWithinRadius: isWithinRadius !== null ? isWithinRadius : true, // Default to true if no location check
       date: today,
       locationAccuracy: accuracy || null,
       ipAddress: req.ip || req.socket.remoteAddress || null,
@@ -208,9 +235,11 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
       message: `${type === 'CHECK_IN' ? 'Check-in' : 'Check-out'} recorded successfully`,
       data: {
         attendance,
-        distance: distance,
-        allowedRadius: allowedRadius,
-        isWithinRadius: true,
+        ...(distance !== null && {
+          distance: distance,
+          allowedRadius: company.attendanceRadius || 200,
+          isWithinRadius: isWithinRadius,
+        }),
       },
     });
   } catch (error) {
@@ -425,9 +454,8 @@ export const getAttendanceStats = async (req: AuthRequest, res: Response): Promi
         });
 
         if (checkOut && checkOut.checkOutTime) {
-          const hours =
-            (checkOut.checkOutTime.getTime() - checkIn.checkInTime.getTime()) /
-            (1000 * 60 * 60);
+          const durationMs = checkOut.checkOutTime.getTime() - checkIn.checkInTime.getTime();
+          const hours = Math.max(0, durationMs) / (1000 * 60 * 60);
           totalHours += hours;
         }
       }
@@ -458,6 +486,81 @@ export const getAttendanceStats = async (req: AuthRequest, res: Response): Promi
     });
   } catch (error) {
     console.error('Get attendance stats error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Get all employees' attendance for Admin (join User + Attendance, date filter, working hours)
+ * GET /api/attendance/all?date=YYYY-MM-DD
+ * Access: ADMIN, HR only
+ */
+export const getAllAttendanceForAdmin = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { date: dateParam } = req.query;
+
+    const where: any = {};
+    if (dateParam && typeof dateParam === 'string') {
+      const d = new Date(dateParam);
+      if (!isNaN(d.getTime())) {
+        d.setHours(0, 0, 0, 0);
+        const nextDay = new Date(d);
+        nextDay.setDate(nextDay.getDate() + 1);
+        where.date = { gte: d, lt: nextDay };
+      }
+    }
+
+    const raw = await prisma.attendance.findMany({
+      where,
+      orderBy: [{ date: 'desc' }, { userId: 'asc' }],
+      include: {
+        user: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            employeeId: true,
+          },
+        },
+      },
+    });
+
+    const byUserDate: Record<string, { checkIn: typeof raw[0] | null; checkOut: typeof raw[0] | null }> = {};
+    for (const row of raw) {
+      const key = `${row.userId}_${row.date.toISOString().slice(0, 10)}`;
+      if (!byUserDate[key]) byUserDate[key] = { checkIn: null, checkOut: null };
+      if (row.type === 'CHECK_IN') byUserDate[key].checkIn = row;
+      if (row.type === 'CHECK_OUT') byUserDate[key].checkOut = row;
+    }
+
+    const rows = Object.entries(byUserDate).map(([, { checkIn, checkOut }]) => {
+      const rec = checkIn || checkOut;
+      if (!rec) return null;
+      const user = rec.user;
+      const checkInTime = checkIn?.checkInTime ?? null;
+      const checkOutTime = checkOut?.checkOutTime ?? null;
+      let totalWorkingHours: number | null = null;
+      if (checkInTime && checkOutTime) {
+        const durationMs = new Date(checkOutTime).getTime() - new Date(checkInTime).getTime();
+        totalWorkingHours = Math.max(0, durationMs) / (1000 * 60 * 60);
+      }
+      return {
+        employeeName: user ? `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.email : '—',
+        employeeId: user?.employeeId ?? '—',
+        checkInTime: checkInTime ? new Date(checkInTime).toISOString() : null,
+        checkOutTime: checkOutTime ? new Date(checkOutTime).toISOString() : null,
+        totalWorkingHours: totalWorkingHours != null ? Math.round(totalWorkingHours * 100) / 100 : null,
+        attendanceDate: rec.date,
+      };
+    }).filter(Boolean);
+
+    res.json({
+      success: true,
+      data: rows,
+    });
+  } catch (error) {
+    console.error('Get all attendance (admin) error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

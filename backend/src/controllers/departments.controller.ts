@@ -172,7 +172,7 @@ export const createCompanyDepartment = async (req: AuthRequest, res: Response): 
       });
       return;
     }
-
+       
     // Verify company exists
     const company = await prisma.company.findUnique({
       where: { id: companyId },

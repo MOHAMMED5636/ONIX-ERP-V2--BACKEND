@@ -117,6 +117,11 @@ if (!fs.existsSync(photosPath)) {
   fs.mkdirSync(photosPath, { recursive: true });
   console.log(`📸 Created photos directory: ${photosPath}`);
 }
+const leaveDocumentsPath = path.join(uploadsPath, 'leave-documents');
+if (!fs.existsSync(leaveDocumentsPath)) {
+  fs.mkdirSync(leaveDocumentsPath, { recursive: true });
+  console.log(`📁 Created leave documents directory: ${leaveDocumentsPath}`);
+}
 
 console.log(`📁 Serving static files from: ${uploadsPath}`);
 console.log(`📸 Photo directory: ${photosPath}`);
@@ -194,6 +199,7 @@ app.get('/api', (req, res) => {
         get: 'GET /api/projects/:id',
         create: 'POST /api/projects',
         update: 'PUT /api/projects/:id',
+        updateName: 'PUT or PATCH /api/projects/:id/name  (body: { name: "villa" }) — use when saving project name in modal so it persists after refresh',
         delete: 'DELETE /api/projects/:id',
         assign: 'POST /api/projects/:id/assign',
         stats: 'GET /api/projects/:id/stats',

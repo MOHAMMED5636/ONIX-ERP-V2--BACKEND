@@ -284,3 +284,30 @@ export const uploadCompanyAssets = multer({
   { name: 'header', maxCount: 1 },
   { name: 'footer', maxCount: 1 },
 ]);
+
+// Leave documents (medical certificates, proofs) - stored under uploads/leave-documents
+const leaveDocumentsDir = path.join(process.cwd(), 'uploads', 'leave-documents');
+if (!fs.existsSync(leaveDocumentsDir)) {
+  fs.mkdirSync(leaveDocumentsDir, { recursive: true });
+}
+
+const leaveDocumentsStorage = multer.diskStorage({
+  destination: (req: Request, file: Express.Multer.File, cb: (error: Error | null, destination: string) => void) => {
+    cb(null, leaveDocumentsDir);
+  },
+  filename: (req: Request, file: Express.Multer.File, cb: (error: Error | null, filename: string) => void) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const ext = path.extname(file.originalname);
+    let name = path.basename(file.originalname, ext);
+    name = name.replace(/[\/\\\?\*\|"<>:]/g, '_').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (name.length > 50) name = name.substring(0, 50);
+    if (!name) name = 'document';
+    cb(null, `${name}-${uniqueSuffix}${ext}`);
+  }
+});
+
+export const uploadLeaveDocuments = multer({
+  storage: leaveDocumentsStorage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: documentsFileFilter,
+}).array('documents', 10);

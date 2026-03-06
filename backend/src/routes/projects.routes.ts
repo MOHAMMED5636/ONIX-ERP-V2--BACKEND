@@ -45,6 +45,8 @@ router.get('/:id', projectsController.getProjectById);
 router.post('/', requirePermission(ResourceType.PROJECT, PermissionAction.CREATE), projectsController.createProject);
 // Employees can UPDATE but only their assigned projects (verified in controller)
 router.put('/:id', requirePermission(ResourceType.PROJECT, PermissionAction.UPDATE), projectsController.updateProject);
+router.put('/:id/name', requirePermission(ResourceType.PROJECT, PermissionAction.UPDATE), projectsController.updateProjectName);
+router.patch('/:id/name', requirePermission(ResourceType.PROJECT, PermissionAction.UPDATE), projectsController.updateProjectName); // Update only project name (persists after refresh)
 router.delete('/bulk', requirePermission(ResourceType.PROJECT, PermissionAction.DELETE), projectsController.deleteProjects); // Bulk delete must come before /:id
 router.delete('/:id', requirePermission(ResourceType.PROJECT, PermissionAction.DELETE), projectsController.deleteProject);
 
