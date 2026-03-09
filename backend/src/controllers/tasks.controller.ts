@@ -10,6 +10,7 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
       status,
       priority,
       assignedTo,
+      employee: employeeParam,
       search,
       page = '1',
       limit = '10',
@@ -38,7 +39,16 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
       where.priority = priority;
     }
 
-    if (assignedTo && req.user?.role !== 'EMPLOYEE') {
+    // When admin/manager views another employee's tasks (e.g. /employees/30), use employee= or assignedTo
+    const canViewOtherEmployee =
+      req.user &&
+      ['ADMIN', 'HR', 'PROJECT_MANAGER'].includes(req.user.role);
+    const targetEmployeeId =
+      (employeeParam as string) || (assignedTo as string) || null;
+    const useTargetEmployee =
+      targetEmployeeId && (canViewOtherEmployee || req.user?.id === targetEmployeeId);
+
+    if (assignedTo && req.user?.role !== 'EMPLOYEE' && !useTargetEmployee) {
       where.assignments = {
         some: {
           employeeId: assignedTo as string,
@@ -49,19 +59,20 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
     const searchOr = search
       ? [{ title: { contains: search as string, mode: 'insensitive' as const } }, { description: { contains: search as string, mode: 'insensitive' as const } }]
       : null;
-    // Employee and Manager roles need filtering - they can only see assigned tasks
+    // Employee/Manager see only their assigned tasks; admin viewing ?employee=XXX sees that employee's tasks
     const isEmployeeFilter = req.user && (req.user.role === 'EMPLOYEE' || req.user.role === 'MANAGER');
-    const employeeOr = isEmployeeFilter
+    const filterByEmployeeId = useTargetEmployee ? targetEmployeeId : (isEmployeeFilter ? req.user!.id : null);
+    const employeeOr = filterByEmployeeId
       ? [
           // Main task assignments (via TaskAssignment table)
-          { assignments: { some: { employeeId: req.user!.id } } },
+          { assignments: { some: { employeeId: filterByEmployeeId } } },
           // Direct subtask assignments (via assignedEmployeeId)
-          { subtasks: { some: { assignedEmployeeId: req.user!.id } } },
+          { subtasks: { some: { assignedEmployeeId: filterByEmployeeId } } },
           // Nested child subtask assignments (2 levels deep)
-          { subtasks: { some: { subtasks: { some: { assignedEmployeeId: req.user!.id } } } } },
-          // Tasks where I delegated a subtask (still visible to me as "Delegated")
-          { subtasks: { some: { delegations: { some: { originalAssigneeId: req.user!.id } } } } },
-          { subtasks: { some: { subtasks: { some: { delegations: { some: { originalAssigneeId: req.user!.id } } } } } } },
+          { subtasks: { some: { subtasks: { some: { assignedEmployeeId: filterByEmployeeId } } } } },
+          // Tasks where user delegated a subtask (still visible as "Delegated")
+          { subtasks: { some: { delegations: { some: { originalAssigneeId: filterByEmployeeId } } } } },
+          { subtasks: { some: { subtasks: { some: { delegations: { some: { originalAssigneeId: filterByEmployeeId } } } } } } },
         ]
       : null;
 

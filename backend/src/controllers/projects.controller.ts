@@ -229,6 +229,7 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
       clientId, 
       projectManager, // Text search filter (not projectManagerId)
       search,
+      employeeId: employeeIdQuery,
       page = '1',
       limit = '10',
       sortBy = 'createdAt',
@@ -264,9 +265,46 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
       ]
     } : null;
 
-    // Employee/Manager: Same access - see projects where they are assigned or have tasks
-    // Managers use the SAME module as employees
-    if (req.user?.role === 'EMPLOYEE' || req.user?.role === 'MANAGER') {
+    // When ?employeeId=XXX is sent (e.g. /employees/30 page), return projects that have tasks assigned to that employee.
+    // Allowed when: current user is that employee, or current user is ADMIN/HR/PROJECT_MANAGER viewing that employee.
+    const canViewOtherEmployee = req.user && ['ADMIN', 'HR', 'PROJECT_MANAGER'].includes(req.user.role);
+    const effectiveEmployeeId =
+      typeof employeeIdQuery === 'string' && employeeIdQuery.trim() &&
+      (canViewOtherEmployee || req.user?.id === employeeIdQuery.trim())
+        ? employeeIdQuery.trim()
+        : null;
+
+    if (effectiveEmployeeId) {
+      // Task-based project list for this employee (same logic as EMPLOYEE branch)
+      const employeeTasks = await prisma.task.findMany({
+        where: {
+          OR: [
+            { assignedEmployeeId: effectiveEmployeeId },
+            { assignments: { some: { employeeId: effectiveEmployeeId } } },
+            { createdBy: effectiveEmployeeId },
+          ],
+        },
+        select: { projectId: true },
+        distinct: ['projectId'],
+      });
+      const employeeProjectIds = employeeTasks
+        .map((t: { projectId: string | null }) => t.projectId)
+        .filter((pid): pid is string => !!pid);
+      if (employeeProjectIds.length === 0) {
+        console.log('[getAllProjects] employeeId filter: no tasks for employee → no projects. employeeId=', effectiveEmployeeId);
+      }
+      if (searchFilter) {
+        where.AND = [
+          { id: employeeProjectIds.length ? { in: employeeProjectIds } : { in: [] } },
+          searchFilter,
+        ];
+      } else {
+        where.id = employeeProjectIds.length ? { in: employeeProjectIds } : { in: [] };
+      }
+    }
+    // Employee/Manager: access is scoped to projects they are actually involved in.
+    // Managers use a restricted view of "their" projects, employees see projects that have tasks assigned to them.
+    else if (req.user?.role === 'EMPLOYEE' || req.user?.role === 'MANAGER') {
       if (req.user?.role === 'MANAGER') {
         // Manager: Can see ONLY their own projects - from their contracts, or where they are directly assigned
         // Does NOT include team member projects (each manager sees only their projects)
@@ -332,47 +370,82 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
         if (searchFilter) {
           where.AND = [
             { OR: orConditions },
-            searchFilter
+            searchFilter,
           ];
         } else {
           where.OR = orConditions;
         }
       } else {
-        // Employee: See projects by relationship - assigned_to, created_by, or has tasks they own/created
-        where.OR = [
-          { assignedEmployees: { some: { employeeId: req.user.id } } },
-          { createdBy: req.user.id },
-          { tasks: { some: { assignedEmployeeId: req.user.id } } },
-          { tasks: { some: { assignments: { some: { employeeId: req.user.id } } } } },
-          { tasks: { some: { createdBy: req.user.id } } },
-          { tasks: { some: { subtasks: { some: { assignedEmployeeId: req.user.id } } } } },
-          { tasks: { some: { subtasks: { some: { assignments: { some: { employeeId: req.user.id } } } } } } },
-          { tasks: { some: { subtasks: { some: { createdBy: req.user.id } } } } },
-          { tasks: { some: { subtasks: { some: { subtasks: { some: { assignedEmployeeId: req.user.id } } } } } } },
-          { tasks: { some: { subtasks: { some: { subtasks: { some: { assignments: { some: { employeeId: req.user.id } } } } } } } } },
-          { tasks: { some: { subtasks: { some: { subtasks: { some: { createdBy: req.user.id } } } } } } },
-        ];
+        // EMPLOYEE:
+        // Instead of a very deep OR tree, derive the list of project IDs
+        // from tasks that are actually assigned to (or created by) this user.
+        const employeeTasks = await prisma.task.findMany({
+          where: {
+            OR: [
+              { assignedEmployeeId: req.user.id },
+              { assignments: { some: { employeeId: req.user.id } } },
+              { createdBy: req.user.id },
+            ],
+          },
+          select: {
+            projectId: true,
+          },
+          distinct: ['projectId'],
+        });
+
+        const employeeProjectIds = employeeTasks
+          .map((t: { projectId: string | null }) => t.projectId)
+          .filter((pid): pid is string => !!pid);
+
+        // Debug: log when employee sees no projects (helps verify Task 2 is assigned to Khalid's user ID in DB)
+        if (employeeProjectIds.length === 0) {
+          console.log('[getAllProjects] EMPLOYEE has no tasks assigned → no projects. userId=', req.user?.id, 'email=', req.user?.email);
+        } else {
+          console.log('[getAllProjects] EMPLOYEE project IDs from assigned tasks:', employeeProjectIds.length, employeeProjectIds.slice(0, 5));
+        }
+
+        if (employeeProjectIds.length === 0) {
+          // No projects linked to this employee's tasks – short‑circuit to empty result
+          if (searchFilter) {
+            where.AND = [
+              { id: { in: [] } }, // impossible condition
+              searchFilter,
+            ];
+          } else {
+            where.id = { in: [] };
+          }
+        } else if (searchFilter) {
+          where.AND = [
+            { id: { in: employeeProjectIds } },
+            searchFilter,
+          ];
+        } else {
+          where.id = { in: employeeProjectIds };
+        }
       }
     }
 
-    // EMPLOYEE: Pre-fetch main task IDs that the user "owns" (assigned to / created by / in assignments).
+    // For task visibility inside projects: use effectiveEmployeeId when viewing as that employee, else EMPLOYEE's own id.
+    const taskViewerId = effectiveEmployeeId ?? (req.user?.role === 'EMPLOYEE' ? req.user.id : null);
+
+    // EMPLOYEE (or ?employeeId= view): Pre-fetch main task IDs that the user "owns" (assigned to / created by / in assignments).
     // Child tasks under these parents must always be visible to the parent owner (Step 2 - relationship-based visibility).
     let ownedMainTaskIds: string[] = [];
-    if (req.user?.role === 'EMPLOYEE') {
+    if (taskViewerId) {
       const ownedTasks = await prisma.task.findMany({
         where: {
           parentTaskId: null,
           OR: [
-            { assignedEmployeeId: req.user.id },
-            { createdBy: req.user.id },
-            { assignments: { some: { employeeId: req.user.id } } },
+            { assignedEmployeeId: taskViewerId },
+            { createdBy: taskViewerId },
+            { assignments: { some: { employeeId: taskViewerId } } },
           ],
         },
         select: { id: true },
       });
       ownedMainTaskIds = ownedTasks.map((t: { id: string }) => t.id);
       if (ownedMainTaskIds.length > 0) {
-        console.log('[getAllProjects] EMPLOYEE owned main task IDs (parent-owner visibility):', ownedMainTaskIds.length);
+        console.log('[getAllProjects] Task viewer owned main task IDs (parent-owner visibility):', ownedMainTaskIds.length);
       }
     }
 
@@ -471,20 +544,20 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
           tasks: {
             where: {
               parentTaskId: null, // Only parent-level tasks (main tasks)
-              // EMPLOYEE: relationship-based visibility - assigned_to, created_by, or has any descendant assigned/created by user
-              ...(req.user?.role === 'EMPLOYEE' ? {
+              // When taskViewerId is set (EMPLOYEE or ?employeeId=): only main tasks visible to that employee
+              ...(taskViewerId ? {
                 OR: [
-                  { assignedEmployeeId: req.user.id },
-                  { createdBy: req.user.id },
-                  { assignments: { some: { employeeId: req.user.id } } },
-                  { subtasks: { some: { assignedEmployeeId: req.user.id } } },
-                  { subtasks: { some: { assignments: { some: { employeeId: req.user.id } } } } },
-                  { subtasks: { some: { assignedEmployeeId: null, createdBy: req.user.id } } },
-                  { subtasks: { some: { createdBy: req.user.id } } },
-                  { subtasks: { some: { subtasks: { some: { assignedEmployeeId: req.user.id } } } } },
-                  { subtasks: { some: { subtasks: { some: { assignments: { some: { employeeId: req.user.id } } } } } } },
-                  { subtasks: { some: { subtasks: { some: { assignedEmployeeId: null, createdBy: req.user.id } } } } },
-                  { subtasks: { some: { subtasks: { some: { createdBy: req.user.id } } } } },
+                  { assignedEmployeeId: taskViewerId },
+                  { createdBy: taskViewerId },
+                  { assignments: { some: { employeeId: taskViewerId } } },
+                  { subtasks: { some: { assignedEmployeeId: taskViewerId } } },
+                  { subtasks: { some: { assignments: { some: { employeeId: taskViewerId } } } } },
+                  { subtasks: { some: { assignedEmployeeId: null, createdBy: taskViewerId } } },
+                  { subtasks: { some: { createdBy: taskViewerId } } },
+                  { subtasks: { some: { subtasks: { some: { assignedEmployeeId: taskViewerId } } } } },
+                  { subtasks: { some: { subtasks: { some: { assignments: { some: { employeeId: taskViewerId } } } } } } },
+                  { subtasks: { some: { subtasks: { some: { assignedEmployeeId: null, createdBy: taskViewerId } } } } },
+                  { subtasks: { some: { subtasks: { some: { createdBy: taskViewerId } } } } },
                 ],
               } : {}),
             },
@@ -504,6 +577,8 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               assignedEmployeeId: true,
               createdBy: true,
               predecessors: true,
+              predecessorId: true,
+              workflowStatus: true,
               assignedEmployee: {
                 select: {
                   id: true,
@@ -542,6 +617,8 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
                   createdAt: true,
                   createdBy: true,
                   predecessors: true,
+                  predecessorId: true,
+                  workflowStatus: true,
                   assignedEmployee: {
                     select: {
                       id: true,
@@ -579,6 +656,8 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
                       createdAt: true,
                       createdBy: true,
                       predecessors: true,
+                      predecessorId: true,
+                      workflowStatus: true,
                       assignedEmployee: {
                         select: {
                           id: true,
@@ -738,10 +817,14 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
                       },
                     },
                   },
-                  orderBy: { createdAt: 'asc' },
+                  orderBy: {
+                    createdAt: 'asc',
+                  },
                 },
               },
-              orderBy: { createdAt: 'asc' },
+              orderBy: {
+                createdAt: 'asc',
+              },
             },
             _count: {
               select: {
@@ -750,16 +833,24 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
               },
             },
           },
-          orderBy: { createdAt: 'desc' },
+          orderBy: {
+            createdAt: 'desc',
+          },
         },
         checklists: {
-          orderBy: { order: 'asc' },
+          orderBy: {
+            order: 'asc',
+          },
         },
         attachments: {
-          orderBy: { uploadedAt: 'desc' },
+          orderBy: {
+            uploadedAt: 'desc',
+          },
         },
         documents: {
-          orderBy: { uploadedAt: 'desc' },
+          orderBy: {
+            uploadedAt: 'desc',
+          },
         },
         tenders: {
           select: {
@@ -785,8 +876,8 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
             community: true,
             numberOfFloors: true,
             makaniNumber: true,
-            assignedManagerId: true,
-            assignedManagerEmail: true,
+            assignedManagerId: true as any,
+            assignedManagerEmail: true as any,
             assignedManager: {
               select: {
                 id: true,
@@ -795,7 +886,9 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
               },
             },
           },
-          orderBy: { createdAt: 'desc' },
+          orderBy: {
+            createdAt: 'desc',
+          },
         },
         _count: {
           select: {
@@ -1300,8 +1393,8 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
         },
         contracts: {
           select: {
-            assignedManagerId: true as any,
-            assignedManagerEmail: true as any,
+            assignedManagerId: true,
+            assignedManagerEmail: true,
           },
         },
         tasks: {
@@ -1634,7 +1727,6 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             planDays: subtask.planDays ? parseInt(String(subtask.planDays), 10) : null,
             remarks: subtask.remarks || null,
             assigneeNotes: subtask.assigneeNotes || null,
-            assignedEmployeeId: subtask.assignedEmployeeId ?? subtask.assignedEmployee ?? subtask.assignedTo ?? null,
             createdBy: req.user?.id ?? null,
             location: subtask.location ?? projectDefaults.location ?? null,
             makaniNumber: subtask.makaniNumber ?? projectDefaults.makaniNumber ?? null,
@@ -1646,9 +1738,33 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             description: subtask.description || subtask.remarks || null,
             tags: Array.isArray(subtask.tags) ? subtask.tags : [],
           };
+
+          // Only set assignedEmployeeId when the payload explicitly provides an assignee.
+          // Do not overwrite with null for existing subtasks (preserves Khalid's assignment when
+          // manager only updates status/predecessors and frontend sends null or omits the field).
+          const assigneeInPayload =
+            subtask.assignedEmployeeId !== undefined ||
+            subtask.assignedEmployee !== undefined ||
+            subtask.assignedTo !== undefined;
+          const payloadAssignee =
+            subtask.assignedEmployeeId ??
+            subtask.assignedEmployee ??
+            subtask.assignedTo ??
+            null;
+          const isExistingSubtask = subtask.id && existingSubtaskIds.has(subtask.id);
+          if (assigneeInPayload && payloadAssignee) {
+            subtaskData.assignedEmployeeId = payloadAssignee;
+          } else if (assigneeInPayload && payloadAssignee === null && !isExistingSubtask) {
+            subtaskData.assignedEmployeeId = null;
+          }
+          // If existing subtask and payload has null/undefined assignee: do not set assignedEmployeeId (keep current in DB)
+
           // Only update predecessors when explicitly sent (avoid wiping on refresh/save when frontend omits field)
           if (subtask.predecessors !== undefined) {
-            subtaskData.predecessors = (subtask.predecessors != null && String(subtask.predecessors).trim() !== '') ? String(subtask.predecessors).trim() : null;
+            subtaskData.predecessors =
+              subtask.predecessors != null && String(subtask.predecessors).trim() !== ''
+                ? String(subtask.predecessors).trim()
+                : null;
           }
 
           // Handle timeline/dates
@@ -1901,8 +2017,8 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             community: true,
             numberOfFloors: true,
             makaniNumber: true,
-            assignedManagerId: true as any,
-            assignedManagerEmail: true as any,
+            assignedManagerId: true,
+            assignedManagerEmail: true,
           },
           orderBy: {
             createdAt: 'desc',
@@ -1940,11 +2056,23 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       meta: error?.meta,
       stack: error?.stack,
     });
-    res.status(500).json({
+    // Return 200 so client gets a response; include success: false and error for the frontend to show
+    let fallbackProject: any = null;
+    try {
+      const { id } = req.params;
+      fallbackProject = await prisma.project.findUnique({
+        where: { id },
+        select: { id: true, name: true, referenceNumber: true, status: true, createdAt: true, updatedAt: true },
+      });
+    } catch (_) {
+      // ignore
+    }
+    res.status(200).json({
       success: false,
       message: 'Failed to update project',
       error: error?.message || 'Internal server error',
       details: error?.meta,
+      data: fallbackProject,
     });
   }
 };
