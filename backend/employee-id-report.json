@@ -1,0 +1,206 @@
+﻿{
+  "totalEmployees": 28,
+  "allNumericEmployeeIds": false,
+  "inactiveCount": 0,
+  "inactiveEmployeeIds": [],
+  "missingCount": 0,
+  "missingEmployeeIds": [],
+  "employeeIds": [
+    {
+      "employeeId": "0-23-33",
+      "isActive": true,
+      "userId": "cdd9afb9-26df-4336-be13-43a43d8699b7",
+      "name": "manjeet singh karnail singh",
+      "email": "manjeet@onixgroup.ae"
+    },
+    {
+      "employeeId": "50105616541",
+      "isActive": true,
+      "userId": "3d2d499d-7011-4af8-b862-9908d5deb9a2",
+      "name": "PARAISO KADDOUR ALKADDOUR",
+      "email": "paulineparaiso0927962@gmail.com"
+    },
+    {
+      "employeeId": "61541564841541",
+      "isActive": true,
+      "userId": "559565c4-d18e-4e6a-9280-c9ddadc0459b",
+      "name": "PAULINE JOFFER OCAMPO PARAISO",
+      "email": "info@onixgroup2.ae"
+    },
+    {
+      "employeeId": "784199648348540",
+      "isActive": true,
+      "userId": "8b26bfee-2d5c-4549-8e6f-b6fa85855bfd",
+      "name": "PAULINE GOFFER PARAISO",
+      "email": "info@onixgroup.ae"
+    },
+    {
+      "employeeId": "C-25-01",
+      "isActive": true,
+      "userId": "479061ea-09ca-4db1-8eaf-5a0747d8b860",
+      "name": "ANAS ALI",
+      "email": "anas@onixgroup.ae"
+    },
+    {
+      "employeeId": "E-24-007",
+      "isActive": true,
+      "userId": "44276be9-d896-407e-bb23-af94ce18cdda",
+      "name": "OMAR MOHAMAD WADDAH SAKAAN",
+      "email": "omar.s@onixgroup.ae"
+    },
+    {
+      "employeeId": "E-24-012",
+      "isActive": true,
+      "userId": "46332715-f95a-41fa-be80-eb4d84698b73",
+      "name": "JAMES KENNETH CABANA",
+      "email": "james@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-21-001",
+      "isActive": true,
+      "userId": "0c66657d-2ed6-4d9a-a88c-25bd890657b3",
+      "name": "RAMEZ AHMED KADOUR",
+      "email": "ramez@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-21-004",
+      "isActive": true,
+      "userId": "2b4f7339-588d-4ec0-abb1-28c9311a2587",
+      "name": "CLINS ANTONY THOMA",
+      "email": "clins@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-21-005",
+      "isActive": true,
+      "userId": "1eed375c-d16b-4272-9886-a049f50381b6",
+      "name": "MUFAZZAL MOHAMED RASHEED",
+      "email": "mufazzal@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-21-059",
+      "isActive": true,
+      "userId": "30a9f834-097f-4974-ac9e-0db776603dcb",
+      "name": "MOHAMAD AHMAD TAHA",
+      "email": "m.taha@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-22-011",
+      "isActive": true,
+      "userId": "2a744faf-87d4-4df8-bc3c-ef543de261c2",
+      "name": "HAITHAM REDA MOHAMMAD",
+      "email": "haitham@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-22-013",
+      "isActive": true,
+      "userId": "bb2adcb4-5f43-4df9-b4e9-6165cfb84a14",
+      "name": "AHAMMED BIN SYED SYEDMUHAMMED",
+      "email": "ahmed@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-22-056",
+      "isActive": true,
+      "userId": "2faeb473-55bb-45ca-972d-3e3951eb43c5",
+      "name": "EYAD IBRAHIM SLIMAN",
+      "email": "eyad@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-23-030",
+      "isActive": true,
+      "userId": "03d1b2d7-4d32-46fc-889b-9604b40d311c",
+      "name": "KHALED IBRAHEM ALKADDOR",
+      "email": "khaled@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-23-034",
+      "isActive": true,
+      "userId": "760415d9-8cdf-495c-9d27-7bb74ecb763a",
+      "name": "ABDULRAZZAQ ABDULKARIM ARAR",
+      "email": "abdulrazzaq@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-23-035",
+      "isActive": true,
+      "userId": "413db6da-be5c-4644-92c1-de90500aabb9",
+      "name": "OSAMA BIRNAD ALMAKDISI",
+      "email": "osama@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-23-044",
+      "isActive": true,
+      "userId": "237e6fe1-0853-415d-b4b2-f2e60b8e6f6f",
+      "name": "MAHMOUD ABD ALKADER AL MCHALBN",
+      "email": "mahmoud@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-24-061",
+      "isActive": true,
+      "userId": "4b221f63-32bb-4255-90a3-bb683c8d2040",
+      "name": "JOEL PANAKKAL",
+      "email": "joel@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-24-067",
+      "isActive": true,
+      "userId": "da3067ea-a19c-4b80-9b49-3b35f6a6413b",
+      "name": "NIVENTHAN LOGANATHAN",
+      "email": "niven@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-24-068",
+      "isActive": true,
+      "userId": "603f6e0d-e5fc-4b8b-a115-f9f279ddd055",
+      "name": "MOHAMMAD OBADA M SAAD HAMADA",
+      "email": "h.obada@outlook.com"
+    },
+    {
+      "employeeId": "O-24-079",
+      "isActive": true,
+      "userId": "12bab860-2bc0-43f2-a6c2-9a3f1e204c1d",
+      "name": "Tala Daboura",
+      "email": "tala@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-25-070",
+      "isActive": true,
+      "userId": "d1eb508b-2eed-4008-a057-9c6d2b6f0095",
+      "name": "SANA SIDKLI",
+      "email": "sana@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-25-071",
+      "isActive": true,
+      "userId": "624444b9-9afd-47dd-a7aa-64d1afeb0d90",
+      "name": "MOHAMMED NAZAR KUNHI PURAYIL ABDUL",
+      "email": "mohammadnazar@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-25-074",
+      "isActive": true,
+      "userId": "be6d849e-87f0-41b2-a6b0-7163497cdd5f",
+      "name": "ABDULLAHA ALAKHRAS",
+      "email": "hr@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-25-076",
+      "isActive": true,
+      "userId": "140d4e49-f444-455f-9dd5-cfb1cd96c6f6",
+      "name": "MAJD ANTONIOUS",
+      "email": "majd@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-25-080",
+      "isActive": true,
+      "userId": "10c756d1-0290-4b43-8e7f-d11661c680c1",
+      "name": "Mohammed Khaled Taan",
+      "email": "accounting@onixgroup.ae"
+    },
+    {
+      "employeeId": "O-25-082",
+      "isActive": true,
+      "userId": "658b517c-be0f-40d4-bd3a-53373ed6f8e4",
+      "name": "PAULINE JOFFER OCAMPO PARAISO",
+      "email": "paulineparaiso092796@gmail.com"
+    }
+  ]
+}

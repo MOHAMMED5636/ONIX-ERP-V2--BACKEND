@@ -3,6 +3,34 @@ import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { calculateDistance, checkProximity, isValidCoordinates } from '../utils/location.utils';
 
+const YMD = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Stable calendar date for Prisma @db.Date (noon UTC avoids TZ edge cases). */
+function dateFromYyyyMmDd(ymd: string): Date {
+  const [y, m, d] = ymd.split('-').map((x) => parseInt(x, 10));
+  return new Date(Date.UTC(y, m - 1, d, 12, 0, 0, 0));
+}
+
+/** For POST /attendance — use client's local calendar day when provided. */
+function resolveAttendanceDateForMark(req: AuthRequest): Date {
+  const raw = typeof req.body?.date === 'string' ? req.body.date.trim() : '';
+  if (raw && YMD.test(raw)) {
+    return dateFromYyyyMmDd(raw);
+  }
+  const n = new Date();
+  return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate(), 12, 0, 0, 0));
+}
+
+/** For GET /attendance/today — align with browser's "today". */
+function resolveAttendanceDateForToday(req: AuthRequest): Date {
+  const raw = typeof req.query?.date === 'string' ? (req.query.date as string).trim() : '';
+  if (raw && YMD.test(raw)) {
+    return dateFromYyyyMmDd(raw);
+  }
+  const n = new Date();
+  return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate(), 12, 0, 0, 0));
+}
+
 /**
  * Mark attendance (check-in or check-out) with location validation
  */
@@ -104,9 +132,8 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    // Get today's date (date only, no time)
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    // Calendar day for this mark (client local YYYY-MM-DD when sent — fixes Check Out not showing when server TZ ≠ user)
+    const today = resolveAttendanceDateForMark(req);
 
     // Check if attendance already exists for today
     const existingAttendance = await prisma.attendance.findUnique({
@@ -328,8 +355,7 @@ export const getTodayAttendance = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = resolveAttendanceDateForToday(req);
 
     const checkIn = await prisma.attendance.findUnique({
       where: {
@@ -500,13 +526,12 @@ export const getAllAttendanceForAdmin = async (req: AuthRequest, res: Response):
     const { date: dateParam } = req.query;
 
     const where: any = {};
+    // Must match how employee check-in stores @db.Date (dateFromYyyyMmDd / noon UTC calendar day).
+    // Old logic used new Date(ymd) + setHours(0,0,0,0) in server local TZ → wrong day vs DB for many zones.
     if (dateParam && typeof dateParam === 'string') {
-      const d = new Date(dateParam);
-      if (!isNaN(d.getTime())) {
-        d.setHours(0, 0, 0, 0);
-        const nextDay = new Date(d);
-        nextDay.setDate(nextDay.getDate() + 1);
-        where.date = { gte: d, lt: nextDay };
+      const trimmed = dateParam.trim();
+      if (YMD.test(trimmed)) {
+        where.date = dateFromYyyyMmDd(trimmed);
       }
     }
 

@@ -21,14 +21,14 @@ Your application is now configured to work on your office network using IP: **19
 
 ## 🔧 Configuration Applied
 
-### **Backend CORS Updated:**
-✅ Added `http://192.168.1.151:3000` to allowed origins
-✅ Added `http://192.168.1.151:3001` to allowed origins
+### **Backend (already in code):**
+✅ Listens on `0.0.0.0` so it accepts connections from the network  
+✅ CORS **automatically** allows your machine’s current IP (e.g. when this PC is 192.168.1.151, `http://192.168.1.151:3000` and `http://192.168.1.151:3001` are allowed)  
+✅ No need to hardcode 192.168.1.151 in backend — it uses the detected LAN IP
 
 This allows:
 - Frontend on this IP to access backend
-- Other office computers to access the application
-- CORS requests to work properly
+- Other office computers to open the app and CORS to work
 
 ---
 
@@ -97,21 +97,32 @@ New-NetFirewallRule -DisplayName "ONIX ERP Port 3001" -Direction Inbound -LocalP
 
 ## 📝 Frontend API Configuration
 
-Make sure your frontend API service points to the correct backend URL.
+**Option A – Use .env (recommended for a fixed office IP)**  
+In `ERP-FRONTEND/ONIX-ERP-V2/.env`:
 
-**Check:** `ERP-FRONTEND/ONIX-ERP-V2/src/services/authAPI.js` or similar files
-
-Should have:
-```javascript
-const API_BASE_URL = 'http://192.168.1.151:3001/api';
-// OR use environment variable
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001/api';
+```env
+REACT_APP_API_URL=http://192.168.1.151:3001/api
+REACT_APP_BACKEND_URL=http://192.168.1.151:3001
 ```
 
-**For office network, update to:**
-```javascript
-const API_BASE_URL = 'http://192.168.1.151:3001/api';
+Then restart the frontend (`npm start`). All API and socket calls will use this backend.
+
+**Option B – Open by IP (if your frontend uses dynamic API config)**  
+If the frontend is built to use the same host as the page for the API, then **opening** `http://192.168.1.151:3000` from any device will make the app call `http://192.168.1.151:3001/api` automatically. No .env change needed.
+
+**Check:** Ensure the frontend start script uses `HOST=0.0.0.0` so the dev server is reachable on the network (e.g. in `package.json`: `"start": "set HOST=0.0.0.0&& ... react-scripts start"`).
+
+---
+
+## 📝 Optional: Backend .env for Office URL
+
+In `Onix-ERP-Backend/backend/.env` you can set:
+
+```env
+FRONTEND_URL=http://192.168.1.151:3000
 ```
+
+This makes links in emails (e.g. password reset, tender invitations) use the office URL instead of localhost.
 
 ---
 
@@ -128,12 +139,12 @@ const API_BASE_URL = 'http://192.168.1.151:3001/api';
 
 ## 🎯 Quick Checklist
 
-- [x] Backend CORS configured for `192.168.1.151`
-- [ ] Windows Firewall allows ports 3000 and 3001
-- [ ] Backend running on `http://192.168.1.151:3001`
-- [ ] Frontend running on `http://192.168.1.151:3000`
-- [ ] Frontend API URL points to `http://192.168.1.151:3001/api`
-- [ ] Test access from another office computer
+- [x] Backend listens on `0.0.0.0` and CORS uses detected IP
+- [ ] Windows Firewall allows inbound TCP for ports **3000** and **3001**
+- [ ] Backend running: `npm run dev` in backend folder
+- [ ] Frontend running: `npm start` in frontend folder (with `HOST=0.0.0.0`)
+- [ ] Frontend API: set `.env` to `http://192.168.1.151:3001/api` **or** open app via `http://192.168.1.151:3000` (if frontend uses dynamic API host)
+- [ ] Test: open `http://192.168.1.151:3000` from this PC and from another office computer
 
 ---
 
@@ -149,7 +160,8 @@ const API_BASE_URL = 'http://192.168.1.151:3001/api';
    - Verify: `http://192.168.1.151:3001/health`
 
 3. **Check Frontend API URL:**
-   - Verify frontend points to `http://192.168.1.151:3001/api`
+   - If using .env: ensure `REACT_APP_API_URL=http://192.168.1.151:3001/api` and restart frontend
+   - If using dynamic config: open the app via `http://192.168.1.151:3000` (not localhost) so API uses the same host
 
 4. **Check Network:**
    - Ensure all computers are on same network (192.168.1.x)

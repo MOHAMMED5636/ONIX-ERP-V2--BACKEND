@@ -5,7 +5,10 @@ import prisma from '../config/database';
 import { config } from '../config/env';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { getPhotoUrl } from '../utils/photo.utils';
+import { labourDetailsToSelfServicePayroll } from '../utils/payroll.utils';
+import { shapeEmployeeForClient } from '../utils/employee-response';
 import { sendLoginOtpEmail } from '../services/email.service';
+import { logUserActivity } from '../services/userActivityLog.service';
 
 /** Permissions per role for unified login / role-based access */
 function getPermissionsForRole(role: string): string[] {
@@ -99,6 +102,14 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             isActive: true,
             forcePasswordChange: true,
             employeeId: true,
+            labourDetails: {
+              select: {
+                basicSalary: true,
+                contractTotalSalary: true,
+                allowance1: true,
+                allowance2: true,
+              },
+            },
           },
         })
       : await prisma.user.findFirst({
@@ -123,6 +134,14 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             isActive: true,
             forcePasswordChange: true,
             employeeId: true,
+            labourDetails: {
+              select: {
+                basicSalary: true,
+                contractTotalSalary: true,
+                allowance1: true,
+                allowance2: true,
+              },
+            },
           },
         });
     
@@ -176,6 +195,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       forcePasswordChange: user.forcePasswordChange ?? false,
       employeeId: user.employeeId ?? null,
       permissions,
+      payroll: labourDetailsToSelfServicePayroll(user.labourDetails),
     };
 
     if (user.forcePasswordChange) {
@@ -245,6 +265,50 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
         employeeId: true,
         nationalIdNumber: true,
         nationalIdExpiryDate: true,
+        employeeType: true,
+        status: true,
+        gender: true,
+        maritalStatus: true,
+        nationality: true,
+        birthday: true,
+        childrenCount: true,
+        currentAddress: true,
+        phoneNumbers: true,
+        emailAddresses: true,
+        company: true,
+        companyLocation: true,
+        joiningDate: true,
+        attendanceProgram: true,
+        passportNumber: true,
+        passportIssueDate: true,
+        passportExpiryDate: true,
+        passportAttachment: true,
+        nationalIdAttachment: true,
+        residencyNumber: true,
+        residencyExpiryDate: true,
+        residencyAttachment: true,
+        insuranceNumber: true,
+        insuranceExpiryDate: true,
+        insuranceAttachment: true,
+        drivingLicenseNumber: true,
+        drivingLicenseExpiryDate: true,
+        drivingLicenseAttachment: true,
+        labourIdNumber: true,
+        labourIdExpiryDate: true,
+        labourIdAttachment: true,
+        remarks: true,
+        isLabour: true,
+        labourDetails: {
+          select: {
+            basicSalary: true,
+            contractTotalSalary: true,
+            allowance1: true,
+            allowance2: true,
+          },
+        },
+        manager: {
+          select: { firstName: true, lastName: true },
+        },
       },
     });
     
@@ -258,20 +322,31 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
     
-    const photoUrl = getPhotoUrl(user.photo, req.protocol, req.get('host') || 'localhost:3001');
+    const protocol = req.protocol || 'http';
+    const host = req.get('host') || 'localhost:3001';
+    const photoUrl = getPhotoUrl(user.photo, protocol, host);
     if (user.photo && !photoUrl) {
       console.log(`⚠️  Photo file not found for user ${user.email}: ${user.photo}`);
     }
-    
+
+    const { manager, labourDetails, ...userRest } = user;
+    const shaped = shapeEmployeeForClient(userRest as unknown as Record<string, unknown>, req);
+    const managerName =
+      manager && (manager.firstName || manager.lastName)
+        ? `${manager.firstName || ''} ${manager.lastName || ''}`.trim()
+        : null;
+
     const permissions = getPermissionsForRole(user.role);
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       data: {
-        ...user,
+        ...shaped,
         photo: photoUrl,
         employeeId: user.employeeId ?? null,
+        managerName,
+        payroll: labourDetailsToSelfServicePayroll(labourDetails),
         permissions,
-      }
+      },
     });
   } catch (error) {
     console.error('Get current user error:', error);
@@ -281,13 +356,16 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
 
 export const logout = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    // Since JWT tokens are stateless, we can't invalidate them server-side
-    // without implementing a token blacklist. This endpoint validates the token
-    // and returns success, allowing the frontend to clear the token from storage.
-    
-    // The token is already validated by the authenticate middleware
-    // We can optionally log the logout event or update user's last logout time
-    
+    const uid = req.user?.id;
+    if (uid) {
+      void logUserActivity({
+        userId: uid,
+        eventType: 'LOGOUT',
+        module: 'auth',
+        action: 'logout',
+      });
+    }
+
     res.json({
       success: true,
       message: 'Logged out successfully'
@@ -487,6 +565,14 @@ export const verifyLoginOtp = async (req: Request, res: Response): Promise<void>
         employeeId: true,
         loginOtp: true,
         loginOtpExpiry: true,
+        labourDetails: {
+          select: {
+            basicSalary: true,
+            contractTotalSalary: true,
+            allowance1: true,
+            allowance2: true,
+          },
+        },
       },
     });
     
@@ -541,6 +627,14 @@ export const verifyLoginOtp = async (req: Request, res: Response): Promise<void>
     } as SignOptions);
     
     console.log(`✅ OTP verified and login successful for user: ${user.email} (${user.role})`);
+
+    void logUserActivity({
+      userId: user.id,
+      eventType: 'LOGIN',
+      module: 'auth',
+      action: 'otp_login',
+      metadata: { ip: req.ip },
+    });
     
     // Get photo URL
     const photoUrl = getPhotoUrl(user.photo, req.protocol, req.get('host') || 'localhost:3001');
@@ -563,6 +657,7 @@ export const verifyLoginOtp = async (req: Request, res: Response): Promise<void>
       forcePasswordChange: user.forcePasswordChange ?? false,
       employeeId: user.employeeId ?? null,
       permissions,
+      payroll: labourDetailsToSelfServicePayroll(user.labourDetails),
     };
     
     if (user.forcePasswordChange) {

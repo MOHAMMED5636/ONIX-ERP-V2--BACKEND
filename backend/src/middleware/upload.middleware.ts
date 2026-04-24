@@ -311,3 +311,68 @@ export const uploadLeaveDocuments = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: documentsFileFilter,
 }).array('documents', 10);
+
+// Company policy file upload (PDF/DOC/DOCX) — stored under uploads/policies
+const policyFilesDir = path.join(process.cwd(), 'uploads', 'policies');
+if (!fs.existsSync(policyFilesDir)) {
+  fs.mkdirSync(policyFilesDir, { recursive: true });
+}
+
+const policyFilesStorage = multer.diskStorage({
+  destination: (_req: Request, _file: Express.Multer.File, cb) => {
+    cb(null, policyFilesDir);
+  },
+  filename: (_req: Request, file: Express.Multer.File, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname);
+    cb(null, `policy-${uniqueSuffix}${ext}`);
+  },
+});
+
+const policyFilesFilter = (_req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  const allowedMimes = [
+    'application/pdf',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  ];
+  if (allowedMimes.includes(file.mimetype)) cb(null, true);
+  else cb(new Error('Invalid file type. Only PDF or Word documents are allowed.'));
+};
+
+export const uploadPolicyFile = multer({
+  storage: policyFilesStorage,
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+  fileFilter: policyFilesFilter,
+}).single('file');
+
+// System feedback screenshots (optional attachment) — images only
+const feedbackDir = path.join(process.cwd(), 'uploads', 'feedback');
+if (!fs.existsSync(feedbackDir)) {
+  fs.mkdirSync(feedbackDir, { recursive: true });
+}
+
+const feedbackStorage = multer.diskStorage({
+  destination: (_req: Request, _file: Express.Multer.File, cb) => {
+    cb(null, feedbackDir);
+  },
+  filename: (_req: Request, file: Express.Multer.File, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname) || '.png';
+    cb(null, `feedback-${uniqueSuffix}${ext}`);
+  },
+});
+
+const feedbackImageFilter = (req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  const allowed = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+  if (allowed.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error(`Invalid screenshot type: ${file.mimetype}. Use JPEG, PNG, GIF, or WebP.`));
+  }
+};
+
+export const uploadFeedbackScreenshot = multer({
+  storage: feedbackStorage,
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
+  fileFilter: feedbackImageFilter,
+}).single('screenshot');

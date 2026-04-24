@@ -26,17 +26,45 @@ import mapsRoutes from './routes/maps.routes';
 import attendanceRoutes from './routes/attendance.routes';
 import leaveRoutes from './routes/leave.routes';
 import questionnaireRoutes from './routes/questionnaire.routes';
+import feedbackSurveyRoutes from './routes/feedbackSurvey.routes';
+import publicFormRoutes from './routes/publicForm.routes';
+import systemFeedbackRoutes from './routes/systemFeedback.routes';
+import companyPolicyRoutes from './routes/companyPolicy.routes';
+import activityRoutes from './routes/activity.routes';
+import salaryRoutes from './routes/salary.routes';
+import payrollRoutes from './routes/payroll.routes';
+import emailManagementRoutes from './routes/emailManagement.routes';
 
 const app = express();
 
+// Local network IP for Helmet CSP and CORS (images, etc. when accessing via office IP)
+function getLocalIPAddress(): string {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    const nets = interfaces[name];
+    if (nets) {
+      for (const net of nets) {
+        if (net.family === 'IPv4' && !net.internal) return net.address;
+      }
+    }
+  }
+  return 'localhost';
+}
+const LOCAL_IP = getLocalIPAddress();
+
 // Middleware
-// Configure Helmet to allow images from same origin
+// Configure Helmet to allow images from same origin and from backend on office network
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      imgSrc: ["'self'", "data:", "http://localhost:3001", "http://localhost:3000", "https:"],
+      imgSrc: [
+        "'self'", "data:",
+        "http://localhost:3001", "http://localhost:3000",
+        `http://${LOCAL_IP}:3001`, `http://${LOCAL_IP}:3000`,
+        "https:"
+      ],
     },
   },
 }));
@@ -47,21 +75,6 @@ app.use(cors({
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     
-    // Get local network IP for dynamic CORS
-    function getLocalIPAddress(): string {
-      const interfaces = os.networkInterfaces();
-      for (const name of Object.keys(interfaces)) {
-        const nets = interfaces[name];
-        if (nets) {
-          for (const net of nets) {
-            if (net.family === 'IPv4' && !net.internal) {
-              return net.address;
-            }
-          }
-        }
-      }
-      return 'localhost';
-    }
     const LOCAL_IP = getLocalIPAddress();
     
     const allowedOrigins = [
@@ -178,6 +191,14 @@ app.use('/api/maps', mapsRoutes);
 app.use('/api/attendance', attendanceRoutes);
 app.use('/api/leaves', leaveRoutes);
 app.use('/api/questionnaire', questionnaireRoutes);
+app.use('/api/public/forms', publicFormRoutes);
+app.use('/api/feedback-surveys', feedbackSurveyRoutes);
+app.use('/api/system-feedback', systemFeedbackRoutes);
+app.use('/api/policies', companyPolicyRoutes);
+app.use('/api/activity', activityRoutes);
+app.use('/api/salary', salaryRoutes);
+app.use('/api/payroll', payrollRoutes);
+app.use('/api/emails', emailManagementRoutes);
 
 // API root endpoint - list all available endpoints
 app.get('/api', (req, res) => {
@@ -275,6 +296,12 @@ app.get('/api', (req, res) => {
         validateMakani: 'GET /api/maps/validate-makani?makaniNumber=...',
         getLocationFromMakani: 'GET /api/maps/makani?makaniNumber=...',
         location: 'GET /api/maps/location?latitude=...&longitude=...',
+      },
+      systemFeedback: {
+        submit: 'POST /api/system-feedback (multipart: message, optional category, pageUrl, screenshot)',
+        list: 'GET /api/system-feedback?status=&page=&limit= — ADMIN only',
+        get: 'GET /api/system-feedback/:id — ADMIN only',
+        update: 'PATCH /api/system-feedback/:id { status, adminNotes } — ADMIN only',
       },
     },
     documentation: 'See API documentation for detailed endpoint information',

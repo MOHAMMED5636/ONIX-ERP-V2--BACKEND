@@ -74,7 +74,7 @@ export const getPreferences = async (req: AuthRequest, res: Response): Promise<v
 /**
  * Update organization preferences (Admin Profile)
  * PATCH /api/auth/preferences
- * Access: Admin only. Other roles get 403.
+ * Access: Any authenticated user.
  */
 export const updatePreferences = async (req: AuthRequest, res: Response): Promise<void> => {
   try {

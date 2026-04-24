@@ -15,7 +15,7 @@ const generateReferenceCode = (module: string, documentType: string, year: numbe
  */
 export const listDocuments = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { projectId, module, documentType } = req.query;
+    const { projectId, module, documentType, entityCode } = req.query;
 
     const where: any = {};
     
@@ -29,6 +29,17 @@ export const listDocuments = async (req: AuthRequest, res: Response): Promise<vo
     
     if (documentType) {
       where.documentType = documentType as string;
+    }
+
+    if (entityCode) {
+      where.entityCode = entityCode as string;
+    }
+
+    // Visibility rule:
+    // - EMPLOYEE can only see documents they uploaded (their own tasks/projects)
+    // - Admin/Manager/HR roles can see all matching documents
+    if (req.user?.role === 'EMPLOYEE' && req.user.id) {
+      where.uploadedBy = req.user.id;
     }
 
     const documents = await prisma.document.findMany({
@@ -113,16 +124,6 @@ export const getDocument = async (req: AuthRequest, res: Response): Promise<void
  */
 export const uploadDocument = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    // Employee role: Cannot upload documents (including company policies)
-    if (req.user?.role === 'EMPLOYEE') {
-      res.status(403).json({
-        success: false,
-        message: 'Access Denied: You do not have permission to create or edit this content. Please contact your manager.',
-        code: 'ACCESS_DENIED',
-      });
-      return;
-    }
-
     console.log('📄 Document upload request received');
     console.log('   User ID:', req.user?.id);
     console.log('   Has file:', !!req.file);

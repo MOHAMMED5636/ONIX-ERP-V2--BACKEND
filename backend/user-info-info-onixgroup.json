@@ -1,0 +1,21 @@
+﻿{
+  "id": "8b26bfee-2d5c-4549-8e6f-b6fa85855bfd",
+  "email": "info@onixgroup.ae",
+  "firstName": "PAULINE GOFFER",
+  "lastName": "PARAISO",
+  "role": "ADMIN",
+  "employeeId": "784199648348540",
+  "isActive": true,
+  "userAccount": true,
+  "department": "Customer Service",
+  "position": "Secretariat",
+  "jobTitle": "Secretariat",
+  "phone": "+971509058438",
+  "company": "ONIX ENGINEERING CONSULTANCY",
+  "companyLocation": "Dubai HQ",
+  "attendanceProgram": "DUBAI 08:00 to 06:30",
+  "joiningDate": "2025-11-01T00:00:00.000Z",
+  "exitDate": null,
+  "createdAt": "2026-04-20T08:47:04.347Z",
+  "updatedAt": "2026-04-20T08:47:04.347Z"
+}

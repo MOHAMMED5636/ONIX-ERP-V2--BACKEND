@@ -6,6 +6,8 @@ export const config = {
   port: process.env.PORT || 3001, // Default to 3001 for local development, Render uses 10000
   nodeEnv: process.env.NODE_ENV || 'development',
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:3000',
+  /** Base URL for links to uploaded files in emails (e.g. screenshots). */
+  apiPublicUrl: process.env.API_PUBLIC_URL || `http://localhost:${process.env.PORT || 3001}`,
   
   jwt: {
     secret: process.env.JWT_SECRET || 'default-secret-change-me',

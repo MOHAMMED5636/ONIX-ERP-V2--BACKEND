@@ -1,7 +1,7 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { DepartmentStatus } from '@prisma/client';
+import { DepartmentStatus, UserRole } from '@prisma/client';
 
 /**
  * Get all departments for a specific company
@@ -80,14 +80,41 @@ export const getCompanyDepartments = async (req: AuthRequest, res: Response): Pr
       prisma.department.count({ where }),
     ]);
 
+    // Align with Employee Directory: same role filter + isActive + User.company string matches Company.name
+    const employeeWhereBase = {
+      role: { notIn: [UserRole.ADMIN, UserRole.TENDER_ENGINEER] },
+      isActive: true,
+      company: { equals: company.name, mode: 'insensitive' as const },
+    };
+
+    const [companyActiveEmployeeTotal, ...perDeptCounts] = await Promise.all([
+      prisma.user.count({ where: employeeWhereBase }),
+      ...departments.map((dept) =>
+        prisma.user.count({
+          where: {
+            ...employeeWhereBase,
+            department: { equals: dept.name, mode: 'insensitive' },
+          },
+        })
+      ),
+    ]);
+
+    const enrichedDepartments = departments.map((dept, i) => ({
+      ...dept,
+      activeEmployeeCount: perDeptCounts[i],
+    }));
+
     res.json({
       success: true,
-      data: departments,
+      data: enrichedDepartments,
       pagination: {
         page: pageNum,
         limit: limitNum,
         total,
         totalPages: Math.ceil(total / limitNum),
+      },
+      companyEmployeeSummary: {
+        activeTotal: companyActiveEmployeeTotal,
       },
     });
   } catch (error) {

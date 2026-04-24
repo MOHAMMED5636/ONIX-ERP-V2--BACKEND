@@ -1,7 +1,16 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { CompanyStatus, LicenseStatus, Prisma } from '@prisma/client';
+import { CompanyStatus, LicenseStatus, Prisma, UserRole } from '@prisma/client';
+
+/** Active directory employees linked by User.company string matching Company.name (same as departments list). */
+function activeEmployeeWhereForCompanyName(companyName: string) {
+  return {
+    role: { notIn: [UserRole.ADMIN, UserRole.TENDER_ENGINEER] },
+    isActive: true,
+    company: { equals: companyName, mode: 'insensitive' as const },
+  };
+}
 
 /** Parse optional date from string or Date; returns null for empty/invalid. */
 function parseOptionalDate(value: unknown): Date | null {
@@ -73,9 +82,22 @@ export const getAllCompanies = async (req: AuthRequest, res: Response): Promise<
       prisma.company.count({ where }),
     ]);
 
+    const activeCounts = await Promise.all(
+      companies.map((c) =>
+        prisma.user.count({
+          where: activeEmployeeWhereForCompanyName(c.name),
+        })
+      )
+    );
+
+    const data = companies.map((c, i) => ({
+      ...c,
+      activeEmployeeCount: activeCounts[i],
+    }));
+
     res.json({
       success: true,
-      data: companies,
+      data,
       pagination: {
         page: pageNum,
         limit: limitNum,
@@ -108,6 +130,10 @@ export const getCompanyById = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
+    const activeEmployeeCount = await prisma.user.count({
+      where: activeEmployeeWhereForCompanyName(company.name),
+    });
+
     console.log(`✅ Company found: ${company.name}`);
     console.log(`📋 License fields:`, {
       licenseCategory: company.licenseCategory,
@@ -123,7 +149,7 @@ export const getCompanyById = async (req: AuthRequest, res: Response): Promise<v
 
     res.json({
       success: true,
-      data: company,
+      data: { ...company, activeEmployeeCount },
     });
   } catch (error) {
     console.error('Get company by ID error:', error);
@@ -782,9 +808,17 @@ export const getCompanyStats = async (req: AuthRequest, res: Response): Promise<
     const activeCompanies = await prisma.company.count({
       where: { status: CompanyStatus.ACTIVE }
     });
-    const totalEmployees = await prisma.company.aggregate({
-      _sum: { employees: true }
+    const allCompanyNames = await prisma.company.findMany({
+      select: { name: true },
     });
+    const perCompanyCounts = await Promise.all(
+      allCompanyNames.map((row) =>
+        prisma.user.count({
+          where: activeEmployeeWhereForCompanyName(row.name),
+        })
+      )
+    );
+    const totalEmployees = perCompanyCounts.reduce((sum, n) => sum + n, 0);
     const industries = await prisma.company.groupBy({
       by: ['industry'],
       _count: { id: true }
@@ -798,7 +832,7 @@ export const getCompanyStats = async (req: AuthRequest, res: Response): Promise<
       data: {
         totalCompanies,
         activeCompanies,
-        totalEmployees: totalEmployees._sum.employees || 0,
+        totalEmployees,
         industries: industries.length,
         activeLicenses,
       },

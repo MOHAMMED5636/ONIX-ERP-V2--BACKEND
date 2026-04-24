@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { computeNextProjectNumber } from '../utils/project-number';
 import { ContractStatus, UserRole } from '@prisma/client';
 
 // Generate unique reference number for contract
@@ -570,6 +571,7 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
 
     const userRole = req.user?.role;
     const userEmail = req.user?.email;
+    const forLoadOut = String((req.query as any)?.forLoadOut || '').toLowerCase() === 'true';
 
     const contract = await prisma.contract.findUnique({
       where: { id },
@@ -630,21 +632,42 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // STRICT ROLE-BASED ACCESS CONTROL
-    // ALL roles (including ADMIN/HR/PROJECT_MANAGER) should only see contracts assigned to them for Load Out
-    if (userRole === 'MANAGER' || userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
-      // Manager, Admin, HR, Project Manager: Can only access contracts assigned to their email OR ID
+    // Role-based access control:
+    // - ADMIN/HR/PROJECT_MANAGER: may view any contract (except in Load Out context)
+    // - MANAGER: may only view contracts assigned to them
+    // - EMPLOYEE: may only view contracts linked to projects where they have tasks
+    //
+    // For Load Out flows, enforce "assigned only" for all privileged roles too.
+    if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
+      if (forLoadOut) {
+        if (!userEmail || !req.user?.id) {
+          res.status(403).json({
+            success: false,
+            message: 'Access Denied: User email or ID not found in session',
+            code: 'ACCESS_DENIED',
+          });
+          return;
+        }
+        if (contract.assignedManagerEmail !== userEmail && contract.assignedManagerId !== req.user.id) {
+          res.status(403).json({
+            success: false,
+            message: 'Access Denied: You can only view contracts assigned to you',
+            code: 'ACCESS_DENIED',
+          });
+          return;
+        }
+      }
+      // Otherwise: allowed
+    } else if (userRole === 'MANAGER') {
       if (!userEmail || !req.user?.id) {
         res.status(403).json({
           success: false,
-          message: 'Access Denied: User email or ID not found in session',
+          message: 'Access Denied: Manager email or ID not found in session',
           code: 'ACCESS_DENIED',
         });
         return;
       }
-      // Check both assignedManagerEmail and assignedManagerId
-      if (contract.assignedManagerEmail !== userEmail && 
-          contract.assignedManagerId !== req.user.id) {
+      if (contract.assignedManagerEmail !== userEmail && contract.assignedManagerId !== req.user.id) {
         res.status(403).json({
           success: false,
           message: 'Access Denied: You can only view contracts assigned to you',
@@ -1529,8 +1552,8 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
     const userRole = req.user?.role;
     const userEmail = req.user?.email;
 
-    if (userRole === 'ADMIN') {
-      // Admin: Can update all contracts
+    if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
+      // Privileged roles: can update all contracts
     } else if (userRole === 'MANAGER') {
       // Manager: Can only update contracts assigned to their email OR ID
       if (!userEmail || !req.user?.id) {
@@ -2342,43 +2365,47 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
     }
 
     // Create project from contract data
-    const project = await prisma.project.create({
-      data: {
-        name: projectName,
-        referenceNumber: projectReferenceNumber,
-        pin: null, // Can be set later if needed
-        clientId: contract.clientId || null,
-        owner: contract.developerName || null,
-        description: contract.description || null,
-        status: 'OPEN', // Default status
-        projectManager: projectManager,
-        startDate: contract.startDate ? new Date(contract.startDate) : null,
-        endDate: contract.endDate ? new Date(contract.endDate) : null,
-        deadline: contract.endDate ? new Date(contract.endDate) : null, // Use end date as deadline
-        planDays: planDays,
-        remarks: contract.specialClauses || contract.termsAndConditions || null,
-        assigneeNotes: contract.paymentTerms || null,
-        // Location & Project Details from contract
-        location: locationString,
-        makaniNumber: contract.makaniNumber || null,
-        plotNumber: contract.plotNumber || null,
-        community: contract.community || null,
-        projectType: contract.contractType || null,
-        projectFloor: contract.numberOfFloors ? contract.numberOfFloors.toString() : null,
-        developerProject: contract.developerName || null,
-        createdBy: req.user?.id || null,
-      },
-      include: {
-        client: true,
-        contracts: {
-          select: {
-            id: true,
-            referenceNumber: true,
-            title: true,
+    const project = await prisma.$transaction(async (tx) => {
+      const projectNumber = await computeNextProjectNumber(tx as any);
+      return tx.project.create({
+        data: {
+          projectNumber,
+          name: projectName,
+          referenceNumber: projectReferenceNumber,
+          pin: null, // Can be set later if needed
+          clientId: contract.clientId || null,
+          owner: contract.developerName || null,
+          description: contract.description || null,
+          status: 'OPEN', // Default status
+          projectManager: projectManager,
+          startDate: contract.startDate ? new Date(contract.startDate) : null,
+          endDate: contract.endDate ? new Date(contract.endDate) : null,
+          deadline: contract.endDate ? new Date(contract.endDate) : null, // Use end date as deadline
+          planDays: planDays,
+          remarks: contract.specialClauses || contract.termsAndConditions || null,
+          assigneeNotes: contract.paymentTerms || null,
+          // Location & Project Details from contract
+          location: locationString,
+          makaniNumber: contract.makaniNumber || null,
+          plotNumber: contract.plotNumber || null,
+          community: contract.community || null,
+          projectType: contract.contractType || null,
+          projectFloor: contract.numberOfFloors ? contract.numberOfFloors.toString() : null,
+          developerProject: contract.developerName || null,
+          createdBy: req.user?.id || null,
+        },
+        include: {
+          client: true,
+          contracts: {
+            select: {
+              id: true,
+              referenceNumber: true,
+              title: true,
+            },
           },
         },
-      },
-    });
+      });
+    }, { isolationLevel: 'Serializable' as any });
 
     // Link contract to the created project
     await prisma.contract.update({
@@ -2631,35 +2658,39 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
         }
 
         // Create project from contract data
-        const project = await prisma.project.create({
-          data: {
-            name: projectName,
-            referenceNumber: projectReferenceNumber,
-            pin: null,
-            clientId: contract.clientId || null,
-            owner: contract.developerName || null,
-            description: contract.description || null,
-            status: 'OPEN', // Default status = Active
-            projectManager: projectManager,
-            startDate: contract.startDate ? new Date(contract.startDate) : null,
-            endDate: contract.endDate ? new Date(contract.endDate) : null,
-            deadline: contract.endDate ? new Date(contract.endDate) : null,
-            planDays: planDays,
-            remarks: contract.specialClauses || contract.termsAndConditions || null,
-            assigneeNotes: contract.paymentTerms || null,
-            location: locationString,
-            makaniNumber: contract.makaniNumber || null,
-            plotNumber: contract.plotNumber || null,
-            community: contract.community || null,
-            projectType: contract.contractType || null,
-            projectFloor: contract.numberOfFloors ? contract.numberOfFloors.toString() : null,
-            developerProject: contract.developerName || null,
-            createdBy: req.user?.id || null,
-          },
-          include: {
-            client: true,
-          },
-        });
+        const project = await prisma.$transaction(async (tx) => {
+          const projectNumber = await computeNextProjectNumber(tx as any);
+          return tx.project.create({
+            data: {
+              projectNumber,
+              name: projectName,
+              referenceNumber: projectReferenceNumber,
+              pin: null,
+              clientId: contract.clientId || null,
+              owner: contract.developerName || null,
+              description: contract.description || null,
+              status: 'OPEN', // Default status = Active
+              projectManager: projectManager,
+              startDate: contract.startDate ? new Date(contract.startDate) : null,
+              endDate: contract.endDate ? new Date(contract.endDate) : null,
+              deadline: contract.endDate ? new Date(contract.endDate) : null,
+              planDays: planDays,
+              remarks: contract.specialClauses || contract.termsAndConditions || null,
+              assigneeNotes: contract.paymentTerms || null,
+              location: locationString,
+              makaniNumber: contract.makaniNumber || null,
+              plotNumber: contract.plotNumber || null,
+              community: contract.community || null,
+              projectType: contract.contractType || null,
+              projectFloor: contract.numberOfFloors ? contract.numberOfFloors.toString() : null,
+              developerProject: contract.developerName || null,
+              createdBy: req.user?.id || null,
+            },
+            include: {
+              client: true,
+            },
+          });
+        }, { isolationLevel: 'Serializable' as any });
 
         // Link contract to the created project
         await prisma.contract.update({

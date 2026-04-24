@@ -1,7 +1,8 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { SubDepartmentStatus } from '@prisma/client';
+import { Prisma, SubDepartmentStatus } from '@prisma/client';
+import { parseSubDepartmentStatus } from '../utils/orgStructureStatus';
 
 /**
  * Get all sub-departments for a specific department
@@ -258,13 +259,16 @@ export const createDepartmentSubDepartment = async (req: AuthRequest, res: Respo
       }
     }
 
+    const statusParsed =
+      parseSubDepartmentStatus(status) ?? SubDepartmentStatus.ACTIVE;
+
     // Create sub-department
     const subDepartment = await prisma.subDepartment.create({
       data: {
         departmentId,
         name,
         description: description || null,
-        status: (status as SubDepartmentStatus) || SubDepartmentStatus.ACTIVE,
+        status: statusParsed,
         managerId: managerId || null,
         location: location || null,
         budget: budget || null,
@@ -344,35 +348,74 @@ export const updateSubDepartment = async (req: AuthRequest, res: Response): Prom
     }
 
     const { id } = req.params;
-    const updateData = req.body;
+    const body = req.body || {};
 
-    // Don't allow changing departmentId through update
-    if (updateData.departmentId) {
-      delete updateData.departmentId;
+    const data: Prisma.SubDepartmentUpdateInput = {};
+
+    if (typeof body.name === 'string') {
+      const trimmed = body.name.trim();
+      if (!trimmed) {
+        res.status(400).json({ success: false, message: 'Sub-department name cannot be empty' });
+        return;
+      }
+      data.name = trimmed;
     }
-
-    // Convert status enum if provided
-    if (updateData.status) {
-      updateData.status = updateData.status as SubDepartmentStatus;
+    if (body.description !== undefined) {
+      data.description =
+        body.description === null || body.description === ''
+          ? null
+          : String(body.description).trim() || null;
     }
-
-    // Verify manager exists if provided
-    if (updateData.managerId) {
-      const manager = await prisma.user.findUnique({
-        where: { id: updateData.managerId },
-      });
-      if (!manager) {
-        res.status(404).json({
+    if (body.status !== undefined) {
+      const s = parseSubDepartmentStatus(body.status);
+      if (!s) {
+        res.status(400).json({
           success: false,
-          message: 'Manager not found',
+          message: 'Invalid status. Use ACTIVE or INACTIVE.',
         });
         return;
       }
+      data.status = s;
+    }
+    if (body.location !== undefined) {
+      data.location =
+        body.location === null || body.location === ''
+          ? null
+          : String(body.location).trim() || null;
+    }
+    if (body.budget !== undefined) {
+      data.budget =
+        body.budget === null || body.budget === ''
+          ? null
+          : String(body.budget).trim() || null;
+    }
+    if (body.managerId !== undefined) {
+      const mid = body.managerId;
+      if (!mid) {
+        data.manager = { disconnect: true };
+      } else {
+        const manager = await prisma.user.findUnique({
+          where: { id: mid },
+        });
+        if (!manager) {
+          res.status(404).json({
+            success: false,
+            message: 'Manager not found',
+          });
+          return;
+        }
+        data.manager = { connect: { id: mid } };
+      }
+    }
+
+    if (Object.keys(data).length === 0) {
+      res.status(400).json({ success: false, message: 'No valid fields to update' });
+      return;
     }
 
     const subDepartment = await prisma.subDepartment.update({
       where: { id },
-      data: updateData,
+      data,
       include: {
         department: {
           select: {

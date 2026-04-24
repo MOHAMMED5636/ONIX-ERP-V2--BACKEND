@@ -2,22 +2,73 @@ import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { getPhotoUrl } from '../utils/photo.utils';
+import { labourDetailsToSelfServicePayroll } from '../utils/payroll.utils';
+import { shapeEmployeeForClient } from '../utils/employee-response';
+
+function parseBodyDate(v: unknown): Date | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null || v === '') return null;
+  const d = new Date(String(v));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function parseBodyInt(v: unknown): number | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null || v === '') return null;
+  const n = parseInt(String(v), 10);
+  return Number.isNaN(n) ? null : n;
+}
+
+function optionalString(v: unknown): string | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  const s = String(v).trim();
+  return s === '' ? null : s;
+}
 
 /**
- * Update user profile (photo and jobTitle)
+ * Update own profile (self-service). Sensitive fields (email, role, employeeId, etc.) are not accepted here.
  * PUT /api/auth/profile
- * Access: Authenticated users (can only update their own profile)
  */
 export const updateProfile = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
-    const { 
-      jobTitle, 
-      phone, 
+    const b = req.body;
+    const {
+      jobTitle,
+      phone,
       position,
       nationalIdNumber,
-      nationalIdExpiryDate
-    } = req.body;
+      nationalIdExpiryDate,
+      firstName,
+      lastName,
+      department,
+      company,
+      companyLocation,
+      employeeType,
+      joiningDate,
+      attendanceProgram,
+      gender,
+      maritalStatus,
+      nationality,
+      birthday,
+      childrenCount,
+      currentAddress,
+      phoneNumbers,
+      emailAddresses,
+      passportNumber,
+      passportIssueDate,
+      passportExpiryDate,
+      residencyNumber,
+      residencyExpiryDate,
+      visaNumber,
+      insuranceNumber,
+      insuranceExpiryDate,
+      labourIdNumber,
+      labourIdExpiryDate,
+      drivingLicenseNumber,
+      drivingLicenseExpiryDate,
+    } = b;
     
     // Debug: Log request details
     console.log('📸 Profile update request received');
@@ -26,6 +77,7 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
     console.log('   Phone:', phone);
     console.log('   Position:', position);
     console.log('   National ID Number:', nationalIdNumber);
+    console.log('   Body keys:', Object.keys(b || {}));
     console.log('   Has file:', !!(req as any).file);
     console.log('   Request headers:', {
       'content-type': req.headers['content-type'],
@@ -94,23 +146,100 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
       console.log('   ℹ️  No file uploaded in this request');
     }
 
-    // Build update data - allow employees to update their own profile fields
-    const updateData: any = {};
-    if (jobTitle !== undefined && jobTitle !== null) {
-      updateData.jobTitle = jobTitle;
+    const updateData: Record<string, unknown> = {};
+
+    if (firstName !== undefined) {
+      const t = String(firstName ?? '').trim();
+      if (t.length > 0) updateData.firstName = t;
     }
-    if (phone !== undefined && phone !== null) {
-      updateData.phone = phone;
+    if (lastName !== undefined) {
+      const t = String(lastName ?? '').trim();
+      if (t.length > 0) updateData.lastName = t;
     }
-    if (position !== undefined && position !== null) {
-      updateData.position = position;
+
+    if (jobTitle !== undefined) updateData.jobTitle = optionalString(jobTitle);
+    if (phone !== undefined) updateData.phone = optionalString(phone);
+    if (position !== undefined) updateData.position = optionalString(position);
+    if (department !== undefined) updateData.department = optionalString(department);
+    if (company !== undefined) updateData.company = optionalString(company);
+    if (companyLocation !== undefined) updateData.companyLocation = optionalString(companyLocation);
+    if (employeeType !== undefined) updateData.employeeType = optionalString(employeeType);
+    if (attendanceProgram !== undefined) updateData.attendanceProgram = optionalString(attendanceProgram);
+
+    if (nationalIdNumber !== undefined) updateData.nationalIdNumber = optionalString(nationalIdNumber);
+    if (gender !== undefined) updateData.gender = optionalString(gender);
+    if (maritalStatus !== undefined) updateData.maritalStatus = optionalString(maritalStatus);
+    if (nationality !== undefined) updateData.nationality = optionalString(nationality);
+    if (currentAddress !== undefined) updateData.currentAddress = optionalString(currentAddress);
+    if (passportNumber !== undefined) updateData.passportNumber = optionalString(passportNumber);
+    if (residencyNumber !== undefined) updateData.residencyNumber = optionalString(residencyNumber);
+    if (visaNumber !== undefined) updateData.visaNumber = optionalString(visaNumber);
+    if (insuranceNumber !== undefined) updateData.insuranceNumber = optionalString(insuranceNumber);
+    if (labourIdNumber !== undefined) updateData.labourIdNumber = optionalString(labourIdNumber);
+    if (drivingLicenseNumber !== undefined) updateData.drivingLicenseNumber = optionalString(drivingLicenseNumber);
+
+    const nidExp = parseBodyDate(nationalIdExpiryDate);
+    if (nidExp !== undefined) updateData.nationalIdExpiryDate = nidExp;
+    const bd = parseBodyDate(birthday);
+    if (bd !== undefined) updateData.birthday = bd;
+    const pid = parseBodyDate(passportIssueDate);
+    if (pid !== undefined) updateData.passportIssueDate = pid;
+    const pex = parseBodyDate(passportExpiryDate);
+    if (pex !== undefined) updateData.passportExpiryDate = pex;
+    const rex = parseBodyDate(residencyExpiryDate);
+    if (rex !== undefined) updateData.residencyExpiryDate = rex;
+    const iex = parseBodyDate(insuranceExpiryDate);
+    if (iex !== undefined) updateData.insuranceExpiryDate = iex;
+    const lex = parseBodyDate(labourIdExpiryDate);
+    if (lex !== undefined) updateData.labourIdExpiryDate = lex;
+    const dex = parseBodyDate(drivingLicenseExpiryDate);
+    if (dex !== undefined) updateData.drivingLicenseExpiryDate = dex;
+    const jd = parseBodyDate(joiningDate);
+    if (jd !== undefined) updateData.joiningDate = jd;
+
+    const cc = parseBodyInt(childrenCount);
+    if (cc !== undefined) updateData.childrenCount = cc;
+
+    if (phoneNumbers !== undefined) {
+      if (phoneNumbers === null || phoneNumbers === '') {
+        updateData.phoneNumbers = null;
+      } else if (typeof phoneNumbers === 'string') {
+        const raw = phoneNumbers.trim();
+        if (!raw) updateData.phoneNumbers = null;
+        else {
+          try {
+            JSON.parse(raw);
+            updateData.phoneNumbers = raw;
+          } catch {
+            const lines = raw.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+            updateData.phoneNumbers =
+              lines.length > 0
+                ? JSON.stringify(lines.map((value) => ({ type: 'phone', value, countryCode: '' })))
+                : null;
+          }
+        }
+      }
     }
-    if (nationalIdNumber !== undefined && nationalIdNumber !== null) {
-      updateData.nationalIdNumber = nationalIdNumber;
-    }
-    if (nationalIdExpiryDate !== undefined && nationalIdExpiryDate !== null) {
-      // Parse date string if provided
-      updateData.nationalIdExpiryDate = nationalIdExpiryDate ? new Date(nationalIdExpiryDate) : null;
+
+    if (emailAddresses !== undefined) {
+      if (emailAddresses === null || emailAddresses === '') {
+        updateData.emailAddresses = null;
+      } else if (typeof emailAddresses === 'string') {
+        const raw = emailAddresses.trim();
+        if (!raw) updateData.emailAddresses = null;
+        else {
+          try {
+            JSON.parse(raw);
+            updateData.emailAddresses = raw;
+          } catch {
+            const lines = raw.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+            updateData.emailAddresses =
+              lines.length > 0
+                ? JSON.stringify(lines.map((value) => ({ type: 'email', value })))
+                : null;
+          }
+        }
+      }
     }
     if (photoFilename) {
       updateData.photo = photoFilename;
@@ -167,7 +296,41 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
         employeeId: true,
         nationalIdNumber: true,
         nationalIdExpiryDate: true,
-      }
+        company: true,
+        companyLocation: true,
+        employeeType: true,
+        joiningDate: true,
+        attendanceProgram: true,
+        gender: true,
+        maritalStatus: true,
+        nationality: true,
+        birthday: true,
+        childrenCount: true,
+        currentAddress: true,
+        phoneNumbers: true,
+        emailAddresses: true,
+        passportNumber: true,
+        passportIssueDate: true,
+        passportExpiryDate: true,
+        residencyNumber: true,
+        residencyExpiryDate: true,
+        visaNumber: true,
+        insuranceNumber: true,
+        insuranceExpiryDate: true,
+        labourIdNumber: true,
+        labourIdExpiryDate: true,
+        drivingLicenseNumber: true,
+        drivingLicenseExpiryDate: true,
+        isLabour: true,
+        labourDetails: {
+          select: {
+            basicSalary: true,
+            contractTotalSalary: true,
+            allowance1: true,
+            allowance2: true,
+          },
+        },
+      },
     });
 
     if (!user) {
@@ -223,10 +386,12 @@ export const updateProfile = async (req: AuthRequest, res: Response): Promise<vo
     console.log('   ✅ Final photo URL:', photoUrl);
     console.log('   ✅ Photo filename in DB:', user.photo);
 
-    // Ensure photo URL is always included in response if photo was updated
+    const { labourDetails: profileLabour, ...userWithoutLabour } = user;
+    const shaped = shapeEmployeeForClient(userWithoutLabour as unknown as Record<string, unknown>, req);
     const responseData = {
-      ...user,
-      photo: photoUrl || user.photo || null, // Always return the constructed URL or existing photo
+      ...shaped,
+      photo: photoUrl || user.photo || null,
+      payroll: labourDetailsToSelfServicePayroll(profileLabour),
     };
 
     console.log('   ✅ Sending response:', {

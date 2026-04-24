@@ -1,7 +1,66 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { PositionStatus } from '@prisma/client';
+import { PositionStatus, Prisma } from '@prisma/client';
+import { parsePositionStatus } from '../utils/orgStructureStatus';
+
+/**
+ * List all positions (flat) for job title pickers and HR management.
+ * GET /api/positions
+ */
+export const getAllPositions = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { status } = req.query;
+    const where: Prisma.PositionWhereInput = {};
+    if (status && status !== 'all') {
+      where.status = status as PositionStatus;
+    }
+
+    const positions = await prisma.position.findMany({
+      where,
+      include: {
+        subDepartment: {
+          select: {
+            id: true,
+            name: true,
+            status: true,
+            department: {
+              select: {
+                id: true,
+                name: true,
+                status: true,
+                company: { select: { id: true, name: true } },
+              },
+            },
+          },
+        },
+      },
+      orderBy: [{ name: 'asc' }],
+    });
+
+    const data = positions.map((p) => {
+      const dept = p.subDepartment?.department?.name || '';
+      const sub = p.subDepartment?.name || '';
+      const company = p.subDepartment?.department?.company?.name || '';
+      const deptLabel = [company, dept, sub].filter(Boolean).join(' · ') || '—';
+      return {
+        id: p.id,
+        name: p.name,
+        title: p.name,
+        description: p.description,
+        status: p.status,
+        subDepartmentId: p.subDepartmentId,
+        departmentLabel: deptLabel,
+        subDepartment: p.subDepartment,
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Get all positions error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
 
 /**
  * Get all positions for a specific sub-department
@@ -244,13 +303,15 @@ export const createSubDepartmentPosition = async (req: AuthRequest, res: Respons
       }
     }
 
+    const statusParsed = parsePositionStatus(status) ?? PositionStatus.ACTIVE;
+
     // Create position
     const position = await prisma.position.create({
       data: {
         subDepartmentId,
         name,
         description: description || null,
-        status: (status as PositionStatus) || PositionStatus.ACTIVE,
+        status: statusParsed,
         managerId: managerId || null,
       },
       include: {
@@ -305,35 +366,70 @@ export const createSubDepartmentPosition = async (req: AuthRequest, res: Respons
 export const updatePosition = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
-    const updateData = req.body;
+    const body = req.body || {};
 
-    // Don't allow changing subDepartmentId through update
-    if (updateData.subDepartmentId) {
-      delete updateData.subDepartmentId;
+    const existing = await prisma.position.findUnique({ where: { id } });
+    if (!existing) {
+      res.status(404).json({ success: false, message: 'Position not found' });
+      return;
     }
 
-    // Convert status enum if provided
-    if (updateData.status) {
-      updateData.status = updateData.status as PositionStatus;
+    const data: Prisma.PositionUpdateInput = {};
+    if (typeof body.name === 'string') {
+      const trimmed = body.name.trim();
+      if (!trimmed) {
+        res.status(400).json({ success: false, message: 'Position name cannot be empty' });
+        return;
+      }
+      data.name = trimmed;
     }
-
-    // Verify manager exists if provided
-    if (updateData.managerId) {
-      const manager = await prisma.user.findUnique({
-        where: { id: updateData.managerId },
-      });
-      if (!manager) {
-        res.status(404).json({
+    if (body.description !== undefined) {
+      data.description =
+        body.description === null || body.description === ''
+          ? null
+          : String(body.description).trim() || null;
+    }
+    if (body.status !== undefined) {
+      const s = parsePositionStatus(body.status);
+      if (!s) {
+        res.status(400).json({
           success: false,
-          message: 'Manager not found',
+          message: 'Invalid status. Use ACTIVE or INACTIVE.',
         });
         return;
       }
+      data.status = s;
     }
+    if (body.managerId !== undefined) {
+      const mid = body.managerId;
+      if (!mid) {
+        data.manager = { disconnect: true };
+      } else {
+        const manager = await prisma.user.findUnique({
+          where: { id: mid },
+        });
+        if (!manager) {
+          res.status(404).json({
+            success: false,
+            message: 'Manager not found',
+          });
+          return;
+        }
+        data.manager = { connect: { id: mid } };
+      }
+    }
+
+    if (Object.keys(data).length === 0) {
+      res.status(400).json({ success: false, message: 'No valid fields to update' });
+      return;
+    }
+
+    const oldName = existing.name;
+    const newName = typeof data.name === 'string' ? data.name : oldName;
 
     const position = await prisma.position.update({
       where: { id },
-      data: updateData,
+      data,
       include: {
         subDepartment: {
           select: {
@@ -357,10 +453,31 @@ export const updatePosition = async (req: AuthRequest, res: Response): Promise<v
       },
     });
 
+    let employeesSynced = 0;
+    if (newName !== oldName) {
+      const [byJobTitle, byPosition] = await Promise.all([
+        prisma.user.updateMany({
+          where: { jobTitle: oldName },
+          data: { jobTitle: newName },
+        }),
+        prisma.user.updateMany({
+          where: { position: oldName },
+          data: { position: newName },
+        }),
+      ]);
+      employeesSynced = byJobTitle.count + byPosition.count;
+      if (employeesSynced > 0) {
+        console.log(
+          `[positions] Renamed "${oldName}" → "${newName}": synced ${byJobTitle.count} jobTitle, ${byPosition.count} position field(s)`
+        );
+      }
+    }
+
     res.json({
       success: true,
       message: 'Position updated successfully',
       data: position,
+      employeesJobTitleSynced: employeesSynced,
     });
   } catch (error) {
     console.error('Update position error:', error);

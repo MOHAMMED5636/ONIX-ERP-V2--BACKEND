@@ -5,7 +5,7 @@ import { config } from '../config/env';
 export interface AuthRequest extends Request {
   user?: {
     id: string;
-    email: string;
+    email?: string;
     role: string;
   };
   body: any;

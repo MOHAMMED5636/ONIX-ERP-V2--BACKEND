@@ -12,7 +12,6 @@ router.use(authenticate);
 // Upload routes must come before /:id routes to avoid conflicts
 // Upload a new document - support both /upload and root POST
 // Accept both 'file' and 'document' field names
-// Employees CANNOT create/upload documents (company policies)
 const uploadMiddleware = (req: any, res: any, next: any) => {
   upload.fields([
     { name: 'file', maxCount: 1 },
@@ -33,8 +32,10 @@ const uploadMiddleware = (req: any, res: any, next: any) => {
   });
 };
 
-router.post('/upload', requirePermission(ResourceType.DOCUMENT, PermissionAction.CREATE), uploadMiddleware, documentsController.uploadDocument);
-router.post('/', requirePermission(ResourceType.DOCUMENT, PermissionAction.CREATE), uploadMiddleware, documentsController.uploadDocument);
+// Allow all authenticated users (including EMPLOYEE) to upload documents.
+// Access control is handled inside the controller and by visibility rules.
+router.post('/upload', uploadMiddleware, documentsController.uploadDocument);
+router.post('/', uploadMiddleware, documentsController.uploadDocument);
 
 // List all documents - Employees can VIEW documents
 router.get('/', documentsController.listDocuments);

@@ -62,9 +62,9 @@ router.post('/change-password', authenticate, passwordController.changePassword)
 router.post('/reset-password/:userId', authenticate, requireRole('ADMIN', 'HR'), passwordController.resetPassword);
 router.post('/admin/set-password', authenticate, requireRole('ADMIN'), passwordController.setPassword);
 
-// Organization preferences (Admin Profile). Read: any authenticated; Update: Admin only.
+// Organization preferences (Admin Profile). Read/Update: any authenticated user.
 router.get('/preferences', authenticate, preferencesController.getPreferences);
-router.patch('/preferences', authenticate, requireRole('ADMIN'), preferencesController.updatePreferences);
+router.patch('/preferences', authenticate, preferencesController.updatePreferences);
 
 export default router;
 

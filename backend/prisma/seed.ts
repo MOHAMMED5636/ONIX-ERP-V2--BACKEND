@@ -52,20 +52,17 @@ async function main() {
   });
   console.log('✅ Created Anas Ali tender engineer:', anas.email);
 
-  // Create Kaddour user
-  const kaddourPassword = await bcrypt.hash('kadoour123', 10);
-  const kaddour = await prisma.user.upsert({
+  // Kaddour account removed from seed — disable ERP access if row still exists (legacy DBs).
+  const kaddourDisabled = await prisma.user.updateMany({
     where: { email: 'kaddour@onixgroup.ae' },
-    update: {},
-    create: {
-      email: 'kaddour@onixgroup.ae',
-      password: kaddourPassword,
-      firstName: 'Kaddour',
-      lastName: 'User',
-      role: 'ADMIN',
+    data: {
+      isActive: false,
+      userAccount: false,
     },
   });
-  console.log('✅ Created Kaddour user:', kaddour.email);
+  if (kaddourDisabled.count > 0) {
+    console.log('✅ Disabled ERP login for kaddour@onixgroup.ae (legacy row)');
+  }
 
   // Create Ramiz user
   const ramizPassword = await bcrypt.hash('ramiz@123', 10);

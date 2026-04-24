@@ -1,22 +1,80 @@
 import { Request, Response } from 'express';
 import prisma from '../config/database';
+import {
+  mainTaskVisibleToEmployeeInProject,
+  taskRowInvolvesEmployee,
+} from '../utils/employee-task-involvement';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { ProjectStatus, TaskStatus, TaskPriority } from '@prisma/client';
+import {
+  computeTaskPermissions,
+} from '../utils/task-permissions';
+import { unlockDependentsWaitingOnFinishedPredecessor } from '../utils/task-predecessor-unlock';
+import { computeNextProjectNumber } from '../utils/project-number';
+
+function looksLikeUuid(v: unknown): v is string {
+  if (typeof v !== 'string') return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
+}
+
+async function resolveAssigneeUserId(raw: any): Promise<string | null> {
+  if (!raw) return null;
+  if (looksLikeUuid(raw)) return raw;
+  if (typeof raw !== 'string') return null;
+
+  const s = raw.trim();
+  if (!s) return null;
+
+  // Email
+  if (s.includes('@')) {
+    const u = await prisma.user.findUnique({ where: { email: s }, select: { id: true } });
+    return u?.id ?? null;
+  }
+
+  // "First Last" name
+  const parts = s.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    const firstName = parts[0];
+    const lastName = parts.slice(1).join(' ');
+    const u = await prisma.user.findFirst({
+      where: {
+        firstName: { equals: firstName, mode: 'insensitive' },
+        lastName: { equals: lastName, mode: 'insensitive' },
+      },
+      select: { id: true },
+    });
+    return u?.id ?? null;
+  }
+
+  return null;
+}
 
 // Helper function to map frontend status to TaskStatus enum
 function mapStatusToTaskStatus(status: string): TaskStatus {
+  if (status == null || typeof status !== 'string') {
+    return TaskStatus.PENDING;
+  }
+  const s = status.trim().toLowerCase();
   const statusMap: Record<string, TaskStatus> = {
     'not started': TaskStatus.PENDING,
-    'pending': TaskStatus.PENDING,
-    'working': TaskStatus.IN_PROGRESS,
+    pending: TaskStatus.PENDING,
+    working: TaskStatus.IN_PROGRESS,
     'in progress': TaskStatus.IN_PROGRESS,
-    'done': TaskStatus.COMPLETED,
-    'completed': TaskStatus.COMPLETED,
-    'stuck': TaskStatus.ON_HOLD,
-    'cancelled': TaskStatus.CANCELLED,
-    'suspended': TaskStatus.ON_HOLD,
+    done: TaskStatus.COMPLETED,
+    completed: TaskStatus.COMPLETED,
+    stuck: TaskStatus.ON_HOLD,
+    cancelled: TaskStatus.CANCELLED,
+    suspended: TaskStatus.ON_HOLD,
   };
-  return statusMap[status?.toLowerCase()] || TaskStatus.PENDING;
+  if (statusMap[s]) {
+    return statusMap[s];
+  }
+  // UI pills like "Done - Open Next Phase", "Done - Spec Next Phase" must count as completed
+  // so dependents unlock (previously fell through to PENDING and never triggered unlock).
+  if (s.startsWith('done')) {
+    return TaskStatus.COMPLETED;
+  }
+  return TaskStatus.PENDING;
 }
 
 // Helper function to map frontend priority to TaskPriority enum
@@ -47,7 +105,9 @@ async function saveChildSubtasks(
   projectId: string,
   childSubtasks: any[],
   createdById?: string | null,
-  projectDefaults?: ProjectLocationDefaults | null
+  projectDefaults?: ProjectLocationDefaults | null,
+  currentUserId?: string | null,
+  currentUserRole?: string | null,
 ): Promise<void> {
   if (!childSubtasks || !Array.isArray(childSubtasks) || childSubtasks.length === 0) {
     return;
@@ -57,7 +117,14 @@ async function saveChildSubtasks(
 
   // Get existing child subtasks and parent task (for inheriting location fields)
   const [existingChildSubtasks, parentTask] = await Promise.all([
-    prisma.task.findMany({ where: { parentTaskId, projectId } }),
+    prisma.task.findMany({
+      where: { parentTaskId, projectId },
+      include: {
+        assignments: {
+          select: { employeeId: true },
+        },
+      },
+    }),
     prisma.task.findUnique({ where: { id: parentTaskId }, select: { location: true, makaniNumber: true, plotNumber: true, community: true, projectType: true, projectFloor: true, developerProject: true } }),
   ]);
 
@@ -78,7 +145,16 @@ async function saveChildSubtasks(
   // IMPORTANT: Only delete if the child task ID is explicitly missing from incoming list
   // This prevents deletion when frontend sends child tasks without IDs due to assignment changes
   const childSubtasksToDelete = existingChildSubtasks.filter(cst => {
-    const shouldDelete = !incomingChildIds.has(cst.id);
+    let shouldDelete = !incomingChildIds.has(cst.id);
+
+    // EMPLOYEE rule: Only the creator of a child task can delete it via this helper.
+    if (shouldDelete && currentUserRole === 'EMPLOYEE' && currentUserId) {
+      if (cst.createdBy !== currentUserId) {
+        console.log(`⛔ Skipping delete of child task ${cst.id} by non-creator employee ${currentUserId}`);
+        shouldDelete = false;
+      }
+    }
+
     if (shouldDelete) {
       console.log(`🗑️ Marking child task ${cst.id} for deletion (not in incoming list)`);
     }
@@ -114,10 +190,11 @@ async function saveChildSubtasks(
       : null;
     
     // Extract assigned employee ID - handle various field names
-    const assignedEmpId = childSubtask.assignedEmployeeId 
+    const assignedEmpRaw = childSubtask.assignedEmployeeId 
       ?? childSubtask.assignedEmployee 
       ?? childSubtask.assignedTo
       ?? null;
+    const assignedEmpId = await resolveAssigneeUserId(assignedEmpRaw);
     
     console.log(`📝 Processing child task: id=${childTaskId || 'NEW'}, title=${childTitle}, assignedEmployeeId=${assignedEmpId || 'NONE'}`);
     
@@ -148,6 +225,15 @@ async function saveChildSubtasks(
     if (childSubtask.predecessors !== undefined) {
       childSubtaskData.predecessors = (childSubtask.predecessors != null && String(childSubtask.predecessors).trim() !== '') ? String(childSubtask.predecessors).trim() : null;
     }
+    // Normalized predecessor link (strict sequencing)
+    if (childSubtask.predecessorId !== undefined) {
+      childSubtaskData.predecessorId = childSubtask.predecessorId || null;
+    }
+    // Keep workflowStatus aligned with predecessor lock state
+    childSubtaskData.workflowStatus =
+      childSubtaskData.status === TaskStatus.COMPLETED
+        ? 'COMPLETED'
+        : (childSubtaskData.predecessorId ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED');
 
     // Handle timeline/dates
     if (childSubtask.timeline && Array.isArray(childSubtask.timeline) && childSubtask.timeline.length >= 2) {
@@ -179,15 +265,56 @@ async function saveChildSubtasks(
     if (childTaskExists && childTaskId) {
       // Update existing child subtask - preserve ID and createdBy (never overwrite creator)
       const existingOne = existingChildSubtasks.find((c: any) => c.id === childTaskId);
-      const updateData = { ...childSubtaskData, createdBy: existingOne?.createdBy ?? childSubtaskData.createdBy };
+
+      // Permission model: use central helper so assignees (e.g. Khalid) can only
+      // change remarks / assignee notes / attachments on child tasks created
+      // by someone else (e.g. Ajmal).
+      let updateData: any = {};
+
+      if (currentUserId && currentUserRole) {
+        const perms = computeTaskPermissions({
+          user: { id: currentUserId, role: currentUserRole as any },
+          task: existingOne as any,
+        });
+
+        // No permission at all → skip silently
+        if (!perms.canEditAssigneeFields && !perms.canEditMainFields) {
+          console.log(
+            `⛔ Skipping update of child task ${childTaskId} by unauthorised user ${currentUserId}`,
+          );
+          continue;
+        }
+
+        if (perms.canEditMainFields) {
+          // Creator / manager / admin / HR – full update
+          updateData = {
+            ...childSubtaskData,
+            createdBy: existingOne?.createdBy ?? childSubtaskData.createdBy,
+          };
+        } else if (perms.canEditAssigneeFields) {
+          // Pure assignee – may only change status, remarks and assigneeNotes
+          updateData = {
+            status: childSubtaskData.status,
+            workflowStatus: childSubtaskData.workflowStatus,
+            remarks: childSubtaskData.remarks,
+            assigneeNotes: childSubtaskData.assigneeNotes,
+          };
+        }
+      } else {
+        // Fallback (no current user context) – preserve previous behaviour
+        updateData = {
+          ...childSubtaskData,
+          createdBy: existingOne?.createdBy ?? childSubtaskData.createdBy,
+        };
+      }
+
       console.log(`🔄 Updating existing child task ${childTaskId}: ${childSubtaskData.title}`);
-      console.log(`   Previous assignedEmployeeId: ${existingOne?.assignedEmployeeId || 'NONE'}`);
-      console.log(`   New assignedEmployeeId: ${childSubtaskData.assignedEmployeeId || 'NONE'}`);
       try {
         await prisma.task.update({
           where: { id: childTaskId },
           data: updateData,
         });
+        await unlockDependentsWaitingOnFinishedPredecessor(prisma, childTaskId);
         childUpdatedCount++;
         console.log(`✅ Successfully updated child task ${childTaskId} with new assignment`);
       } catch (updateError: any) {
@@ -232,8 +359,10 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
       employeeId: employeeIdQuery,
       page = '1',
       limit = '10',
-      sortBy = 'createdAt',
-      sortOrder = 'desc'
+      // Default ordering should be stable for hierarchical auto-numbering in UI.
+      // Using createdAt desc makes the newest project appear as "1" and shifts others.
+      sortBy = 'projectNumber',
+      sortOrder = 'asc'
     } = req.query;
 
     const pageNum = parseInt(page as string, 10);
@@ -277,13 +406,7 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
     if (effectiveEmployeeId) {
       // Task-based project list for this employee (same logic as EMPLOYEE branch)
       const employeeTasks = await prisma.task.findMany({
-        where: {
-          OR: [
-            { assignedEmployeeId: effectiveEmployeeId },
-            { assignments: { some: { employeeId: effectiveEmployeeId } } },
-            { createdBy: effectiveEmployeeId },
-          ],
-        },
+        where: taskRowInvolvesEmployee(effectiveEmployeeId),
         select: { projectId: true },
         distinct: ['projectId'],
       });
@@ -380,13 +503,7 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
         // Instead of a very deep OR tree, derive the list of project IDs
         // from tasks that are actually assigned to (or created by) this user.
         const employeeTasks = await prisma.task.findMany({
-          where: {
-            OR: [
-              { assignedEmployeeId: req.user.id },
-              { assignments: { some: { employeeId: req.user.id } } },
-              { createdBy: req.user.id },
-            ],
-          },
+          where: taskRowInvolvesEmployee(req.user.id),
           select: {
             projectId: true,
           },
@@ -460,6 +577,7 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
         select: {
           // Include all base fields including projectManager
           id: true,
+          projectNumber: true,
           name: true,
           referenceNumber: true,
           pin: true,
@@ -545,21 +663,9 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
             where: {
               parentTaskId: null, // Only parent-level tasks (main tasks)
               // When taskViewerId is set (EMPLOYEE or ?employeeId=): only main tasks visible to that employee
-              ...(taskViewerId ? {
-                OR: [
-                  { assignedEmployeeId: taskViewerId },
-                  { createdBy: taskViewerId },
-                  { assignments: { some: { employeeId: taskViewerId } } },
-                  { subtasks: { some: { assignedEmployeeId: taskViewerId } } },
-                  { subtasks: { some: { assignments: { some: { employeeId: taskViewerId } } } } },
-                  { subtasks: { some: { assignedEmployeeId: null, createdBy: taskViewerId } } },
-                  { subtasks: { some: { createdBy: taskViewerId } } },
-                  { subtasks: { some: { subtasks: { some: { assignedEmployeeId: taskViewerId } } } } },
-                  { subtasks: { some: { subtasks: { some: { assignments: { some: { employeeId: taskViewerId } } } } } } },
-                  { subtasks: { some: { subtasks: { some: { assignedEmployeeId: null, createdBy: taskViewerId } } } } },
-                  { subtasks: { some: { subtasks: { some: { createdBy: taskViewerId } } } } },
-                ],
-              } : {}),
+              ...(taskViewerId
+                ? { OR: mainTaskVisibleToEmployeeInProject(taskViewerId) }
+                : {}),
             },
             select: {
               id: true,
@@ -577,8 +683,6 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               assignedEmployeeId: true,
               createdBy: true,
               predecessors: true,
-              predecessorId: true,
-              workflowStatus: true,
               assignedEmployee: {
                 select: {
                   id: true,
@@ -617,8 +721,6 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
                   createdAt: true,
                   createdBy: true,
                   predecessors: true,
-                  predecessorId: true,
-                  workflowStatus: true,
                   assignedEmployee: {
                     select: {
                       id: true,
@@ -656,8 +758,6 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
                       createdAt: true,
                       createdBy: true,
                       predecessors: true,
-                      predecessorId: true,
-                      workflowStatus: true,
                       assignedEmployee: {
                         select: {
                           id: true,
@@ -959,10 +1059,17 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
           return;
         }
       } else {
-        // Employee: Can only see assigned projects
-        const isAssigned = projectWithRelations.assignedEmployees?.some((a: { employeeId: string }) => a.employeeId === req.user!.id);
-        const hasTasks = projectWithRelations.tasks?.some((task: any) => task.assignedEmployeeId === req.user!.id);
-        if (!isAssigned && !hasTasks) {
+        // Employee: project assignment, or any task/subtask row (incl. delegation) in this project
+        const isAssigned = projectWithRelations.assignedEmployees?.some(
+          (a: { employeeId: string }) => a.employeeId === req.user!.id
+        );
+        const involvedInProject = await prisma.task.findFirst({
+          where: {
+            AND: [{ projectId: id }, taskRowInvolvesEmployee(req.user!.id)],
+          },
+          select: { id: true },
+        });
+        if (!isAssigned && !involvedInProject) {
           res.status(403).json({ success: false, message: 'You do not have access to this project' });
           return;
         }
@@ -1175,54 +1282,61 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
       : null;
 
     // Create project
-    const project = await prisma.project.create({
-      data: {
-        name: finalName,
-        referenceNumber,
-        pin: pin || null,
-        clientId: finalClientId || null,
-        owner: owner || null,
-        description: finalDescription || null,
-        status: projectStatus,  // Use enum value, not string
-        projectManager: projectManagerText, // Plain text string
-        startDate: finalStartDate ? new Date(finalStartDate) : null,
-        endDate: finalEndDate ? new Date(finalEndDate) : null,
-        deadline: deadline ? new Date(deadline) : null,
-        planDays: planDays ? parseInt(planDays, 10) : null,
-        remarks: remarks || null,
-        assigneeNotes: assigneeNotes || null,
-        // Location & Project Details
-        location: finalLocation || null,
-        makaniNumber: finalMakaniNumber || null,
-        plotNumber: finalPlotNumber || null,
-        community: finalCommunity || null,
-        projectType: finalProjectType || null,
-        projectFloor: finalProjectFloor || null,
-        developerProject: finalDeveloperProject || null,
-        createdBy: req.user?.id || null,
-        assignedEmployees: employeeIds && employeeIds.length > 0 ? {
-          create: employeeIds.map((employeeId: string) => ({
-            employeeId,
-            assignedBy: req.user?.id || null,
-          })),
-        } : undefined,
-      },
-      include: {
-        client: true,
-        assignedEmployees: {
-          include: {
-            employee: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-                email: true,
+    const project = await prisma.$transaction(async (tx) => {
+      const projectNumber = await computeNextProjectNumber(tx as any);
+      return tx.project.create({
+        data: {
+          projectNumber,
+          name: finalName,
+          referenceNumber,
+          pin: pin || null,
+          clientId: finalClientId || null,
+          owner: owner || null,
+          description: finalDescription || null,
+          status: projectStatus, // Use enum value, not string
+          projectManager: projectManagerText, // Plain text string
+          startDate: finalStartDate ? new Date(finalStartDate) : null,
+          endDate: finalEndDate ? new Date(finalEndDate) : null,
+          deadline: deadline ? new Date(deadline) : null,
+          planDays: planDays ? parseInt(planDays, 10) : null,
+          remarks: remarks || null,
+          assigneeNotes: assigneeNotes || null,
+          // Location & Project Details
+          location: finalLocation || null,
+          makaniNumber: finalMakaniNumber || null,
+          plotNumber: finalPlotNumber || null,
+          community: finalCommunity || null,
+          projectType: finalProjectType || null,
+          projectFloor: finalProjectFloor || null,
+          developerProject: finalDeveloperProject || null,
+          createdBy: req.user?.id || null,
+          assignedEmployees:
+            employeeIds && employeeIds.length > 0
+              ? {
+                  create: employeeIds.map((employeeId: string) => ({
+                    employeeId,
+                    assignedBy: req.user?.id || null,
+                  })),
+                }
+              : undefined,
+        },
+        include: {
+          client: true,
+          assignedEmployees: {
+            include: {
+              employee: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  email: true,
+                },
               },
             },
           },
         },
-      },
-    });
+      });
+    }, { isolationLevel: 'Serializable' as any });
 
     // Link contract to project if contract reference was provided
     if (contractId && contractData) {
@@ -1248,7 +1362,7 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
     // Verify the project was saved correctly
     const verifyProject = await prisma.project.findUnique({
       where: { id: project.id },
-      select: { id: true, name: true, status: true, referenceNumber: true }
+      select: { id: true, projectNumber: true, name: true, status: true, referenceNumber: true }
     });
     console.log(`   Verified in DB:`, verifyProject);
 
@@ -1297,6 +1411,9 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
   console.log('👤 User:', req.user?.email, 'Role:', req.user?.role);
   const body = req.body as Record<string, unknown>;
   console.log('📥 updateProject body keys:', body ? Object.keys(body) : []);
+  if (body && (body as any).projectNumber !== undefined) {
+    console.warn('⚠️ Ignoring attempt to update projectNumber (immutable).');
+  }
   if (body && (body.name !== undefined || body.projectName !== undefined || body.title !== undefined)) {
     console.log('📥 updateProject name-related:', { name: body.name, projectName: body.projectName, title: body.title });
   }
@@ -1510,13 +1627,17 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
               projectFloor: projectWithTasks.projectFloor ?? null,
               developerProject: projectWithTasks.developerProject ?? null,
             };
-            if (level2Parent) {
-              await saveChildSubtasks(parentSubtaskId, id, parentSubtask.childSubtasks, req.user?.id ?? null, projectDefaults);
-              console.log(`📥 Add-child-only: saved new level-3 child "${nameStr}" under parent ${parentSubtaskId}`);
-            } else {
-              subtasksToSave = built;
-              console.log(`📥 Add-child-only: merged new child "${nameStr}" into main task ${parentSubtaskId} (will save with full tree)`);
-            }
+            // Always persist new child tasks directly via helper.
+            await saveChildSubtasks(
+              parentSubtaskId,
+              id,
+              parentSubtask.childSubtasks,
+              req.user?.id ?? null,
+              projectDefaults,
+              req.user?.id ?? null,
+              req.user?.role ?? null,
+            );
+            console.log(`📥 Add-child-only: saved new child "${nameStr}" under parent ${parentSubtaskId}`);
           }
         } else {
           console.warn(`⚠️ Add-child-only: parentSubtaskId ${parentSubtaskId} not found in project task tree`);
@@ -1685,6 +1806,11 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
         };
         const existingSubtasks = await prisma.task.findMany({
           where: subtaskWhereClause,
+          include: {
+            assignments: {
+              select: { employeeId: true },
+            },
+          },
         });
 
         const existingSubtaskIds = new Set(existingSubtasks.map(st => st.id));
@@ -1737,6 +1863,7 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             developerProject: subtask.developerProject ?? projectDefaults.developerProject ?? null,
             description: subtask.description || subtask.remarks || null,
             tags: Array.isArray(subtask.tags) ? subtask.tags : [],
+            taskOrder: subtask.taskOrder != null ? parseInt(String(subtask.taskOrder), 10) : null,
           };
 
           // Only set assignedEmployeeId when the payload explicitly provides an assignee.
@@ -1753,7 +1880,8 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             null;
           const isExistingSubtask = subtask.id && existingSubtaskIds.has(subtask.id);
           if (assigneeInPayload && payloadAssignee) {
-            subtaskData.assignedEmployeeId = payloadAssignee;
+            const resolvedAssigneeId = await resolveAssigneeUserId(payloadAssignee);
+            subtaskData.assignedEmployeeId = resolvedAssigneeId;
           } else if (assigneeInPayload && payloadAssignee === null && !isExistingSubtask) {
             subtaskData.assignedEmployeeId = null;
           }
@@ -1766,6 +1894,15 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
                 ? String(subtask.predecessors).trim()
                 : null;
           }
+          // Normalized predecessor link (strict sequencing)
+          if (subtask.predecessorId !== undefined) {
+            subtaskData.predecessorId = subtask.predecessorId || null;
+          }
+          // Keep workflowStatus aligned with predecessor lock state
+          subtaskData.workflowStatus =
+            subtaskData.status === TaskStatus.COMPLETED
+              ? 'COMPLETED'
+              : (subtaskData.predecessorId ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED');
 
           // Handle timeline/dates
           if (subtask.timeline && Array.isArray(subtask.timeline) && subtask.timeline.length >= 2) {
@@ -1777,12 +1914,51 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
           }
 
           if (subtask.id && existingSubtaskIds.has(subtask.id)) {
-            // Update existing subtask
+            // Update existing subtask with permission‑aware logic:
+            // - managers/admin/HR/creator can edit all fields
+            // - assignees (e.g. Khalid on a row created by Ajmal) can only edit
+            //   remarks and assigneeNotes from the main table.
+            const existingOne = existingSubtasks.find(
+              (st: any) => st.id === subtask.id,
+            );
+
+            let updateData: any = {};
+
+            if (req.user?.id && req.user.role) {
+              const perms = computeTaskPermissions({
+                user: { id: req.user.id, role: req.user.role as any },
+                task: existingOne as any,
+              });
+
+              if (!perms.canEditAssigneeFields && !perms.canEditMainFields) {
+                console.log(
+                  `⛔ Skipping update of subtask ${subtask.id} by unauthorised user ${req.user.id}`,
+                );
+                continue;
+              }
+
+              if (perms.canEditMainFields) {
+                updateData = subtaskData;
+              } else if (perms.canEditAssigneeFields) {
+                // Assignee can change status + remarks/notes only
+                updateData = {
+                  status: subtaskData.status,
+                  workflowStatus: subtaskData.workflowStatus,
+                  remarks: subtaskData.remarks,
+                  assigneeNotes: subtaskData.assigneeNotes,
+                };
+              }
+            } else {
+              // Fallback: preserve previous behaviour if no user context
+              updateData = subtaskData;
+            }
+
             console.log(`🔄 Updating subtask ${subtask.id}: ${subtaskData.title}`);
             await prisma.task.update({
               where: { id: subtask.id },
-              data: subtaskData,
+              data: updateData,
             });
+            await unlockDependentsWaitingOnFinishedPredecessor(prisma, subtask.id);
             updatedCount++;
           } else {
             // Create new subtask
@@ -1795,7 +1971,15 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
 
             // Save child subtasks for this subtask
             if (subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0) {
-              await saveChildSubtasks(newSubtask.id, id, subtask.childSubtasks, req.user?.id, projectDefaults);
+              await saveChildSubtasks(
+                newSubtask.id,
+                id,
+                subtask.childSubtasks,
+                req.user?.id,
+                projectDefaults,
+                req.user?.id ?? null,
+                req.user?.role ?? null,
+              );
             }
           }
         }
@@ -1848,7 +2032,15 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             if (subtaskId) {
               try {
                 console.log(`💾 Calling saveChildSubtasks for parent ${subtaskId} with ${subtask.childSubtasks.length} children`);
-                await saveChildSubtasks(subtaskId, id, subtask.childSubtasks, req.user?.id, projectDefaults);
+                await saveChildSubtasks(
+                  subtaskId,
+                  id,
+                  subtask.childSubtasks,
+                  req.user?.id,
+                  projectDefaults,
+                  req.user?.id ?? null,
+                  req.user?.role ?? null,
+                );
                 console.log(`✅ Successfully saved child tasks for subtask ${subtaskId}`);
               } catch (childError: any) {
                 console.error(`❌ Error saving child tasks for subtask ${subtaskId}:`, childError);
@@ -2062,7 +2254,7 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       const { id } = req.params;
       fallbackProject = await prisma.project.findUnique({
         where: { id },
-        select: { id: true, name: true, referenceNumber: true, status: true, createdAt: true, updatedAt: true },
+        select: { id: true, projectNumber: true, name: true, referenceNumber: true, status: true, createdAt: true, updatedAt: true },
       });
     } catch (_) {
       // ignore
@@ -2101,7 +2293,7 @@ export const updateProjectName = async (req: AuthRequest, res: Response): Promis
     const updated = await prisma.project.update({
       where: { id },
       data: { name },
-      select: { id: true, name: true, referenceNumber: true },
+      select: { id: true, projectNumber: true, name: true, referenceNumber: true },
     });
     console.log(`📝 Project name updated: ${id} -> "${updated.name}"`);
     res.json({

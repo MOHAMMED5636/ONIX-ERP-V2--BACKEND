@@ -1,6 +1,55 @@
 import { Request, Response } from 'express';
 import prisma from '../config/database';
+import { taskRowInvolvesEmployee } from '../utils/employee-task-involvement';
+import { unlockDependentsWaitingOnFinishedPredecessor } from '../utils/task-predecessor-unlock';
 import { AuthRequest } from '../middleware/auth.middleware';
+import {
+  computeTaskPermissions,
+  hasMainFieldChanges,
+} from '../utils/task-permissions';
+
+// Reusable lock helper for predecessor‑based workflow
+async function checkTaskLock(taskId: string) {
+  const task = await prisma.task.findUnique({
+    where: { id: taskId },
+    select: {
+      id: true,
+      status: true,
+      workflowStatus: true,
+      predecessorId: true,
+      predecessor: {
+        select: {
+          id: true,
+          title: true,
+          status: true,
+          workflowStatus: true,
+        },
+      },
+    },
+  });
+
+  if (!task) {
+    return { locked: false, reason: null as string | null, task: null as any };
+  }
+
+  if (!task.predecessorId || !task.predecessor) {
+    return { locked: false, reason: null, task };
+  }
+
+  const predecessorDone =
+    task.predecessor.status === 'COMPLETED' ||
+    task.predecessor.workflowStatus === 'COMPLETED';
+
+  if (!predecessorDone) {
+    return {
+      locked: true,
+      reason: 'Task is locked until predecessor is completed',
+      task,
+    };
+  }
+
+  return { locked: false, reason: null, task };
+}
 
 // Get all tasks with filters
 export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -66,10 +115,16 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
       ? [
           // Main task assignments (via TaskAssignment table)
           { assignments: { some: { employeeId: filterByEmployeeId } } },
+
+          // Tasks directly assigned via assignedEmployeeId (root or sub)
+          { assignedEmployeeId: filterByEmployeeId },
+
           // Direct subtask assignments (via assignedEmployeeId)
           { subtasks: { some: { assignedEmployeeId: filterByEmployeeId } } },
+
           // Nested child subtask assignments (2 levels deep)
           { subtasks: { some: { subtasks: { some: { assignedEmployeeId: filterByEmployeeId } } } } },
+
           // Tasks where user delegated a subtask (still visible as "Delegated")
           { subtasks: { some: { delegations: { some: { originalAssigneeId: filterByEmployeeId } } } } },
           { subtasks: { some: { subtasks: { some: { delegations: { some: { originalAssigneeId: filterByEmployeeId } } } } } } },
@@ -210,27 +265,31 @@ export const getTaskById = async (req: AuthRequest, res: Response): Promise<void
 
     const taskWithIncludes = taskCheck as typeof taskCheck & { assignments?: { employeeId: string }[]; delegations?: { originalAssigneeId: string }[] };
 
-    // Employee/Manager role: Can only view tasks assigned to them (root assignment, child-task assignment, or original assignee after delegation)
+    // Employee/Manager: same visibility as list API — this row, or any descendant row, may involve the user
     if (req.user?.role === 'EMPLOYEE' || req.user?.role === 'MANAGER') {
-      const isAssignedViaRoot = taskWithIncludes.assignments?.some(
-        (a) => a.employeeId === req.user!.id
-      );
-      const isAssignedViaChild = taskCheck.assignedEmployeeId === req.user!.id;
-      const isOriginalAssigneeDelegated = taskWithIncludes.delegations?.some(
-        (d) => d.originalAssigneeId === req.user!.id
-      );
-      
-      // Also check if this is a subtask assigned to the user (need to check parent task's subtasks)
-      let isAssignedViaSubtask = false;
-      if (taskCheck.parentTaskId) {
-        // This is a subtask, check if it's assigned to the user
-        isAssignedViaSubtask = taskCheck.assignedEmployeeId === req.user!.id;
-      } else {
-        // This is a main task, check if any of its subtasks are assigned to the user
-        // This will be checked via the include relations below
+      const uid = req.user!.id;
+      const isInvolvedOnThisRow =
+        taskCheck.assignedEmployeeId === uid ||
+        (taskWithIncludes.assignments?.some((a) => a.employeeId === uid) ?? false) ||
+        taskCheck.createdBy === uid ||
+        (taskWithIncludes.delegations?.some((d) => d.originalAssigneeId === uid) ?? false);
+
+      let allowed = isInvolvedOnThisRow;
+      if (!allowed && !taskCheck.parentTaskId) {
+        const descendantCount = await prisma.task.count({
+          where: {
+            AND: [
+              {
+                OR: [{ parentTaskId: id }, { parentTask: { parentTaskId: id } }],
+              },
+              taskRowInvolvesEmployee(uid),
+            ],
+          },
+        });
+        allowed = descendantCount > 0;
       }
-      
-      if (!isAssignedViaRoot && !isAssignedViaChild && !isOriginalAssigneeDelegated && !isAssignedViaSubtask) {
+
+      if (!allowed) {
         res.status(403).json({
           success: false,
           message: 'Access Denied: You do not have permission to view this task. You can only view tasks assigned to you.',
@@ -391,6 +450,7 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
       projectType,
       projectFloor,
       developerProject,
+      // Legacy predecessor fields (kept for backward compatibility, no longer used for locking)
       predecessors,
       predecessorId,
       // Nested subtasks and child tasks
@@ -422,7 +482,6 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
     // Helper function to map subtask data for nested create (supports assignedEmployeeId for child visibility)
     const mapSubtaskData = (subtask: any) => {
       const assignedEmpId = subtask.assignedEmployeeId || subtask.assignedTo || null;
-      const hasPredecessor = !!subtask.predecessorId;
       const subStatus =
         subtask.status === 'not started' ? 'PENDING' :
         subtask.status === 'working' ? 'IN_PROGRESS' :
@@ -435,7 +494,10 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
         description: subtask.description || null,
         projectId,
         status: subStatus,
-        workflowStatus: hasPredecessor ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED',
+        // If a predecessor is configured for this subtask, start it in
+        // WAITING_FOR_PREDECESSOR so the UI can show the correct "waiting" label
+        // and the unlock helper can safely move it to NOT_STARTED when ready.
+        workflowStatus: subtask.predecessorId ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED',
         priority: subtask.priority === 'Low' ? 'LOW' : 
                   subtask.priority === 'High' ? 'HIGH' : 
                   subtask.priority === 'Medium' ? 'MEDIUM' : 'MEDIUM',
@@ -460,6 +522,7 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
         assignedEmployeeId: assignedEmpId,
         predecessors: (subtask.predecessors != null && String(subtask.predecessors).trim() !== '') ? String(subtask.predecessors).trim() : null,
         predecessorId: subtask.predecessorId || null,
+        // taskOrder removed: execution order now purely visual on frontend
         // Nested child subtasks
         subtasks: subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0
           ? {
@@ -509,8 +572,10 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
       developerProject: developerProject || null,
       createdBy: req.user?.id || null,
       predecessorId: predecessorId || null,
-      workflowStatus: predecessorId ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED',
       predecessors: (predecessors != null && String(predecessors).trim() !== '') ? String(predecessors).trim() : null,
+      // Root/main task workflow: if a predecessor is set at creation time, start
+      // in WAITING_FOR_PREDECESSOR; otherwise treat as NOT_STARTED.
+      workflowStatus: predecessorId ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED',
       // Create TaskAssignment records for main task employees
       assignments: finalEmployeeIds.length > 0 ? {
         create: finalEmployeeIds.map((employeeId: string) => ({
@@ -587,17 +652,29 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
       actualHours,
       tags,
       assignedEmployeeId,
+      // Assignee‑side fields (allowed for assignees)
+      remarks,
+      assigneeNotes,
+      // Legacy predecessor fields (no longer used for locking)
       predecessors,
       predecessorId,
     } = req.body;
 
-    // Check if task exists
+    // Check if task exists (and basic assignment info)
     const existingTask: any = await prisma.task.findUnique({
       where: { id },
       include: {
         assignments: {
           select: {
             employeeId: true,
+          },
+        },
+        predecessor: {
+          select: {
+            id: true,
+            title: true,
+            status: true,
+            workflowStatus: true,
           },
         },
       },
@@ -608,102 +685,93 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // Employee role: Can only update tasks assigned to them (root or child assignment), and only certain fields
-    if (req.user?.role === 'EMPLOYEE') {
-      const isAssignedViaRoot = existingTask.assignments?.some(
-        (a: { employeeId: string }) => a.employeeId === req.user!.id
-      );
-      const isAssignedViaChild = existingTask.assignedEmployeeId === req.user!.id;
-      if (!isAssignedViaRoot && !isAssignedViaChild) {
-        res.status(403).json({
-          success: false,
-          message: 'Access Denied: You do not have permission to update this task. You can only update tasks assigned to you.',
-          code: 'ACCESS_DENIED',
-        });
-        return;
-      }
-      // Employees can only update: status, actualHours, and comments (not title, description, priority, dates, etc.)
-      // Restrict certain fields for employees
-      if (title !== undefined || description !== undefined || priority !== undefined || 
-          startDate !== undefined || dueDate !== undefined || estimatedHours !== undefined ||
-          predecessors !== undefined || predecessorId !== undefined) {
-        res.status(403).json({
-          success: false,
-          message: 'Access Denied: You can only update task status and actual hours. Please contact your project manager to modify other fields.',
-          code: 'ACCESS_DENIED',
-        });
-        return;
-      }
+    if (!req.user) {
+      res.status(401).json({ success: false, message: 'Unauthorized' });
+      return;
     }
 
-    // Prevent self-dependency
-    if (predecessorId && predecessorId === id) {
-      res.status(400).json({
+    // Centralised permission evaluation based on role, creator, and assignments
+    const perms = computeTaskPermissions({
+      user: { id: req.user.id, role: req.user.role as any },
+      task: existingTask,
+    });
+
+    // If user is neither creator, assignee, nor privileged → cannot update at all
+    if (!perms.canEditAssigneeFields && !perms.canEditMainFields) {
+      res.status(403).json({
         success: false,
-        message: 'A task cannot have itself as a predecessor.',
+        message:
+          'Access Denied: You are not assigned to this task and cannot update it.',
+        code: 'ACCESS_DENIED',
       });
       return;
     }
 
-    // Prevent simple circular dependency (A -> B and B -> A)
-    if (predecessorId) {
-      const predecessorTask: any = await (prisma as any).task.findUnique({
-        where: { id: predecessorId },
-      });
-      if (predecessorTask && predecessorTask.predecessorId === id) {
+    const canEditMainFields = perms.canEditMainFields;
+    const canEditAssigneeFields = perms.canEditAssigneeFields;
+
+    // Predecessor-based blocking: if this task has a predecessor, do not allow
+    // it to move to IN_PROGRESS or COMPLETED until the predecessor is COMPLETED.
+    const nextStatus = status || existingTask.status;
+    if (existingTask.predecessorId) {
+      const lockInfo = await checkTaskLock(id);
+
+      if (lockInfo.locked && (nextStatus === 'IN_PROGRESS' || nextStatus === 'COMPLETED')) {
         res.status(400).json({
           success: false,
-          message: 'Circular dependency detected between these two tasks.',
+          code: 'PREDECESSOR_NOT_COMPLETED',
+          message: lockInfo.reason,
+          predecessor: lockInfo.task?.predecessor || existingTask.predecessor,
         });
         return;
       }
-    }
-
-    // Prevent starting locked tasks
-    if (status === 'IN_PROGRESS' && (existingTask as any).workflowStatus === 'WAITING_FOR_PREDECESSOR') {
-      res.status(400).json({
-        success: false,
-        message: 'This task is locked until predecessor is completed.',
-      });
-      return;
     }
 
     const updateData: any = {
-      ...(title && { title }),
-      ...(description !== undefined && { description: description || null }),
-      ...(status && { status }),
-      ...(priority && { priority }),
-      ...(startDate && { startDate: new Date(startDate) }),
-      ...(dueDate && { dueDate: new Date(dueDate) }),
-      ...(estimatedHours !== undefined && { estimatedHours: estimatedHours ? parseFloat(estimatedHours) : null }),
-      ...(actualHours !== undefined && { actualHours: actualHours ? parseFloat(actualHours) : null }),
-      ...(tags && { tags }),
-      ...(predecessors !== undefined && {
-        predecessors: (predecessors != null && String(predecessors).trim() !== '') ? String(predecessors).trim() : null,
-      }),
-      ...(predecessorId !== undefined && { predecessorId: predecessorId || null }),
-      ...(assignedEmployeeId !== undefined && req.user?.role !== 'EMPLOYEE' && { assignedEmployeeId: assignedEmployeeId || null }),
-    };
+      // Main fields – managers/admin/HR, creator, and any assignee may change these
+      ...(canEditMainFields && title && { title }),
+      ...(canEditMainFields &&
+        description !== undefined && { description: description || null }),
+      // Status is allowed for both main editors and assignees
+      ...((canEditMainFields || canEditAssigneeFields) && status && { status }),
+      ...(canEditMainFields && priority && { priority }),
+      ...(canEditMainFields &&
+        startDate && { startDate: new Date(startDate) }),
+      ...(canEditMainFields && dueDate && { dueDate: new Date(dueDate) }),
+      ...(canEditMainFields &&
+        estimatedHours !== undefined && {
+          estimatedHours: estimatedHours ? parseFloat(estimatedHours) : null,
+        }),
+      ...(canEditMainFields &&
+        actualHours !== undefined && {
+          actualHours: actualHours ? parseFloat(actualHours) : null,
+        }),
+      ...(canEditMainFields && tags && { tags }),
+      ...(canEditMainFields &&
+        predecessors !== undefined && {
+          predecessors:
+            predecessors != null && String(predecessors).trim() !== ''
+              ? String(predecessors).trim()
+              : null,
+        }),
+      ...(canEditMainFields &&
+        predecessorId !== undefined && {
+          predecessorId: predecessorId || null,
+          // If a predecessor is being set via update, move workflowStatus
+          // into WAITING_FOR_PREDECESSOR; if removed, reset to NOT_STARTED.
+          workflowStatus: predecessorId ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED',
+        }),
+      ...(canEditMainFields &&
+        assignedEmployeeId !== undefined && {
+          assignedEmployeeId: assignedEmployeeId || null,
+        }),
 
-    // Maintain workflowStatus alongside status / predecessor changes
-    if (status) {
-      if (status === 'COMPLETED') {
-        (updateData as any).workflowStatus = 'COMPLETED';
-      } else if (status === 'IN_PROGRESS') {
-        (updateData as any).workflowStatus = 'IN_PROGRESS';
-      } else if (status === 'PENDING') {
-      const hasPred = predecessorId !== undefined
-          ? !!predecessorId
-          : !!(existingTask as any).predecessorId;
-        (updateData as any).workflowStatus = hasPred ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED';
-      }
-    } else if (predecessorId !== undefined && status === undefined) {
-      // Only predecessor changed
-      const hasPred = !!predecessorId;
-      if ((existingTask as any).status !== 'COMPLETED') {
-        (updateData as any).workflowStatus = hasPred ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED';
-      }
-    }
+      // Assignee‑side fields – creator / managers / admins / assignees
+      ...(canEditAssigneeFields &&
+        remarks !== undefined && { remarks: remarks || null }),
+      ...(canEditAssigneeFields &&
+        assigneeNotes !== undefined && { assigneeNotes: assigneeNotes || null }),
+    };
 
     // If status is being changed to COMPLETED, set completedAt
     if (status === 'COMPLETED' && existingTask.status !== 'COMPLETED') {
@@ -740,18 +808,9 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
         },
       });
 
-      // When a task is newly completed, unlock its direct dependents
-      if (status === 'COMPLETED' && existingTask.status !== 'COMPLETED') {
-        await (tx as any).task.updateMany({
-          where: {
-            predecessorId: id,
-            workflowStatus: 'WAITING_FOR_PREDECESSOR',
-          } as any,
-          data: {
-            workflowStatus: 'NOT_STARTED',
-          } as any,
-        });
-      }
+      // Unlock dependents whenever this task row is a finished predecessor (handles custom
+      // "Done - …" labels saved via project API + heals stale WAITING rows).
+      await unlockDependentsWaitingOnFinishedPredecessor(tx, id);
 
       return updated;
     });
@@ -1496,13 +1555,9 @@ export const getTaskStats = async (req: AuthRequest, res: Response): Promise<voi
       }
     }
 
-    // Employee role: Count tasks where they are in assignments, assigned via assignedEmployeeId, or original assignee after delegation
+    // Employee: count any task row (main or sub) where they are assignee, creator, or original delegate
     if (req.user && req.user.role === 'EMPLOYEE') {
-      where.OR = [
-        { assignments: { some: { employeeId: req.user.id } } },
-        { assignedEmployeeId: req.user.id },
-        { delegations: { some: { originalAssigneeId: req.user.id } } },
-      ];
+      Object.assign(where, taskRowInvolvesEmployee(req.user.id));
     }
 
     const [
