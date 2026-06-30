@@ -1,6 +1,8 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { buildCompanyNameAliases } from '../utils/company-name-aliases';
+import { ensureDefaultAttendanceProgram } from '../utils/attendance-program-defaults';
 
 const WEEKDAY_ORDER = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const;
 type Weekday = (typeof WEEKDAY_ORDER)[number];
@@ -140,6 +142,7 @@ export const listAttendancePrograms = async (req: AuthRequest, res: Response): P
       });
       return;
     }
+    await ensureDefaultAttendanceProgram(company.id);
     const rows = await prisma.attendanceProgram.findMany({
       where: { companyId: company.id },
       orderBy: { name: 'asc' },
@@ -277,9 +280,16 @@ export const updateAttendanceProgram = async (req: AuthRequest, res: Response): 
     let employeesUpdated = 0;
 
     if (oldName !== newName && canSyncEmployees) {
+      const companyAliases = buildCompanyNameAliases(company.name);
       const result = await prisma.user.updateMany({
         where: {
-          company: { equals: company.name, mode: 'insensitive' },
+          ...(companyAliases.length > 0
+            ? {
+                OR: companyAliases.map((n) => ({
+                  company: { equals: n, mode: 'insensitive' as const },
+                })),
+              }
+            : { company: { equals: company.name, mode: 'insensitive' as const } }),
           attendanceProgram: oldName,
         },
         data: { attendanceProgram: newName },

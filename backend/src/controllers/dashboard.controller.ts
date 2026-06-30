@@ -1,7 +1,12 @@
 import { Response } from 'express';
+import { UserRole } from '@prisma/client';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
 import * as dashboardService from '../services/dashboard.service';
+import {
+  buildEmployeeWhereForCompanyScope,
+  resolveCompanyAccessScope,
+} from '../services/companyAccess.service';
 
 /**
  * Get Dashboard Statistics
@@ -21,6 +26,7 @@ export const getDashboardStats = async (req: AuthRequest, res: Response): Promis
           pendingTasks: 0,
           inProgressTasks: 0,
           teamMembers: 0,
+          inProgressProjects: 0,
           inProgressTenders: 0,
           pendingInvitations: 0,
           recentProjects: []
@@ -39,6 +45,7 @@ export const getDashboardStats = async (req: AuthRequest, res: Response): Promis
     // Log the stats for debugging
     console.log(`📊 Dashboard Controller - Returning stats:`, {
       activeProjects: stats.activeProjects,
+      inProgressProjects: stats.inProgressProjects,
       activeTasks: stats.activeTasks,
       userId,
       userRole
@@ -66,6 +73,7 @@ export const getDashboardStats = async (req: AuthRequest, res: Response): Promis
       error: error instanceof Error ? error.message : 'Unknown error',
       data: {
         activeProjects: 0,  // Always 0 on error - no fallback to 3
+        inProgressProjects: 0,
         activeTasks: 0,
         completedTasks: 0,
         pendingTasks: 0,
@@ -92,10 +100,11 @@ export const getDashboardProjects = async (req: AuthRequest, res: Response): Pro
 
     const { status, limit = 10 } = req.query;
 
-    const where: any = {};
-    if (status && status !== 'all') {
-      where.status = status;
-    }
+    const where = await dashboardService.buildDashboardProjectsWhere(
+      req.user.id,
+      req.user.role,
+      typeof status === 'string' ? status : undefined
+    );
 
     const projects = await prisma.project.findMany({
       where,
@@ -222,22 +231,52 @@ export const getDashboardTeam = async (req: AuthRequest, res: Response): Promise
       return;
     }
 
-    const teamMembers = await prisma.user.findMany({
-      where: {
-        isActive: true
-      },
-      select: {
-        id: true,
-        email: true,
-        firstName: true,
-        lastName: true,
-        role: true,
-        createdAt: true
-      },
-      orderBy: {
-        createdAt: 'desc'
-      }
-    });
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    const userSelect = {
+      id: true,
+      email: true,
+      firstName: true,
+      lastName: true,
+      role: true,
+      createdAt: true,
+    } as const;
+
+    type TeamMemberRow = {
+      id: string;
+      email: string | null;
+      firstName: string | null;
+      lastName: string | null;
+      role: UserRole;
+      createdAt: Date;
+    };
+
+    let teamMembers: TeamMemberRow[];
+    const accessScope = await resolveCompanyAccessScope(userId, userRole);
+    if (dashboardService.isCompanyWideDashboardRole(userRole)) {
+      teamMembers = await prisma.user.findMany({
+        where: { isActive: true },
+        select: userSelect,
+        orderBy: { createdAt: 'desc' },
+      });
+    } else if (dashboardService.hasCompanyTeamMembersDashboard(userRole) && !accessScope.unrestricted) {
+      const employeeWhere = await buildEmployeeWhereForCompanyScope(accessScope);
+      teamMembers = await prisma.user.findMany({
+        where: { isActive: true, ...(employeeWhere ?? {}) },
+        select: userSelect,
+        orderBy: { createdAt: 'desc' },
+      });
+    } else if (userRole === 'MANAGER') {
+      teamMembers = await prisma.user.findMany({
+        where: { isActive: true, managerId: userId },
+        select: userSelect,
+        orderBy: { createdAt: 'desc' },
+      });
+    } else {
+      // Project managers, employees, etc.: do not expose other users on this endpoint
+      teamMembers = [];
+    }
 
     res.json({
       success: true,
@@ -272,47 +311,60 @@ export const getDashboardCalendar = async (req: AuthRequest, res: Response): Pro
     const startDate = new Date(targetYear, targetMonth - 1, 1);
     const endDate = new Date(targetYear, targetMonth, 0, 23, 59, 59);
 
-    const projects = await prisma.project.findMany({
-      where: {
-        deadline: {
-          gte: startDate,
-          lte: endDate
-        }
-      },
-      select: {
-        id: true,
-        name: true,
-        deadline: true,
-        status: true
-      }
-    });
+    const scopedProjectIds = await dashboardService.getScopedProjectIds(
+      req.user.id,
+      req.user.role
+    );
 
-    // Get tenders with deadlines in the specified month
-    const tenders = await prisma.tender.findMany({
-      where: {
-        OR: [
-          {
-            bidSubmissionDeadline: {
-              gte: startDate,
-              lte: endDate
-            }
-          },
-          {
-            tenderAcceptanceDeadline: {
-              gte: startDate,
-              lte: endDate
-            }
-          }
-        ]
-      },
-      select: {
-        id: true,
-        name: true,
-        bidSubmissionDeadline: true,
-        tenderAcceptanceDeadline: true,
-        status: true
-      }
-    });
+    const projects =
+      scopedProjectIds.length > 0
+        ? await prisma.project.findMany({
+            where: {
+              id: { in: scopedProjectIds },
+              deadline: {
+                gte: startDate,
+                lte: endDate,
+              },
+            },
+            select: {
+              id: true,
+              name: true,
+              deadline: true,
+              status: true,
+            },
+          })
+        : [];
+
+    // Get tenders with deadlines in the specified month (only on projects the user may see)
+    const tenders =
+      scopedProjectIds.length > 0
+        ? await prisma.tender.findMany({
+            where: {
+              projectId: { in: scopedProjectIds },
+              OR: [
+                {
+                  bidSubmissionDeadline: {
+                    gte: startDate,
+                    lte: endDate,
+                  },
+                },
+                {
+                  tenderAcceptanceDeadline: {
+                    gte: startDate,
+                    lte: endDate,
+                  },
+                },
+              ],
+            },
+            select: {
+              id: true,
+              name: true,
+              bidSubmissionDeadline: true,
+              tenderAcceptanceDeadline: true,
+              status: true,
+            },
+          })
+        : [];
 
     const events = [
       ...projects.map(project => ({
@@ -359,6 +411,7 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response): Prom
           activeProjects: 0,
           activeTasks: 0,
           teamMembers: 0,
+          inProgressProjects: 0,
           inProgressTenders: 0,
           totalClients: 0,
           totalTenders: 0,
@@ -387,6 +440,7 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response): Prom
         activeProjects: 0,
         activeTasks: 0,
         teamMembers: 0,
+        inProgressProjects: 0,
         inProgressTenders: 0,
         totalClients: 0,
         totalTenders: 0,

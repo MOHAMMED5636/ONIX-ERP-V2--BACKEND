@@ -2,13 +2,28 @@ import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { CompanyStatus, LicenseStatus, Prisma, UserRole } from '@prisma/client';
+import { buildCompanyScopeAliases } from '../utils/company-name-aliases';
+import {
+  assertCanAccessCompany,
+  buildEmployeeWhereForCompanyScope,
+  prismaCompanyWhereFromScope,
+  resolveCompanyAccessScope,
+} from '../services/companyAccess.service';
+import { ensureDefaultAttendanceProgram } from '../utils/attendance-program-defaults';
 
 /** Active directory employees linked by User.company string matching Company.name (same as departments list). */
 function activeEmployeeWhereForCompanyName(companyName: string) {
+  const aliases = buildCompanyScopeAliases(companyName);
   return {
-    role: { notIn: [UserRole.ADMIN, UserRole.TENDER_ENGINEER] },
+    role: { notIn: [UserRole.TENDER_ENGINEER] },
     isActive: true,
-    company: { equals: companyName, mode: 'insensitive' as const },
+    ...(aliases.length > 0
+      ? {
+          OR: aliases.map((n) => ({
+            company: { equals: n, mode: 'insensitive' as const },
+          })),
+        }
+      : { company: { equals: companyName, mode: 'insensitive' as const } }),
   };
 }
 
@@ -68,6 +83,11 @@ export const getAllCompanies = async (req: AuthRequest, res: Response): Promise<
         { industry: { contains: search as string, mode: 'insensitive' } },
         { contactEmail: { contains: search as string, mode: 'insensitive' } },
       ];
+    }
+
+    const accessScope = await resolveCompanyAccessScope(req.user!.id, req.user!.role);
+    if (!accessScope.unrestricted) {
+      Object.assign(where, prismaCompanyWhereFromScope(accessScope));
     }
 
     const [companies, total] = await Promise.all([
@@ -130,6 +150,12 @@ export const getCompanyById = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
+    const allowed = await assertCanAccessCompany(req.user!.id, req.user!.role, id);
+    if (!allowed) {
+      res.status(403).json({ success: false, message: 'Forbidden: company not in your assigned scope' });
+      return;
+    }
+
     const activeEmployeeCount = await prisma.user.count({
       where: activeEmployeeWhereForCompanyName(company.name),
     });
@@ -153,6 +179,33 @@ export const getCompanyById = async (req: AuthRequest, res: Response): Promise<v
     });
   } catch (error) {
     console.error('Get company by ID error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Lightweight branding for sidebar / banner (logo only) — any user assigned to the company.
+ * GET /api/companies/:id/branding
+ */
+export const getCompanyBranding = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const allowed = await assertCanAccessCompany(req.user!.id, req.user!.role, id);
+    if (!allowed) {
+      res.status(403).json({ success: false, message: 'Forbidden: company not in your scope' });
+      return;
+    }
+    const company = await prisma.company.findUnique({
+      where: { id },
+      select: { id: true, name: true, tag: true, logo: true },
+    });
+    if (!company) {
+      res.status(404).json({ success: false, message: 'Company not found' });
+      return;
+    }
+    res.json({ success: true, data: company });
+  } catch (error) {
+    console.error('Get company branding error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
@@ -188,10 +241,13 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
       logo,
       header,
       footer,
+      letterhead,
       employees,
       officeLatitude,
       officeLongitude,
       attendanceRadius,
+      requireFacialAttendance,
+      facialMatchMinScore,
       // Personal & Representative
       fullNameEn,
       fullNameAr,
@@ -282,6 +338,7 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
       // Notes
       licenseRemarks,
       connectionType,
+      parentCompanyId,
     } = body;
 
     // Validate required fields (name may be missing when using FormData)
@@ -300,6 +357,7 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
     const logoFile = files?.logo?.[0];
     const headerFile = files?.header?.[0];
     const footerFile = files?.footer?.[0];
+    const letterheadFile = files?.letterhead?.[0];
 
     // Get file paths if files were uploaded, otherwise use provided URLs
     const logoPath = logoFile 
@@ -311,10 +369,22 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
     const footerPath = footerFile
       ? `/uploads/companies/${footerFile.filename}`
       : (footer && typeof footer === 'string' ? footer : null);
+    const letterheadPath = letterheadFile
+      ? `/uploads/companies/${letterheadFile.filename}`
+      : (letterhead && typeof letterhead === 'string' ? letterhead : null);
 
     const lat = officeLatitude != null && officeLatitude !== '' ? parseFloat(String(officeLatitude)) : null;
     const lng = officeLongitude != null && officeLongitude !== '' ? parseFloat(String(officeLongitude)) : null;
     const radius = attendanceRadius != null && attendanceRadius !== '' ? parseInt(String(attendanceRadius), 10) : null;
+
+    const parentId = typeof parentCompanyId === 'string' && parentCompanyId.trim() ? parentCompanyId.trim() : null;
+    if (parentId) {
+      const exists = await prisma.company.findUnique({ where: { id: parentId }, select: { id: true } });
+      if (!exists) {
+        res.status(400).json({ success: false, message: 'Parent company does not exist' });
+        return;
+      }
+    }
 
     console.log(`📝 Creating company: ${companyName}`);
     console.log(`   Tag: ${tag || 'N/A'}`);
@@ -323,6 +393,7 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
     console.log(`   Logo: ${logoPath || 'null'}`);
     console.log(`   Header: ${headerPath || 'null'}`);
     console.log(`   Footer: ${footerPath || 'null'}`);
+    console.log(`   Letterhead: ${letterheadPath || 'null'}`);
 
     const partnersJson = partnersInfo != null && typeof partnersInfo === 'object'
       ? (Array.isArray(partnersInfo) ? partnersInfo : (typeof partnersInfo === 'string' ? JSON.parse(partnersInfo) : partnersInfo))
@@ -334,6 +405,7 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
     // Create company (type assertion: Prisma client may not yet reflect all schema fields in IDE)
     const createData = {
         name: companyName,
+        parentCompanyId: parentId,
         tag: tag || null,
         address: address || null,
         industry: industry || null,
@@ -356,11 +428,18 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
         logo: logoPath,
         header: headerPath,
         footer: footerPath,
+        letterhead: letterheadPath,
         employees: employees ? (typeof employees === 'number' ? employees : parseInt(String(employees), 10)) : 0,
         createdBy: req.user?.id ?? null,
         officeLatitude: lat != null && !isNaN(lat) ? lat : null,
         officeLongitude: lng != null && !isNaN(lng) ? lng : null,
         attendanceRadius: radius != null && !isNaN(radius) && radius > 0 ? radius : null,
+        requireFacialAttendance: parseOptionalBoolean(requireFacialAttendance) ?? false,
+        facialMatchMinScore: (() => {
+          if (facialMatchMinScore == null || facialMatchMinScore === '') return null;
+          const f = parseFloat(String(facialMatchMinScore));
+          return !Number.isNaN(f) && f > 0 && f <= 1 ? f : null;
+        })(),
         fullNameEn: fullNameEn || null,
         fullNameAr: fullNameAr || null,
         delegatedCardNumber: delegatedCardNumber || null,
@@ -451,6 +530,12 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
+    try {
+      await ensureDefaultAttendanceProgram(company.id);
+    } catch (seedErr) {
+      console.warn('Default attendance program seed skipped:', seedErr);
+    }
+
     console.log(`✅ Company created successfully: ${company.id}`);
     console.log(`   Final Status: ${company.status}`);
 
@@ -497,6 +582,7 @@ export const createCompany = async (req: AuthRequest, res: Response): Promise<vo
  */
 /** Company model keys that are allowed to be updated via API (excludes id, createdAt, updatedAt, relations). */
 const COMPANY_UPDATE_ALLOWED = new Set([
+  'parentCompanyId',
   'name', 'tag', 'address', 'industry', 'founded', 'status', 'contactName', 'contactEmail', 'contactPhone', 'contactExtension',
   'licenseCategory', 'legalType', 'licenseExpiry', 'licenseStatus', 'dunsNumber', 'registerNo', 'issueDate', 'mainLicenseNo', 'dcciNo', 'trnNumber',
   'fullNameEn', 'fullNameAr', 'delegatedCardNumber', 'businessPartnerNumber', 'emiratesId', 'emiratesIdExpiry', 'passportNumber', 'nationality', 'dateOfBirth', 'gender',
@@ -509,8 +595,8 @@ const COMPANY_UPDATE_ALLOWED = new Set([
   'corporateTaxRegistrationNumber', 'corporateTaxEffectiveRegistrationDate', 'firstCorporateTaxPeriodStart', 'firstCorporateTaxPeriodEnd', 'firstCorporateTaxFilingDeadline',
   'officePhone', 'telephone2', 'faxNumber', 'companyEmail', 'contactPersonName', 'contactMobile', 'poBox', 'city', 'region', 'street', 'addressDetails',
   'makaniNumber', 'parcelId', 'buildingNumber', 'floorNumber', 'subscriptionExpiryDate', 'ownerName', 'partnersInfo', 'activitiesInfo', 'licenseRemarks', 'connectionType',
-  'logo', 'header', 'footer', 'defaultCurrency', 'lengthUnit', 'areaUnit', 'volumeUnit', 'heightUnit', 'weightUnit',
-  'officeLatitude', 'officeLongitude', 'attendanceRadius', 'employees', 'createdBy',
+  'logo', 'header', 'footer', 'letterhead', 'payslipTemplate', 'stamp', 'defaultCurrency', 'lengthUnit', 'areaUnit', 'volumeUnit', 'heightUnit', 'weightUnit',
+  'officeLatitude', 'officeLongitude', 'attendanceRadius', 'requireFacialAttendance', 'facialMatchMinScore', 'employees', 'createdBy',
 ]);
 
 /** Date fields on Company that need parsing when received from request. */
@@ -532,14 +618,34 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
 
     // Parse date fields
     COMPANY_DATE_FIELDS.forEach((key) => {
-      if (updateData[key] !== undefined && updateData[key] !== null && updateData[key] !== '') {
+      if (updateData[key] === '') {
+        // Allow clearing date fields from forms that send empty strings
+        updateData[key] = null as never;
+        return;
+      }
+      if (updateData[key] !== undefined) {
         const parsed = parseOptionalDate(updateData[key]);
-        updateData[key] = parsed as never;
+        // If invalid date was provided, persist as null rather than throwing at Prisma layer
+        if (parsed === null && updateData[key] != null) {
+          updateData[key] = null as never;
+        } else if (parsed !== null) {
+          updateData[key] = parsed as never;
+        }
       }
     });
     if (updateData.prequalificationSubmitted !== undefined) {
       const v = parseOptionalBoolean(updateData.prequalificationSubmitted);
       updateData.prequalificationSubmitted = v as never;
+    }
+    if (updateData.requireFacialAttendance !== undefined) {
+      const v = parseOptionalBoolean(updateData.requireFacialAttendance);
+      updateData.requireFacialAttendance = (v ?? false) as never;
+    }
+    if (updateData.facialMatchMinScore !== undefined && updateData.facialMatchMinScore !== null && updateData.facialMatchMinScore !== '') {
+      const f = parseFloat(String(updateData.facialMatchMinScore));
+      updateData.facialMatchMinScore = !Number.isNaN(f) && f > 0 && f <= 1 ? f : null;
+    } else if (updateData.facialMatchMinScore === '') {
+      updateData.facialMatchMinScore = null;
     }
     if (updateData.partnersInfo !== undefined) {
       const v = updateData.partnersInfo;
@@ -554,12 +660,33 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
         : null;
     }
 
+    // parent company validation (allow null/empty to clear)
+    if (updateData.parentCompanyId !== undefined) {
+      const raw = typeof updateData.parentCompanyId === 'string' ? updateData.parentCompanyId.trim() : '';
+      if (!raw) {
+        updateData.parentCompanyId = null as never;
+      } else {
+        if (raw === id) {
+          res.status(400).json({ success: false, message: 'Company cannot be its own parent company' });
+          return;
+        }
+        const exists = await prisma.company.findUnique({ where: { id: raw }, select: { id: true } });
+        if (!exists) {
+          res.status(400).json({ success: false, message: 'Parent company does not exist' });
+          return;
+        }
+        updateData.parentCompanyId = raw as never;
+      }
+    }
+
     // Handle file uploads from multer
     // Multer with .fields() returns an object with fieldname as keys
     const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
     const logoFile = files?.logo?.[0];
     const headerFile = files?.header?.[0];
     const footerFile = files?.footer?.[0];
+    const letterheadFile = files?.letterhead?.[0];
+    const stampFile = files?.stamp?.[0];
 
     // Update file paths if new files were uploaded
     // If new file uploaded, use new file path; otherwise preserve existing URL from req.body
@@ -595,6 +722,26 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
       delete updateData.footer;
     }
 
+    if (letterheadFile) {
+      updateData.letterhead = `/uploads/companies/${letterheadFile.filename}`;
+      console.log(`📸 Letterhead uploaded: ${updateData.letterhead}`);
+    } else if (updateData.letterhead && typeof updateData.letterhead === 'string' && updateData.letterhead.trim() !== '') {
+      updateData.letterhead = updateData.letterhead;
+      console.log(`📸 Letterhead preserved: ${updateData.letterhead}`);
+    } else {
+      delete updateData.letterhead;
+    }
+
+    if (stampFile) {
+      updateData.stamp = `/uploads/companies/${stampFile.filename}`;
+      console.log(`📸 Stamp uploaded: ${updateData.stamp}`);
+    } else if (updateData.stamp && typeof updateData.stamp === 'string' && updateData.stamp.trim() !== '') {
+      updateData.stamp = updateData.stamp;
+      console.log(`📸 Stamp preserved: ${updateData.stamp}`);
+    } else {
+      delete updateData.stamp;
+    }
+
     // Convert status enums if provided
     if (updateData.status) {
       updateData.status = updateData.status as CompanyStatus;
@@ -605,7 +752,16 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
 
     // Convert employees to number
     if (updateData.employees !== undefined) {
-      updateData.employees = parseInt(updateData.employees, 10);
+      if (updateData.employees === '' || updateData.employees === null) {
+        delete updateData.employees;
+      } else {
+        const n = parseInt(String(updateData.employees), 10);
+        if (Number.isNaN(n)) {
+          delete updateData.employees;
+        } else {
+          updateData.employees = n as never;
+        }
+      }
     }
 
     // Convert office location (may come as strings from FormData)
@@ -650,8 +806,149 @@ export const updateCompany = async (req: AuthRequest, res: Response): Promise<vo
     if (error instanceof Error && error.message.includes('Record to update not found')) {
       res.status(404).json({ success: false, message: 'Company not found' });
     } else {
-      res.status(500).json({ success: false, message: 'Internal server error' });
+      // Provide a clearer message for common Prisma/DB issues (e.g. migration not applied)
+      let message = 'Internal server error';
+      const errMsg = error instanceof Error ? error.message : '';
+      if (errMsg) {
+        if (errMsg.toLowerCase().includes('parentcompanyid')) {
+          message =
+            'Parent company could not be saved. Please apply the latest database migration (company branches) and restart the backend.';
+        } else if (errMsg.toLowerCase().includes('foreign key') || errMsg.toLowerCase().includes('constraint')) {
+          message = 'Invalid parent company selection (constraint violation).';
+        } else {
+          message = errMsg;
+        }
+      }
+      res.status(500).json({ success: false, message });
     }
+  }
+};
+
+/**
+ * Upload company letterhead only (PDF/image) — avoids bundling with full company FormData.
+ * POST /api/companies/:id/letterhead
+ */
+export const uploadCompanyLetterheadAsset = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const file = req.file;
+    if (!file) {
+      res.status(400).json({ success: false, message: 'Letterhead file is required' });
+      return;
+    }
+
+    const letterheadPath = `/uploads/companies/${file.filename}`;
+    const company = await prisma.company.update({
+      where: { id },
+      data: { letterhead: letterheadPath },
+    });
+
+    res.json({
+      success: true,
+      message: 'Letterhead uploaded successfully',
+      data: { letterhead: company.letterhead },
+    });
+  } catch (error) {
+    console.error('Upload company letterhead error:', error);
+    if (error instanceof Error && error.message.includes('Record to update not found')) {
+      res.status(404).json({ success: false, message: 'Company not found' });
+      return;
+    }
+    const errMsg = error instanceof Error ? error.message : '';
+    if (errMsg.toLowerCase().includes('letterhead')) {
+      res.status(500).json({
+        success: false,
+        message:
+          'Letterhead could not be saved. Apply the latest database migration and restart the backend.',
+      });
+      return;
+    }
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Upload company payslip template (PNG/JPG recommended).
+ * POST /api/companies/:id/payslip-template
+ */
+export const uploadCompanyPayslipTemplateAsset = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const file = req.file;
+    if (!file) {
+      res.status(400).json({ success: false, message: 'Payslip template file is required' });
+      return;
+    }
+
+    const payslipTemplatePath = `/uploads/companies/${file.filename}`;
+    const company = await prisma.company.update({
+      where: { id },
+      data: { payslipTemplate: payslipTemplatePath } as Prisma.CompanyUpdateInput,
+    });
+
+    res.json({
+      success: true,
+      message: 'Payslip template uploaded successfully',
+      data: { payslipTemplate: (company as { payslipTemplate?: string | null }).payslipTemplate ?? null },
+    });
+  } catch (error) {
+    console.error('Upload company payslip template error:', error);
+    if (error instanceof Error && error.message.includes('Record to update not found')) {
+      res.status(404).json({ success: false, message: 'Company not found' });
+      return;
+    }
+    const errMsg = error instanceof Error ? error.message : '';
+    if (errMsg.toLowerCase().includes('paysliptemplate')) {
+      res.status(500).json({
+        success: false,
+        message:
+          'Payslip template could not be saved. Apply the latest database migration and restart the backend.',
+      });
+      return;
+    }
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Upload official company seal/stamp (PNG/JPG).
+ * POST /api/companies/:id/stamp
+ */
+export const uploadCompanyStampAsset = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const file = req.file;
+    if (!file) {
+      res.status(400).json({ success: false, message: 'Company seal image is required' });
+      return;
+    }
+
+    const stampPath = `/uploads/companies/${file.filename}`;
+    const company = await prisma.company.update({
+      where: { id },
+      data: { stamp: stampPath } as Prisma.CompanyUpdateInput,
+    });
+
+    res.json({
+      success: true,
+      message: 'Company seal uploaded successfully',
+      data: { stamp: (company as { stamp?: string | null }).stamp ?? null },
+    });
+  } catch (error) {
+    console.error('Upload company stamp error:', error);
+    if (error instanceof Error && error.message.includes('Record to update not found')) {
+      res.status(404).json({ success: false, message: 'Company not found' });
+      return;
+    }
+    const errMsg = error instanceof Error ? error.message : '';
+    if (errMsg.toLowerCase().includes('stamp')) {
+      res.status(500).json({
+        success: false,
+        message: 'Company seal could not be saved. Apply the latest database migration and restart the backend.',
+      });
+      return;
+    }
+    res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
 
@@ -804,27 +1101,34 @@ export const deleteCompany = async (req: AuthRequest, res: Response): Promise<vo
  */
 export const getCompanyStats = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const totalCompanies = await prisma.company.count();
+    const accessScope = await resolveCompanyAccessScope(req.user!.id, req.user!.role);
+    const companyWhere = prismaCompanyWhereFromScope(accessScope);
+
+    const totalCompanies = await prisma.company.count({ where: companyWhere });
     const activeCompanies = await prisma.company.count({
-      where: { status: CompanyStatus.ACTIVE }
+      where: { ...companyWhere, status: CompanyStatus.ACTIVE },
     });
-    const allCompanyNames = await prisma.company.findMany({
-      select: { name: true },
-    });
+
+    const scopedCompanies = accessScope.unrestricted
+      ? await prisma.company.findMany({ select: { name: true } })
+      : accessScope.companies.map((c) => ({ name: c.name }));
+
     const perCompanyCounts = await Promise.all(
-      allCompanyNames.map((row) =>
+      scopedCompanies.map((row) =>
         prisma.user.count({
           where: activeEmployeeWhereForCompanyName(row.name),
-        })
-      )
+        }),
+      ),
     );
     const totalEmployees = perCompanyCounts.reduce((sum, n) => sum + n, 0);
+
     const industries = await prisma.company.groupBy({
       by: ['industry'],
-      _count: { id: true }
+      where: companyWhere,
+      _count: { id: true },
     });
     const activeLicenses = await prisma.company.count({
-      where: { licenseStatus: LicenseStatus.ACTIVE }
+      where: { ...companyWhere, licenseStatus: LicenseStatus.ACTIVE },
     });
 
     res.json({

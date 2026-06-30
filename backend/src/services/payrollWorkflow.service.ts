@@ -7,6 +7,15 @@ import {
   type PayrollApproval,
 } from '@prisma/client';
 import { calculatePayrollLineForEmployee, DEFAULT_SETTINGS } from './payrollCalculation.service';
+import { unpublishMonthlySalaryForPeriod } from './salary-monthly-sheet.service';
+import {
+  assertPayrollStageApprovalAllowed,
+  nextPayrollStatusAfterApproval,
+} from '../utils/payrollApprovalAccess';
+import {
+  notifyPayrollFinanceReviewEmail,
+  notifyPayrollPaymentReadyEmail,
+} from './emailDispatch.service';
 
 type CreatePayrollRunInput = {
   userId: string;
@@ -26,6 +35,7 @@ type AdjustmentInput = {
 
 type ApproveInput = {
   userId: string;
+  userRole: string;
   runId: string;
   stage: PayrollApprovalStage;
   approved: boolean;
@@ -228,24 +238,36 @@ export async function approvePayrollRunStageService(input: ApproveInput) {
     throw err;
   }
 
+  if (input.approved) {
+    assertPayrollStageApprovalAllowed({
+      role: input.userRole,
+      stage: input.stage,
+      status: payrollRun.status,
+    });
+  }
+
   const approvedAt = input.approved ? nowIso() : null;
 
-  let updateData: any = {};
+  let updateData: Record<string, unknown> = {};
   if (input.approved) {
+    const nextStatus = nextPayrollStatusAfterApproval(input.stage);
     if (input.stage === PayrollApprovalStage.HR_REVIEW) {
-      updateData = { status: PayrollStatus.HR_APPROVED, hrApprovedById: input.userId, hrApprovedAt: approvedAt };
+      updateData = {
+        status: nextStatus,
+        hrApprovedById: input.userId,
+        hrApprovedAt: approvedAt,
+      };
     } else if (input.stage === PayrollApprovalStage.FINANCE_REVIEW) {
       updateData = {
-        status: PayrollStatus.FINANCE_APPROVED,
+        status: nextStatus,
         financeApprovedById: input.userId,
         financeApprovedAt: approvedAt,
       };
     } else if (input.stage === PayrollApprovalStage.FINAL_APPROVAL) {
       updateData = {
-        status: PayrollStatus.LOCKED,
+        status: nextStatus,
         finalApprovedById: input.userId,
         finalApprovedAt: approvedAt,
-        lockedAt: approvedAt,
       };
     }
   } else {
@@ -281,7 +303,29 @@ export async function approvePayrollRunStageService(input: ApproveInput) {
     });
   });
 
-  return prisma.payrollRun.findUnique({ where: { id: input.runId } });
+  const updated = await prisma.payrollRun.findUnique({ where: { id: input.runId } });
+
+  if (input.approved && updated) {
+    const approver = await prisma.user.findUnique({
+      where: { id: input.userId },
+      select: { firstName: true, lastName: true },
+    });
+    if (input.stage === PayrollApprovalStage.HR_REVIEW) {
+      const employeeCount = await prisma.payrollLine.count({ where: { payrollRunId: input.runId } });
+      void notifyPayrollFinanceReviewEmail({
+        payrollRun: updated,
+        approvedBy: approver,
+        employeeCount,
+      });
+    } else if (input.stage === PayrollApprovalStage.FINAL_APPROVAL) {
+      void notifyPayrollPaymentReadyEmail({
+        payrollRun: updated,
+        approvedBy: approver,
+      });
+    }
+  }
+
+  return updated;
 }
 
 export async function lockPayrollRunService(input: { userId: string; runId: string }) {
@@ -353,5 +397,60 @@ export async function generatePayslipsForRunService(input: { userId: string; run
   });
 
   return { updatedCount };
+}
+
+const NON_DELETABLE_PAYROLL_STATUSES = new Set<PayrollStatus>([PayrollStatus.LOCKED]);
+
+export async function deletePayrollRunService(input: { userId: string; runId: string }) {
+  const run = await prisma.payrollRun.findUnique({ where: { id: input.runId } });
+  if (!run) {
+    const err = new Error('Payroll run not found');
+    (err as Error & { code?: string }).code = 'NOT_FOUND';
+    throw err;
+  }
+  if (NON_DELETABLE_PAYROLL_STATUSES.has(run.status)) {
+    const err = new Error('Locked payroll runs cannot be deleted');
+    (err as Error & { code?: string }).code = 'LOCKED';
+    throw err;
+  }
+
+  await prisma.payrollRun.delete({ where: { id: input.runId } });
+
+  await unpublishMonthlySalaryForPeriod(run.periodYear, run.periodMonth);
+
+  return { deleted: true, runId: input.runId };
+}
+
+/** Remove all payroll runs except locked ones (fresh start for HR). */
+export async function deleteAllPayrollRunsService(input: { userId: string }) {
+  const where = { status: { not: PayrollStatus.LOCKED } };
+  const toDelete = await prisma.payrollRun.findMany({
+    where,
+    select: { id: true, periodMonth: true, periodYear: true, status: true },
+  });
+
+  if (!toDelete.length) {
+    return { deleted: 0, skippedLocked: await prisma.payrollRun.count({ where: { status: PayrollStatus.LOCKED } }) };
+  }
+
+  await prisma.payrollRun.deleteMany({ where });
+
+  const periodKeys = new Set<string>();
+  for (const run of toDelete) {
+    periodKeys.add(`${run.periodYear}-${run.periodMonth}`);
+  }
+  for (const key of periodKeys) {
+    const [yearStr, monthStr] = key.split('-');
+    const year = Number(yearStr);
+    const month = Number(monthStr);
+    if (Number.isFinite(year) && Number.isFinite(month)) {
+      await unpublishMonthlySalaryForPeriod(year, month);
+    }
+  }
+
+  return {
+    deleted: toDelete.length,
+    skippedLocked: await prisma.payrollRun.count({ where: { status: PayrollStatus.LOCKED } }),
+  };
 }
 

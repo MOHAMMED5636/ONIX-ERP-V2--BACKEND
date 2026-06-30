@@ -141,6 +141,7 @@ export const uploadLegalDocuments = multer({
   { name: 'insuranceAttachment', maxCount: 1 },
   { name: 'drivingLicenseAttachment', maxCount: 1 },
   { name: 'labourIdAttachment', maxCount: 1 },
+  { name: 'curriculumVitaeAttachment', maxCount: 1 },
 ]);
 
 // Combined upload for employee: photo + legal documents in a single multer instance
@@ -223,6 +224,7 @@ export const uploadEmployeeFiles = multer({
   { name: 'insuranceAttachment', maxCount: 1 },
   { name: 'drivingLicenseAttachment', maxCount: 1 },
   { name: 'labourIdAttachment', maxCount: 1 },
+  { name: 'curriculumVitaeAttachment', maxCount: 1 },
 ]);
 
 // Company assets upload configuration (logo, header, footer)
@@ -276,14 +278,53 @@ const companyAssetsFileFilter = (req: Request, file: Express.Multer.File, cb: mu
 export const uploadCompanyAssets = multer({
   storage: companyAssetsStorage,
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB max file size
+    fileSize: 15 * 1024 * 1024, // 15MB — letterhead PDFs can be larger than logos
   },
   fileFilter: companyAssetsFileFilter,
 }).fields([
   { name: 'logo', maxCount: 1 },
   { name: 'header', maxCount: 1 },
   { name: 'footer', maxCount: 1 },
+  { name: 'letterhead', maxCount: 1 },
+  { name: 'payslipTemplate', maxCount: 1 },
+  { name: 'stamp', maxCount: 1 },
 ]);
+
+/** Dedicated letterhead upload (single file, avoids huge full-company FormData). */
+export const uploadCompanyLetterhead = multer({
+  storage: companyAssetsStorage,
+  limits: {
+    fileSize: 15 * 1024 * 1024,
+  },
+  fileFilter: companyAssetsFileFilter,
+}).single('letterhead');
+
+/** Dedicated payslip template upload (PNG/JPG recommended). */
+export const uploadCompanyPayslipTemplate = multer({
+  storage: companyAssetsStorage,
+  limits: {
+    fileSize: 15 * 1024 * 1024,
+  },
+  fileFilter: companyAssetsFileFilter,
+}).single('payslipTemplate');
+
+const companyStampFileFilter = (req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  const allowedMimes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+  if (allowedMimes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed for the company seal.'));
+  }
+};
+
+/** Official company seal/stamp (PNG/JPG) for payslips and HR PDFs. */
+export const uploadCompanyStamp = multer({
+  storage: companyAssetsStorage,
+  limits: {
+    fileSize: 5 * 1024 * 1024,
+  },
+  fileFilter: companyStampFileFilter,
+}).single('stamp');
 
 // Leave documents (medical certificates, proofs) - stored under uploads/leave-documents
 const leaveDocumentsDir = path.join(process.cwd(), 'uploads', 'leave-documents');
@@ -311,6 +352,35 @@ export const uploadLeaveDocuments = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: documentsFileFilter,
 }).array('documents', 10);
+
+const resignationDocumentsDir = path.join(process.cwd(), 'uploads', 'resignation-documents');
+if (!fs.existsSync(resignationDocumentsDir)) {
+  fs.mkdirSync(resignationDocumentsDir, { recursive: true });
+}
+
+const resignationDocumentsStorage = multer.diskStorage({
+  destination: (_req: Request, _file: Express.Multer.File, cb) => {
+    cb(null, resignationDocumentsDir);
+  },
+  filename: (_req: Request, file: Express.Multer.File, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname);
+    let name = path.basename(file.originalname, ext);
+    name = name.replace(/[\/\\\?\*\|"<>:]/g, '_').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (name.length > 50) name = name.substring(0, 50);
+    if (!name) name = 'resignation-doc';
+    cb(null, `${name}-${uniqueSuffix}${ext}`);
+  },
+});
+
+export const uploadResignationDocuments = multer({
+  storage: resignationDocumentsStorage,
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: documentsFileFilter,
+}).fields([
+  { name: 'employmentContract', maxCount: 1 },
+  { name: 'supportingDocuments', maxCount: 10 },
+]);
 
 // Company policy file upload (PDF/DOC/DOCX) — stored under uploads/policies
 const policyFilesDir = path.join(process.cwd(), 'uploads', 'policies');
@@ -376,3 +446,154 @@ export const uploadFeedbackScreenshot = multer({
   limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
   fileFilter: feedbackImageFilter,
 }).single('screenshot');
+
+// Company compliance attachments — PDF, Office, images (same rules as documents)
+const companyAttachmentsDir = path.join(process.cwd(), 'uploads', 'company-attachments');
+if (!fs.existsSync(companyAttachmentsDir)) {
+  fs.mkdirSync(companyAttachmentsDir, { recursive: true });
+}
+
+const companyAttachmentsStorage = multer.diskStorage({
+  destination: (_req: Request, _file: Express.Multer.File, cb) => {
+    cb(null, companyAttachmentsDir);
+  },
+  filename: (_req: Request, file: Express.Multer.File, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname);
+    let name = path.basename(file.originalname, ext);
+    name = name.replace(/[\/\\\?\*\|"<>:]/g, '_').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (name.length > 50) name = name.substring(0, 50);
+    if (!name) name = 'attachment';
+    cb(null, `${name}-${uniqueSuffix}${ext}`);
+  },
+});
+
+export const uploadCompanyAttachmentFile = multer({
+  storage: companyAttachmentsStorage,
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15 MB
+  fileFilter: documentsFileFilter,
+}).single('file');
+
+// Project chat attachments (photo / video / document)
+const projectChatDir = path.join(process.cwd(), 'uploads', 'project-chat');
+if (!fs.existsSync(projectChatDir)) {
+  fs.mkdirSync(projectChatDir, { recursive: true });
+}
+
+const projectChatStorage = multer.diskStorage({
+  destination: (_req: Request, _file: Express.Multer.File, cb) => {
+    cb(null, projectChatDir);
+  },
+  filename: (_req: Request, file: Express.Multer.File, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname) || '';
+    let name = path.basename(file.originalname, ext);
+    name = name.replace(/[\/\\\?\*\|"<>:]/g, '_').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (name.length > 40) name = name.substring(0, 40);
+    if (!name) name = 'file';
+    cb(null, `${name}-${uniqueSuffix}${ext}`);
+  },
+});
+
+const projectChatPhotoMimes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+const projectChatVideoMimes = ['video/mp4', 'video/webm', 'video/quicktime', 'video/x-msvideo', 'video/mpeg'];
+
+export const uploadProjectChatFile = multer({
+  storage: projectChatStorage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB (videos)
+  fileFilter: (req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+    const kind = String((req.body as { kind?: string })?.kind || 'document').toLowerCase();
+    if (kind === 'photo') {
+      if (projectChatPhotoMimes.includes(file.mimetype)) {
+        cb(null, true);
+        return;
+      }
+      cb(new Error('Photo must be JPEG, PNG, GIF, or WebP.'));
+      return;
+    }
+    if (kind === 'video') {
+      if (projectChatVideoMimes.includes(file.mimetype)) {
+        cb(null, true);
+        return;
+      }
+      cb(new Error('Video must be MP4, WebM, MOV, AVI, or MPEG.'));
+      return;
+    }
+    const docMimes = [
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'text/plain',
+      'image/jpeg',
+      'image/jpg',
+      'image/png',
+    ];
+    if (docMimes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid document type. Use PDF, Word, Excel, text, or image files.'));
+    }
+  },
+}).single('file');
+
+const teamChatDir = path.join(process.cwd(), 'uploads', 'team-chat');
+if (!fs.existsSync(teamChatDir)) {
+  fs.mkdirSync(teamChatDir, { recursive: true });
+}
+
+const teamChatStorage = multer.diskStorage({
+  destination: (_req: Request, _file: Express.Multer.File, cb) => {
+    cb(null, teamChatDir);
+  },
+  filename: (_req: Request, file: Express.Multer.File, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname) || '';
+    let name = path.basename(file.originalname, ext);
+    name = name.replace(/[\/\\\?\*\|"<>:]/g, '_').replace(/\s+/g, '_').replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (name.length > 40) name = name.substring(0, 40);
+    if (!name) name = 'file';
+    cb(null, `${name}-${uniqueSuffix}${ext}`);
+  },
+});
+
+export const uploadTeamChatFile = multer({
+  storage: teamChatStorage,
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+    const kind = String((req.body as { kind?: string })?.kind || 'document').toLowerCase();
+    if (kind === 'photo') {
+      if (projectChatPhotoMimes.includes(file.mimetype)) {
+        cb(null, true);
+        return;
+      }
+      cb(new Error('Photo must be JPEG, PNG, GIF, or WebP.'));
+      return;
+    }
+    if (kind === 'video') {
+      if (projectChatVideoMimes.includes(file.mimetype)) {
+        cb(null, true);
+        return;
+      }
+      cb(new Error('Video must be MP4, WebM, MOV, AVI, or MPEG.'));
+      return;
+    }
+    const docMimes = [
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'text/plain',
+      'image/jpeg',
+      'image/jpg',
+      'image/png',
+    ];
+    if (docMimes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid document type. Use PDF, Word, Excel, text, or image files.'));
+    }
+  },
+}).single('file');

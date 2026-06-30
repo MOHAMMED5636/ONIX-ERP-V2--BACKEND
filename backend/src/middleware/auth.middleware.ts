@@ -15,9 +15,17 @@ export interface AuthRequest extends Request {
 }
 
 /** Stateless: extract user from JWT only; no global/cached user. */
+function extractBearerToken(req: AuthRequest): string | undefined {
+  const headerToken = req.headers.authorization?.split(' ')[1];
+  if (headerToken) return headerToken;
+  const queryToken = req.query?.token;
+  if (typeof queryToken === 'string' && queryToken.trim()) return queryToken.trim();
+  return undefined;
+}
+
 export const authenticate = (req: AuthRequest, res: Response, next: NextFunction): void => {
   try {
-    const token = req.headers.authorization?.split(' ')[1]; // Bearer <token>
+    const token = extractBearerToken(req);
     
     if (!token) {
       res.status(401).json({ 
@@ -62,7 +70,7 @@ export const authenticate = (req: AuthRequest, res: Response, next: NextFunction
 // Useful for endpoints that can work with or without authentication
 export const optionalAuthenticate = (req: AuthRequest, res: Response, next: NextFunction): void => {
   try {
-    const token = req.headers.authorization?.split(' ')[1];
+    const token = extractBearerToken(req);
     
     if (token) {
       try {

@@ -133,7 +133,7 @@ function addDateDisplayVariants(out: Record<string, unknown>): void {
  */
 export function publicUploadFileUrl(
   req: Request | undefined,
-  folder: 'photos' | 'documents',
+  folder: 'photos' | 'documents' | 'project-chat' | 'team-chat' | 'feedback' | 'company-attachments',
   filename: string | null | undefined
 ): string | null {
   if (filename == null) return null;
@@ -180,6 +180,9 @@ function attachDirectoryAliases(out: Record<string, unknown>): void {
     labourIdExpiryDate: out.labourIdExpiryDate ?? null,
     labourIdAttachment: out.labourIdAttachment ?? null,
     labourIdAttachmentUrl: out.labourIdAttachmentUrl ?? null,
+    educationalQualification: out.educationalQualification ?? null,
+    curriculumVitaeAttachment: out.curriculumVitaeAttachment ?? null,
+    curriculumVitaeAttachmentUrl: out.curriculumVitaeAttachmentUrl ?? null,
     labourCardNumber: out.labourIdNumber ?? null,
     laborCardNumber: out.labourIdNumber ?? null,
     drivingLicenceNumber: out.drivingLicenseNumber ?? null,
@@ -263,19 +266,51 @@ export function shapeEmployeeForClient(
   out.insuranceAttachmentUrl = publicUploadFileUrl(req, 'documents', out.insuranceAttachment as string | null | undefined);
   out.drivingLicenseAttachmentUrl = publicUploadFileUrl(req, 'documents', out.drivingLicenseAttachment as string | null | undefined);
   out.labourIdAttachmentUrl = publicUploadFileUrl(req, 'documents', out.labourIdAttachment as string | null | undefined);
+  out.curriculumVitaeAttachmentUrl = publicUploadFileUrl(
+    req,
+    'documents',
+    out.curriculumVitaeAttachment as string | null | undefined,
+  );
 
   addDateDisplayVariants(out);
   attachDirectoryAliases(out);
 
   const pas = out.positionAssignments;
   delete out.positionAssignments;
-  if (Array.isArray(pas)) {
-    out.additionalPositionIds = pas
-      .map((x) => (x && typeof x === 'object' && 'positionId' in x ? (x as { positionId?: string }).positionId : null))
-      .filter((id): id is string => typeof id === 'string' && id.length > 0);
-  } else {
-    out.additionalPositionIds = [];
-  }
+  const additionalOrgPositions = buildAdditionalOrgPositions(pas);
+  out.additionalOrgPositions = additionalOrgPositions;
+  out.additionalPositionIds = additionalOrgPositions.map((x) => x.positionId);
 
   return out;
+}
+
+/** Extra org-chart links (employee_position_assignments). Primary directory company/dept is unchanged when these are removed. */
+function buildAdditionalOrgPositions(pas: unknown): { positionId: string; summary: string }[] {
+  if (!Array.isArray(pas)) return [];
+  const result: { positionId: string; summary: string }[] = [];
+  for (const row of pas) {
+    if (!row || typeof row !== 'object') continue;
+    const r = row as Record<string, unknown>;
+    const pos = r.position as Record<string, unknown> | undefined;
+    const positionId =
+      (typeof r.positionId === 'string' && r.positionId) ||
+      (pos && typeof pos.id === 'string' && pos.id) ||
+      '';
+    if (!positionId) continue;
+    let summary = `Org position (${positionId.slice(0, 8)}…)`;
+    if (pos && typeof pos === 'object') {
+      const sub = pos.subDepartment as Record<string, unknown> | undefined;
+      const dept = sub?.department as Record<string, unknown> | undefined;
+      const company = dept?.company as Record<string, unknown> | undefined;
+      const parts = [
+        typeof company?.name === 'string' ? company.name : '',
+        typeof dept?.name === 'string' ? dept.name : '',
+        typeof sub?.name === 'string' ? sub.name : '',
+        typeof pos.name === 'string' ? pos.name : '',
+      ].filter(Boolean);
+      if (parts.length > 0) summary = parts.join(' › ');
+    }
+    result.push({ positionId, summary });
+  }
+  return result;
 }

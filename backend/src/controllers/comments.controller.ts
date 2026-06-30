@@ -1,6 +1,11 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { logProjectActivity } from '../services/projectActivity.service';
+import {
+  ensureTaskProjectWriteAllowed,
+  PROJECT_SUSPENDED_MESSAGE,
+} from '../utils/project-suspension';
 
 // Get task comments
 export const getTaskComments = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -54,6 +59,20 @@ export const createTaskComment = async (req: AuthRequest, res: Response): Promis
     const { taskId } = req.params;
     const { content } = req.body;
 
+    try {
+      await ensureTaskProjectWriteAllowed(taskId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
+
     if (!content || !content.trim()) {
       res.status(400).json({
         success: false,
@@ -69,6 +88,21 @@ export const createTaskComment = async (req: AuthRequest, res: Response): Promis
         createdBy: req.user?.id || null,
       },
     });
+
+    const taskRow = await prisma.task.findUnique({
+      where: { id: taskId },
+      select: { projectId: true, title: true },
+    });
+    if (taskRow) {
+      await logProjectActivity({
+        projectId: taskRow.projectId,
+        actorId: req.user?.id,
+        action: 'COMMENT_ADDED',
+        taskId,
+        summary: `Comment on "${taskRow.title}"`,
+        metadata: { taskTitle: taskRow.title, preview: content.trim().slice(0, 240) },
+      });
+    }
 
     // Fetch user details
     let user = null;
@@ -104,6 +138,20 @@ export const updateTaskComment = async (req: AuthRequest, res: Response): Promis
   try {
     const { taskId, commentId } = req.params;
     const { content } = req.body;
+
+    try {
+      await ensureTaskProjectWriteAllowed(taskId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
 
     if (!content || !content.trim()) {
       res.status(400).json({
@@ -149,6 +197,20 @@ export const updateTaskComment = async (req: AuthRequest, res: Response): Promis
 export const deleteTaskComment = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { taskId, commentId } = req.params;
+
+    try {
+      await ensureTaskProjectWriteAllowed(taskId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
 
     const comment = await prisma.taskComment.findFirst({
       where: {

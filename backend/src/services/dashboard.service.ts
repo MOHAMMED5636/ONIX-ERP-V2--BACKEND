@@ -1,5 +1,101 @@
 import prisma from '../config/database';
 import { ProjectStatus, TaskStatus } from '@prisma/client';
+import { computeEmployeeWorkload } from './workload.service';
+import {
+  countActiveEmployeesForScope,
+  resolveCompanyAccessScope,
+} from './companyAccess.service';
+import {
+  ACTIVE_PROJECT_STATUSES,
+  buildManagerProjectVisibilityOr,
+  isManagerLikeRole,
+} from '../utils/manager-project-visibility';
+
+/**
+ * Full company metrics (projects, clients, tenders, all users) — Super Admin only.
+ */
+export const isCompanyWideDashboardRole = (role?: string): boolean =>
+  role === 'SUPER_ADMIN';
+
+/** Total active employees on dashboard — Admin, Super Admin, and HR (scoped to assigned companies for Admin/HR). */
+export const hasCompanyTeamMembersDashboard = (role?: string): boolean =>
+  role === 'ADMIN' || role === 'SUPER_ADMIN' || role === 'HR';
+
+/** Tasks the user created, is assigned to, or has a TaskAssignment row for (covers subtasks / child tasks). */
+const taskInvolvementOr = (userId: string) =>
+  [
+    { createdBy: userId },
+    { assignedEmployeeId: userId },
+    { assignments: { some: { employeeId: userId } } },
+  ] as const;
+
+/**
+ * Projects visible on a personal dashboard: created by user, assigned as member,
+ * contains any task/subtask they created or are assigned to, and (for MANAGER only)
+ * linked via contracts they manage.
+ */
+export const buildScopedProjectVisibilityOr = async (
+  userId: string,
+  userRole?: string
+): Promise<Array<Record<string, unknown>>> => {
+  if (isManagerLikeRole(userRole)) {
+    // Match Main Table / project list: contract-assigned PM only (not createdBy / task rows).
+    return buildManagerProjectVisibilityOr(userId);
+  }
+
+  const ors: Array<Record<string, unknown>> = [
+    { createdBy: userId },
+    { assignedEmployees: { some: { employeeId: userId } } },
+    {
+      tasks: {
+        some: {
+          OR: [...taskInvolvementOr(userId)],
+        },
+      },
+    },
+  ];
+
+  return ors;
+};
+
+/**
+ * WHERE clause for dashboard project lists (optional status filter from query string).
+ */
+export const buildDashboardProjectsWhere = async (
+  userId: string,
+  userRole: string | undefined,
+  statusQuery?: string | null
+): Promise<Record<string, unknown>> => {
+  const parts: Record<string, unknown>[] = [];
+
+  if (statusQuery && statusQuery !== 'all') {
+    parts.push({ status: statusQuery });
+  }
+
+  if (!isCompanyWideDashboardRole(userRole)) {
+    parts.push({ OR: await buildScopedProjectVisibilityOr(userId, userRole) });
+  }
+
+  if (parts.length === 0) return {};
+  if (parts.length === 1) return parts[0];
+  return { AND: parts };
+};
+
+/** Project IDs the user may see on dashboard widgets (calendar, tender deadlines, etc.). */
+export const getScopedProjectIds = async (
+  userId: string,
+  userRole?: string
+): Promise<string[]> => {
+  if (isCompanyWideDashboardRole(userRole)) {
+    const all = await prisma.project.findMany({ select: { id: true } });
+    return all.map((p) => p.id);
+  }
+  const rows = await prisma.project.findMany({
+    where: { OR: await buildScopedProjectVisibilityOr(userId, userRole) },
+    select: { id: true },
+  });
+  return rows.map((r) => r.id);
+};
 
 /**
  * Dashboard Service
@@ -9,6 +105,8 @@ import { ProjectStatus, TaskStatus } from '@prisma/client';
 
 export interface DashboardStats {
   activeProjects: number;
+  /** Projects with status IN_PROGRESS (matches Main Table "In Progress" column). */
+  inProgressProjects: number;
   activeTasks: number;
   completedTasks: number;
   pendingTasks: number;
@@ -18,10 +116,29 @@ export interface DashboardStats {
   totalClients: number;
   totalTenders: number;
   pendingInvitations: number;
+  /** Present when userId is set — gamification / workload snapshot for the logged-in user */
+  gamification?: {
+    totalXp: number;
+    starCount: number;
+    workloadScore: number;
+    utilizationPercent?: number;
+    completedUtilizationPercent?: number;
+    /** Active open tasks right now. */
+    employeeCapacity?: number;
+    /** Points cap from workload settings. */
+    pointsCapacity?: number;
+    pendingLoad?: number;
+    workerStatus?: string;
+    statusColor: string;
+    activeTasksCount: number;
+    activeProjectsCount?: number;
+    performance?: unknown;
+  };
 }
 
 export interface DashboardSummary {
   activeProjects: number;
+  inProgressProjects: number;
   activeTasks: number;
   teamMembers: number;
   inProgressTenders: number;
@@ -37,10 +154,8 @@ export interface DashboardSummary {
  */
 export const getDashboardStats = async (userId?: string, userRole?: string): Promise<DashboardStats> => {
   try {
-    const isEmployee = userRole === 'EMPLOYEE' && userId;
-    const isManager = userRole === 'MANAGER' && userId;
-
     let activeProjects: number;
+    let inProgressProjects: number;
     let activeTasks: number;
     let completedTasks: number;
     let pendingTasks: number;
@@ -51,123 +166,17 @@ export const getDashboardStats = async (userId?: string, userRole?: string): Pro
     let totalTenders: number;
     let pendingInvitations: number;
 
-    if (isEmployee) {
-      // Employee: only counts for assigned projects and tasks
-      activeProjects = await prisma.projectAssignment.count({
+    if (userId && isCompanyWideDashboardRole(userRole)) {
+      // Admin / super admin: company-wide counts
+      activeProjects = await prisma.project.count({
         where: {
-          employeeId: userId,
-          project: {
-            status: { in: [ProjectStatus.OPEN, ProjectStatus.IN_PROGRESS] }
-          }
+          deletedAt: null,
+          status: { in: [...ACTIVE_PROJECT_STATUSES] },
         }
       });
 
-      // Count tasks where employee is in TaskAssignment OR assigned via assignedEmployeeId (child tasks)
-      const taskCounts = await Promise.all([
-        prisma.task.count({
-          where: {
-            status: TaskStatus.COMPLETED,
-            OR: [
-              { assignments: { some: { employeeId: userId } } },
-              { assignedEmployeeId: userId },
-            ]
-          }
-        }),
-        prisma.task.count({
-          where: {
-            status: TaskStatus.PENDING,
-            OR: [
-              { assignments: { some: { employeeId: userId } } },
-              { assignedEmployeeId: userId },
-            ]
-          }
-        }),
-        prisma.task.count({
-          where: {
-            status: TaskStatus.IN_PROGRESS,
-            OR: [
-              { assignments: { some: { employeeId: userId } } },
-              { assignedEmployeeId: userId },
-            ]
-          }
-        })
-      ]);
-      completedTasks = taskCounts[0];
-      pendingTasks = taskCounts[1];
-      inProgressTasks = taskCounts[2];
-      activeTasks = pendingTasks + inProgressTasks;
-
-      teamMembers = 0;
-      inProgressTenders = 0;
-      totalClients = 0;
-      totalTenders = 0;
-      pendingInvitations = 0;
-    } else if (isManager) {
-      // Manager: count projects they created, are assigned to, or from their contracts
-      // Get team member IDs
-      const teamMemberIds = await prisma.user.findMany({
-        where: { managerId: userId },
-        select: { id: true },
-      }).then(users => users.map(u => u.id));
-
-      // Get user email for contract filtering
-      const managerUser = await prisma.user.findUnique({
-        where: { id: userId },
-        select: { email: true },
-      });
-
-      // Build OR conditions for manager projects - ONLY their own, not team member projects
-      const projectWhere: any = {
-        status: { in: [ProjectStatus.OPEN, ProjectStatus.IN_PROGRESS] },
-        OR: [
-          { assignedEmployees: { some: { employeeId: userId } } },
-          { tasks: { some: { assignedEmployeeId: userId } } },
-          { createdBy: userId },
-          ...(managerUser?.email ? [
-            { contracts: { some: { assignedManagerEmail: managerUser.email } } }
-          ] : []),
-          { contracts: { some: { assignedManagerId: userId } } },
-        ],
-      };
-
-      activeProjects = await prisma.project.count({
-        where: projectWhere,
-      });
-
-      // Count tasks for manager and team members
-      const taskWhere = {
-        OR: [
-          { assignedEmployeeId: userId },
-          { assignments: { some: { employeeId: userId } } },
-          ...(teamMemberIds.length > 0 ? [
-            { assignedEmployeeId: { in: teamMemberIds } },
-            { assignments: { some: { employeeId: { in: teamMemberIds } } } },
-          ] : []),
-        ],
-      };
-
-      const taskCounts = await Promise.all([
-        prisma.task.count({ where: { ...taskWhere, status: TaskStatus.COMPLETED } }),
-        prisma.task.count({ where: { ...taskWhere, status: TaskStatus.PENDING } }),
-        prisma.task.count({ where: { ...taskWhere, status: TaskStatus.IN_PROGRESS } }),
-      ]);
-      completedTasks = taskCounts[0];
-      pendingTasks = taskCounts[1];
-      inProgressTasks = taskCounts[2];
-      activeTasks = pendingTasks + inProgressTasks;
-
-      // Count team members
-      teamMembers = teamMemberIds.length;
-      inProgressTenders = 0;
-      totalClients = 0;
-      totalTenders = 0;
-      pendingInvitations = 0;
-    } else {
-      // Admin / other roles: company-wide counts
-      activeProjects = await prisma.project.count({
-        where: {
-          status: { in: [ProjectStatus.OPEN, ProjectStatus.IN_PROGRESS] }
-        }
+      inProgressProjects = await prisma.project.count({
+        where: { deletedAt: null, status: ProjectStatus.IN_PROGRESS },
       });
 
       const existingProjects = await prisma.project.findMany({ select: { id: true } });
@@ -193,15 +202,87 @@ export const getDashboardStats = async (userId?: string, userRole?: string): Pro
       totalTenders = await prisma.tender.count();
 
       pendingInvitations = 0;
-      if (userRole === 'TENDER_ENGINEER' && userId) {
+    } else if (userId) {
+      // Everyone else: only projects/tasks/subtasks they own, created, or are assigned to (no company-wide rollups)
+      const projectOr = await buildScopedProjectVisibilityOr(userId, userRole);
+
+      activeProjects = await prisma.project.count({
+        where: {
+          deletedAt: null,
+          status: { in: [...ACTIVE_PROJECT_STATUSES] },
+          OR: projectOr,
+        },
+      });
+
+      inProgressProjects = await prisma.project.count({
+        where: {
+          deletedAt: null,
+          status: ProjectStatus.IN_PROGRESS,
+          OR: projectOr,
+        },
+      });
+
+      const taskInvolvement = { OR: [...taskInvolvementOr(userId)] };
+
+      const taskCounts = await Promise.all([
+        prisma.task.count({
+          where: {
+            ...taskInvolvement,
+            status: TaskStatus.COMPLETED,
+          },
+        }),
+        prisma.task.count({
+          where: {
+            ...taskInvolvement,
+            status: TaskStatus.PENDING,
+          },
+        }),
+        prisma.task.count({
+          where: {
+            ...taskInvolvement,
+            status: TaskStatus.IN_PROGRESS,
+          },
+        }),
+      ]);
+      completedTasks = taskCounts[0];
+      pendingTasks = taskCounts[1];
+      inProgressTasks = taskCounts[2];
+      activeTasks = pendingTasks + inProgressTasks;
+
+      teamMembers =
+        userRole === 'MANAGER'
+          ? await prisma.user.count({ where: { managerId: userId, isActive: true } })
+          : hasCompanyTeamMembersDashboard(userRole)
+            ? await countActiveEmployeesForScope(await resolveCompanyAccessScope(userId, userRole))
+            : 0;
+
+      inProgressTenders = 0;
+      totalClients = 0;
+      totalTenders = 0;
+
+      pendingInvitations = 0;
+      if (userRole === 'TENDER_ENGINEER') {
         pendingInvitations = await prisma.tenderInvitation.count({
-          where: { engineerId: userId, status: 'PENDING' }
+          where: { engineerId: userId, status: 'PENDING' },
         });
       }
+    } else {
+      activeProjects = 0;
+      inProgressProjects = 0;
+      activeTasks = 0;
+      completedTasks = 0;
+      pendingTasks = 0;
+      inProgressTasks = 0;
+      teamMembers = 0;
+      inProgressTenders = 0;
+      totalClients = 0;
+      totalTenders = 0;
+      pendingInvitations = 0;
     }
 
-    return {
+    const base = {
       activeProjects,
+      inProgressProjects,
       activeTasks,
       completedTasks,
       pendingTasks,
@@ -210,13 +291,43 @@ export const getDashboardStats = async (userId?: string, userRole?: string): Pro
       inProgressTenders,
       totalClients,
       totalTenders,
-      pendingInvitations
+      pendingInvitations,
+    };
+
+    if (!userId) return base;
+
+    const [userRow, workload] = await Promise.all([
+      prisma.user.findUnique({
+        where: { id: userId },
+        select: { totalXp: true, starCount: true },
+      }),
+      computeEmployeeWorkload(userId),
+    ]);
+
+    return {
+      ...base,
+      gamification: {
+        totalXp: userRow?.totalXp ?? 0,
+        starCount: userRow?.starCount ?? 0,
+        workloadScore: workload?.workloadScore ?? 0,
+        utilizationPercent: workload?.utilizationPercent ?? 0,
+        completedUtilizationPercent: workload?.completedUtilizationPercent ?? 0,
+        employeeCapacity: workload?.employeeCapacity ?? 0,
+        pointsCapacity: workload?.pointsCapacity ?? 10,
+        pendingLoad: workload?.pendingLoad ?? 0,
+        workerStatus: workload?.workerStatus ?? 'Undefined',
+        statusColor: workload?.statusColor ?? 'blue',
+        activeTasksCount: workload?.activeTasksCount ?? 0,
+        activeProjectsCount: workload?.activeProjectsCount ?? 0,
+        performance: workload?.performance ?? null,
+      },
     };
   } catch (error) {
     console.error('Dashboard service error:', error);
     // Return default values on error
     return {
       activeProjects: 0,
+      inProgressProjects: 0,
       activeTasks: 0,
       completedTasks: 0,
       pendingTasks: 0,
@@ -239,6 +350,7 @@ export const getDashboardSummary = async (userId?: string, userRole?: string): P
     
     return {
       activeProjects: stats.activeProjects,
+      inProgressProjects: stats.inProgressProjects,
       activeTasks: stats.activeTasks,
       teamMembers: stats.teamMembers,
       inProgressTenders: stats.inProgressTenders,
@@ -250,6 +362,7 @@ export const getDashboardSummary = async (userId?: string, userRole?: string): P
     console.error('Dashboard summary service error:', error);
     return {
       activeProjects: 0,
+      inProgressProjects: 0,
       activeTasks: 0,
       teamMembers: 0,
       inProgressTenders: 0,
@@ -266,37 +379,10 @@ export const getDashboardSummary = async (userId?: string, userRole?: string): P
  */
 export const getRecentProjects = async (limit: number = 5, userId?: string, userRole?: string) => {
   try {
-    const isEmployee = userRole === 'EMPLOYEE' && userId;
-    const isManager = userRole === 'MANAGER' && userId;
+    let where: Record<string, unknown> = {};
 
-    let where: any = {};
-    
-    if (isEmployee) {
-      where = { assignedEmployees: { some: { employeeId: userId } } };
-    } else if (isManager) {
-      // Manager: see projects they created, are assigned to, or from their contracts
-      const teamMemberIds = await prisma.user.findMany({
-        where: { managerId: userId },
-        select: { id: true },
-      }).then(users => users.map(u => u.id));
-
-      const managerUser = await prisma.user.findUnique({
-        where: { id: userId },
-        select: { email: true },
-      });
-
-      // Manager: only their own projects, not team member projects
-      where = {
-        OR: [
-          { assignedEmployees: { some: { employeeId: userId } } },
-          { tasks: { some: { assignedEmployeeId: userId } } },
-          { createdBy: userId },
-          ...(managerUser?.email ? [
-            { contracts: { some: { assignedManagerEmail: managerUser.email } } }
-          ] : []),
-          { contracts: { some: { assignedManagerId: userId } } },
-        ],
-      };
+    if (userId && !isCompanyWideDashboardRole(userRole)) {
+      where = { OR: await buildScopedProjectVisibilityOr(userId, userRole) };
     }
 
     const projects = await prisma.project.findMany({

@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { resolveApiPublicBaseUrl, resolveCertificateVerifyBaseUrl } from '../utils/network';
 
 dotenv.config();
 
@@ -6,8 +7,10 @@ export const config = {
   port: process.env.PORT || 3001, // Default to 3001 for local development, Render uses 10000
   nodeEnv: process.env.NODE_ENV || 'development',
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:3000',
-  /** Base URL for links to uploaded files in emails (e.g. screenshots). */
-  apiPublicUrl: process.env.API_PUBLIC_URL || `http://localhost:${process.env.PORT || 3001}`,
+  /** Public URL embedded in leave-certificate QR codes (never localhost). */
+  certificateVerifyBaseUrl: resolveCertificateVerifyBaseUrl(),
+  /** Base URL for API links on phones / external networks (never localhost). */
+  apiPublicUrl: resolveApiPublicBaseUrl(),
   
   jwt: {
     secret: process.env.JWT_SECRET || 'default-secret-change-me',
@@ -36,6 +39,13 @@ export const config = {
   
   googleMaps: {
     apiKey: process.env.GOOGLE_MAPS_API_KEY || '',
+  },
+
+  /** Web Push (browser notifications). Generate keys: npx web-push generate-vapid-keys */
+  webPush: {
+    publicKey: process.env.VAPID_PUBLIC_KEY || '',
+    privateKey: process.env.VAPID_PRIVATE_KEY || '',
+    subject: process.env.VAPID_SUBJECT || 'mailto:noreply@onixgroup.ae',
   },
 };
 

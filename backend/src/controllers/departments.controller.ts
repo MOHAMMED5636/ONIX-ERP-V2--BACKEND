@@ -1,7 +1,8 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { DepartmentStatus, UserRole } from '@prisma/client';
+import { DepartmentStatus, Prisma, UserRole } from '@prisma/client';
+import { buildCompanyScopeAliases } from '../utils/company-name-aliases';
 
 /**
  * Get all departments for a specific company
@@ -19,10 +20,11 @@ export const getCompanyDepartments = async (req: AuthRequest, res: Response): Pr
       sortOrder = 'desc'
     } = req.query;
 
-    // Verify company exists
+    // Verify company exists (include parent for branch aliasing)
     const company = await prisma.company.findUnique({
       where: { id: companyId },
-    });
+      select: { id: true, name: true, parentCompanyId: true } as any,
+    }) as any;
 
     if (!company) {
       res.status(404).json({ 
@@ -80,23 +82,97 @@ export const getCompanyDepartments = async (req: AuthRequest, res: Response): Pr
       prisma.department.count({ where }),
     ]);
 
-    // Align with Employee Directory: same role filter + isActive + User.company string matches Company.name
-    const employeeWhereBase = {
-      role: { notIn: [UserRole.ADMIN, UserRole.TENDER_ENGINEER] },
+    let parentName: string | null = null;
+    if (company?.parentCompanyId) {
+      const parent = await prisma.company.findUnique({
+        where: { id: String(company.parentCompanyId).trim() },
+        select: { name: true } as any,
+      }) as any;
+      parentName = parent?.name ? String(parent.name).trim() : null;
+    }
+    const companyAliases = buildCompanyScopeAliases(company.name, parentName);
+    const employeeDirectoryBase: Prisma.UserWhereInput = {
+      role: { notIn: [UserRole.TENDER_ENGINEER] },
       isActive: true,
-      company: { equals: company.name, mode: 'insensitive' as const },
+      ...(companyAliases.length > 0
+        ? {
+            OR: companyAliases.map((n) => ({
+              company: { equals: n, mode: 'insensitive' as const },
+            })),
+          }
+        : { company: { equals: company.name, mode: 'insensitive' as const } }),
+    };
+
+    const deptIds = departments.map((d) => d.id);
+    const allSubs =
+      deptIds.length === 0
+        ? []
+        : await prisma.subDepartment.findMany({
+            where: { departmentId: { in: deptIds } },
+            select: { id: true, name: true, departmentId: true },
+          });
+    const subsByDeptId = new Map<string, { id: string; name: string }[]>();
+    for (const s of allSubs) {
+      const arr = subsByDeptId.get(s.departmentId) ?? [];
+      arr.push({ id: s.id, name: s.name });
+      subsByDeptId.set(s.departmentId, arr);
+    }
+    const subIdList = allSubs.map((s) => s.id);
+    const positionsUnderSubs =
+      subIdList.length === 0
+        ? []
+        : await prisma.position.findMany({
+            where: { subDepartmentId: { in: subIdList } },
+            select: { id: true, subDepartmentId: true },
+          });
+    const positionIdsBySubId = new Map<string, string[]>();
+    for (const p of positionsUnderSubs) {
+      const arr = positionIdsBySubId.get(p.subDepartmentId) ?? [];
+      arr.push(p.id);
+      positionIdsBySubId.set(p.subDepartmentId, arr);
+    }
+
+    const normKey = (s: string) => s.trim().toLowerCase();
+
+    const buildDeptMatchOr = (dept: { id: string; name: string }): Prisma.UserWhereInput[] => {
+      const clauses: Prisma.UserWhereInput[] = [];
+      const seen = new Set<string>();
+      const pushDeptString = (raw: string) => {
+        const t = raw?.trim();
+        if (!t) return;
+        const k = normKey(t);
+        if (seen.has(k)) return;
+        seen.add(k);
+        clauses.push({ department: { equals: t, mode: 'insensitive' } });
+      };
+      pushDeptString(dept.name);
+      const subs = subsByDeptId.get(dept.id) ?? [];
+      for (const s of subs) pushDeptString(s.name);
+      const positionIds: string[] = [];
+      for (const s of subs) {
+        positionIds.push(...(positionIdsBySubId.get(s.id) ?? []));
+      }
+      if (positionIds.length > 0) {
+        clauses.push({
+          positionAssignments: { some: { positionId: { in: positionIds } } },
+        });
+      }
+      return clauses;
     };
 
     const [companyActiveEmployeeTotal, ...perDeptCounts] = await Promise.all([
-      prisma.user.count({ where: employeeWhereBase }),
-      ...departments.map((dept) =>
-        prisma.user.count({
+      prisma.user.count({ where: employeeDirectoryBase }),
+      ...departments.map((dept) => {
+        const deptOr = buildDeptMatchOr(dept);
+        return prisma.user.count({
           where: {
-            ...employeeWhereBase,
-            department: { equals: dept.name, mode: 'insensitive' },
+            AND: [
+              employeeDirectoryBase,
+              deptOr.length > 0 ? { OR: deptOr } : { id: { in: [] } },
+            ],
           },
-        })
-      ),
+        });
+      }),
     ]);
 
     const enrichedDepartments = departments.map((dept, i) => ({

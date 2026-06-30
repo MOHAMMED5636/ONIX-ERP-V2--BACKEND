@@ -1302,7 +1302,7 @@ export const exportSurveyCsv = async (req: AuthRequest, res: Response): Promise<
 export const deleteFeedbackSurvey = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const role = req.user?.role;
-    if (!role || !['ADMIN', 'HR'].includes(role)) {
+    if (!canManageOrgSurveys(role)) {
       res.status(403).json({ success: false, message: 'Only admin or HR can delete surveys.' });
       return;
     }
@@ -1326,7 +1326,7 @@ export const deleteFeedbackSurvey = async (req: AuthRequest, res: Response): Pro
 export const updateFeedbackSurveyStatus = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const role = req.user?.role;
-    if (!role || !['ADMIN', 'HR'].includes(role)) {
+    if (!canManageOrgSurveys(role)) {
       res.status(403).json({ success: false, message: 'Only admin or HR can update survey status.' });
       return;
     }

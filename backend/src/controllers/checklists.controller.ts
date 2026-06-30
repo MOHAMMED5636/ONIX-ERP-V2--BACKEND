@@ -1,6 +1,11 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
+import {
+  ensureProjectWriteAllowed,
+  ensureTaskProjectWriteAllowed,
+  PROJECT_SUSPENDED_MESSAGE,
+} from '../utils/project-suspension';
 
 // Project Checklists
 
@@ -29,6 +34,20 @@ export const createProjectChecklist = async (req: AuthRequest, res: Response): P
   try {
     const { projectId } = req.params;
     const { title, description, order } = req.body;
+
+    try {
+      await ensureProjectWriteAllowed(projectId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
 
     if (!title) {
       res.status(400).json({
@@ -63,6 +82,20 @@ export const updateProjectChecklist = async (req: AuthRequest, res: Response): P
   try {
     const { projectId, checklistId } = req.params;
     const { title, description, isCompleted, order } = req.body;
+
+    try {
+      await ensureProjectWriteAllowed(projectId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
 
     const checklist = await prisma.projectChecklist.findFirst({
       where: {
@@ -106,6 +139,20 @@ export const updateProjectChecklist = async (req: AuthRequest, res: Response): P
 export const deleteProjectChecklist = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { projectId, checklistId } = req.params;
+
+    try {
+      await ensureProjectWriteAllowed(projectId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
 
     const checklist = await prisma.projectChecklist.findFirst({
       where: {
@@ -161,6 +208,20 @@ export const createTaskChecklist = async (req: AuthRequest, res: Response): Prom
     const { taskId } = req.params;
     const { title, order } = req.body;
 
+    try {
+      await ensureTaskProjectWriteAllowed(taskId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
+
     if (!title) {
       res.status(400).json({
         success: false,
@@ -193,6 +254,20 @@ export const updateTaskChecklist = async (req: AuthRequest, res: Response): Prom
   try {
     const { taskId, checklistId } = req.params;
     const { title, isCompleted, order } = req.body;
+
+    try {
+      await ensureTaskProjectWriteAllowed(taskId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
 
     const checklist = await prisma.taskChecklist.findFirst({
       where: {
@@ -235,6 +310,20 @@ export const updateTaskChecklist = async (req: AuthRequest, res: Response): Prom
 export const deleteTaskChecklist = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { taskId, checklistId } = req.params;
+
+    try {
+      await ensureTaskProjectWriteAllowed(taskId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
 
     const checklist = await prisma.taskChecklist.findFirst({
       where: {

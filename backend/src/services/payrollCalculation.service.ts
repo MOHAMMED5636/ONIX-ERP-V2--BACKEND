@@ -91,7 +91,13 @@ export async function calculatePayrollLineForEmployee(params: {
   // Adjust later if the UI requires a different breakdown.
   const snapshotAllowance1 =
     allowances
-      .filter((a) => a.allowanceType === 'HRA' || a.allowanceType === 'BONUS' || a.allowanceType === 'OTHER')
+      .filter(
+        (a) =>
+          a.allowanceType === 'HRA' ||
+          a.allowanceType === 'BONUS' ||
+          a.allowanceType === 'MOBILE_CONNECTIVITY' ||
+          a.allowanceType === 'OTHER',
+      )
       .reduce((sum, a) => sum + Number(a.amount ?? 0), 0) || 0;
 
   const snapshotAllowance2 =

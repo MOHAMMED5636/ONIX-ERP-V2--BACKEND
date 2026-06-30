@@ -25,6 +25,19 @@ export async function permanentlyDeleteUser(userId: string): Promise<void> {
       await tx.questionnaireAssignment.updateMany({ where: { assignedBy: userId }, data: { assignedBy: null } });
 
       await tx.feedbackSurvey.updateMany({ where: { createdBy: userId }, data: { createdBy: null } });
+      await tx.feedbackSurvey.updateMany({ where: { ownerId: userId }, data: { ownerId: null } });
+
+      await tx.feedbackSurveyCollaborator.deleteMany({ where: { userId } });
+      await tx.feedbackSurveyAssignment.deleteMany({ where: { userId } });
+      await tx.feedbackSurveyResponse.deleteMany({ where: { userId } });
+
+      await tx.feedbackSurveyShareLink.updateMany({
+        where: { createdById: userId },
+        data: { createdById: null },
+      });
+
+      await tx.teamChatParticipant.deleteMany({ where: { userId } });
+      await tx.teamChatMessage.updateMany({ where: { senderId: userId }, data: { senderId: null } });
 
       await tx.companyPolicy.updateMany({ where: { createdById: userId }, data: { createdById: null } });
 
@@ -41,6 +54,7 @@ export async function permanentlyDeleteUser(userId: string): Promise<void> {
       await tx.leave.deleteMany({ where: { userId } });
 
       await tx.projectAssignment.deleteMany({ where: { employeeId: userId } });
+      await tx.projectChatParticipant.deleteMany({ where: { userId } });
       await tx.taskAssignment.deleteMany({ where: { employeeId: userId } });
 
       await tx.taskDelegation.deleteMany({

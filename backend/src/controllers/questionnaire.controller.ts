@@ -2,6 +2,11 @@ import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { QuestionnaireAnswer } from '@prisma/client';
+import {
+  ensureProjectWriteAllowed,
+  ensureTaskProjectWriteAllowed,
+  PROJECT_SUSPENDED_MESSAGE,
+} from '../utils/project-suspension';
 
 // ============================================
 // QUESTIONNAIRE TEMPLATES
@@ -96,7 +101,7 @@ export const createQuestionnaireTemplate = async (req: AuthRequest, res: Respons
   try {
     // Check if user is manager/admin/hr
     const userRole = req.user?.role;
-    if (!['ADMIN', 'PROJECT_MANAGER', 'HR'].includes(userRole || '')) {
+    if (!['ADMIN', 'PROJECT_MANAGER', 'HR', 'SUPER_ADMIN'].includes(userRole || '')) {
       res.status(403).json({
         success: false,
         message: 'Access denied. Only managers can create templates.',
@@ -150,7 +155,7 @@ export const createQuestionnaireTemplate = async (req: AuthRequest, res: Respons
 export const updateQuestionnaireTemplate = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    if (!['ADMIN', 'PROJECT_MANAGER', 'HR'].includes(userRole || '')) {
+    if (!['ADMIN', 'PROJECT_MANAGER', 'HR', 'SUPER_ADMIN'].includes(userRole || '')) {
       res.status(403).json({
         success: false,
         message: 'Access denied. Only managers can update templates.',
@@ -172,7 +177,7 @@ export const updateQuestionnaireTemplate = async (req: AuthRequest, res: Respons
 
     if (template.isLocked && isLocked === false) {
       // Only allow unlocking if user has permission
-      if (userRole !== 'ADMIN') {
+      if (userRole !== 'ADMIN' && userRole !== 'SUPER_ADMIN') {
         res.status(403).json({
           success: false,
           message: 'Only admins can unlock templates.',
@@ -206,7 +211,7 @@ export const updateQuestionnaireTemplate = async (req: AuthRequest, res: Respons
 export const deleteQuestionnaireTemplate = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    if (!['ADMIN', 'PROJECT_MANAGER', 'HR'].includes(userRole || '')) {
+    if (!['ADMIN', 'PROJECT_MANAGER', 'HR', 'SUPER_ADMIN'].includes(userRole || '')) {
       res.status(403).json({
         success: false,
         message: 'Access denied. Only managers can delete templates.',
@@ -299,7 +304,7 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
     console.log('📝 User:', { id: req.user?.id, role: req.user?.role });
     
     const userRole = req.user?.role;
-    if (!['ADMIN', 'PROJECT_MANAGER', 'HR'].includes(userRole || '')) {
+    if (!['ADMIN', 'PROJECT_MANAGER', 'HR', 'SUPER_ADMIN'].includes(userRole || '')) {
       res.status(403).json({
         success: false,
         message: 'Access denied. Only managers can create questions.',
@@ -407,7 +412,7 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
 export const updateQuestion = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    if (!['ADMIN', 'PROJECT_MANAGER', 'HR'].includes(userRole || '')) {
+    if (!['ADMIN', 'PROJECT_MANAGER', 'HR', 'SUPER_ADMIN'].includes(userRole || '')) {
       res.status(403).json({
         success: false,
         message: 'Access denied. Only managers can update questions.',
@@ -427,7 +432,7 @@ export const updateQuestion = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    if (question.isLocked && isLocked === false && userRole !== 'ADMIN') {
+    if (question.isLocked && isLocked === false && userRole !== 'ADMIN' && userRole !== 'SUPER_ADMIN') {
       res.status(403).json({
         success: false,
         message: 'Only admins can unlock questions.',
@@ -461,7 +466,7 @@ export const updateQuestion = async (req: AuthRequest, res: Response): Promise<v
 export const deleteQuestion = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    if (!['ADMIN', 'PROJECT_MANAGER', 'HR'].includes(userRole || '')) {
+    if (!['ADMIN', 'PROJECT_MANAGER', 'HR', 'SUPER_ADMIN'].includes(userRole || '')) {
       res.status(403).json({
         success: false,
         message: 'Access denied. Only managers can delete questions.',
@@ -478,6 +483,24 @@ export const deleteQuestion = async (req: AuthRequest, res: Response): Promise<v
     if (!question) {
       res.status(404).json({ success: false, message: 'Question not found' });
       return;
+    }
+
+    try {
+      if (question.taskId) {
+        await ensureTaskProjectWriteAllowed(question.taskId, req.user, prisma);
+      } else if (question.projectId) {
+        await ensureProjectWriteAllowed(question.projectId, req.user, prisma);
+      }
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
     }
 
     if (question.isLocked) {
@@ -625,7 +648,7 @@ export const getResponses = async (req: AuthRequest, res: Response): Promise<voi
 
     // Employees can only see their own responses, managers can see all
     const where: any = { questionId };
-    if (!['ADMIN', 'PROJECT_MANAGER', 'HR'].includes(userRole || '')) {
+    if (!['ADMIN', 'PROJECT_MANAGER', 'HR', 'SUPER_ADMIN'].includes(userRole || '')) {
       where.answeredBy = userId;
     }
 
@@ -664,7 +687,7 @@ export const getResponses = async (req: AuthRequest, res: Response): Promise<voi
 export const lockResponse = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    if (!['ADMIN', 'PROJECT_MANAGER', 'HR'].includes(userRole || '')) {
+    if (!['ADMIN', 'PROJECT_MANAGER', 'HR', 'SUPER_ADMIN'].includes(userRole || '')) {
       res.status(403).json({
         success: false,
         message: 'Access denied. Only managers can lock responses.',
@@ -708,7 +731,7 @@ export const lockResponse = async (req: AuthRequest, res: Response): Promise<voi
 export const assignTemplate = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const userRole = req.user?.role;
-    if (!['ADMIN', 'PROJECT_MANAGER', 'HR'].includes(userRole || '')) {
+    if (!['ADMIN', 'PROJECT_MANAGER', 'HR', 'SUPER_ADMIN'].includes(userRole || '')) {
       res.status(403).json({
         success: false,
         message: 'Access denied. Only managers can assign templates.',
@@ -897,3 +920,4 @@ export const getQuestionnaireStatus = async (req: AuthRequest, res: Response): P
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
+

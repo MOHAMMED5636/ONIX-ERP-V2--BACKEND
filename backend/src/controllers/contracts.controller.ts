@@ -1,10 +1,37 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { computeNextProjectNumber } from '../utils/project-number';
+import { runContractLoadOutTransaction } from '../utils/loadOutDuplicateProject';
+import {
+  buildAssignedManagerFilter,
+  getEffectiveRole,
+  isContractAssignedToUser,
+  requiresAssignedManagerScope,
+} from '../utils/managerScope';
 import { ContractStatus, UserRole } from '@prisma/client';
+import { buildCompanyScopeAliases } from '../utils/company-name-aliases';
+import { resolveCompanyAccessScope } from '../services/companyAccess.service';
+import { notifyPmProjectAssignment } from '../services/projectPmAssignmentNotice.service';
+import { notifyContractCreatedForPm } from '../services/emailDispatch.service';
 
-// Generate unique reference number for contract
+/** Merge an extra Prisma condition into a mutable `where` clause. */
+function mergeIntoWhere(where: Record<string, unknown>, extra: Record<string, unknown>): void {
+  if (!extra || Object.keys(extra).length === 0) return;
+  if (Array.isArray(where.AND)) {
+    (where.AND as unknown[]).push(extra);
+    return;
+  }
+  const snapshot = { ...where };
+  const keys = Object.keys(snapshot).filter((k) => snapshot[k] !== undefined);
+  if (keys.length === 0) {
+    Object.assign(where, extra);
+    return;
+  }
+  for (const k of keys) delete where[k];
+  where.AND = [snapshot, extra];
+}
+
+import { buildContractBranchFilter } from '../utils/contractBranchFilter';
 async function generateReferenceNumber(): Promise<string> {
   const prefix = 'O-CT-';
   let referenceNumber: string;
@@ -37,6 +64,170 @@ async function generateReferenceNumber(): Promise<string> {
   return referenceNumber!;
 }
 
+function parseContractJsonField<T>(value: unknown, fallback: T): T {
+  if (value == null || value === '') return fallback;
+  if (typeof value === 'object') return value as T;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return (parsed ?? fallback) as T;
+    } catch {
+      return fallback;
+    }
+  }
+  return fallback;
+}
+
+/** Parse JSON text columns on Contract for API clients (edit form, etc.). */
+export function shapeContractForClient(contract: Record<string, unknown> | null) {
+  if (!contract) return contract;
+  return {
+    ...contract,
+    projectNature: parseContractJsonField<unknown[]>(contract.projectNature, []),
+    contractFees: parseContractJsonField<unknown[]>(contract.contractFees, []),
+    contractPhases: parseContractJsonField<unknown[]>(contract.contractPhases, []),
+    selectedClients: parseContractJsonField<unknown[]>(contract.selectedClients, []),
+    attachments: parseContractJsonField<unknown[]>(contract.attachments, []),
+  };
+}
+
+function parseContractPhasesField(
+  contractPhases: unknown,
+): string | null {
+  if (contractPhases == null || contractPhases === '') return null;
+  if (typeof contractPhases === 'string') {
+    try {
+      const parsed = JSON.parse(contractPhases);
+      if (Array.isArray(parsed)) {
+        const names = parsed
+          .map((p) => (typeof p === 'string' ? p.trim() : String((p as { name?: string })?.name || '').trim()))
+          .filter(Boolean);
+        return names.length > 0 ? JSON.stringify(names) : null;
+      }
+    } catch {
+      const single = contractPhases.trim();
+      return single ? JSON.stringify([single]) : null;
+    }
+  }
+  if (Array.isArray(contractPhases)) {
+    const names = contractPhases
+      .map((p) => (typeof p === 'string' ? p.trim() : String((p as { name?: string })?.name || '').trim()))
+      .filter(Boolean);
+    return names.length > 0 ? JSON.stringify(names) : null;
+  }
+  return null;
+}
+
+/**
+ * Load Out picker: contracts not linked to an active project.
+ * Includes unlinked contracts and contracts whose project was moved to trash.
+ */
+function applyLoadOutPendingContractsFilter(where: Record<string, any>) {
+  if (
+    where.projectId != null &&
+    typeof where.projectId === 'object' &&
+    !Array.isArray(where.projectId) &&
+    'in' in where.projectId
+  ) {
+    return;
+  }
+  const pending = {
+    OR: [
+      { projectId: null },
+      { project: { deletedAt: { not: null } } },
+    ],
+  };
+  if (Array.isArray(where.AND)) {
+    where.AND.push(pending);
+    return;
+  }
+  const standalone = Object.keys(where).filter((k) => k !== 'AND' && k !== 'OR');
+  if (where.OR && standalone.length === 0) {
+    where.AND = [{ OR: where.OR }, pending];
+    delete where.OR;
+    return;
+  }
+  if (where.OR && standalone.length > 0) {
+    const rest: Record<string, any> = {};
+    for (const k of standalone) {
+      rest[k] = where[k];
+      delete where[k];
+    }
+    const orVal = where.OR;
+    delete where.OR;
+    where.AND = [{ OR: orVal }, rest, pending];
+    return;
+  }
+  Object.assign(where, pending);
+}
+
+function mergeIntoWhereAnd(where: Record<string, any>, clause: Record<string, any>) {
+  if (Array.isArray(where.AND)) {
+    where.AND.push(clause);
+    return;
+  }
+  const standalone = Object.keys(where).filter((k) => k !== 'AND' && k !== 'OR');
+  if (where.OR && standalone.length === 0) {
+    const orVal = where.OR;
+    delete where.OR;
+    where.AND = [{ OR: orVal }, clause];
+    return;
+  }
+  if (where.OR && standalone.length > 0) {
+    const rest: Record<string, any> = {};
+    for (const k of standalone) {
+      rest[k] = where[k];
+      delete where[k];
+    }
+    const orVal = where.OR;
+    delete where.OR;
+    where.AND = [{ OR: orVal }, rest, clause];
+    return;
+  }
+  if (standalone.length > 0) {
+    const rest: Record<string, any> = {};
+    for (const k of standalone) {
+      rest[k] = where[k];
+      delete where[k];
+    }
+    where.AND = [rest, clause];
+    return;
+  }
+  Object.assign(where, clause);
+}
+
+/** Link contracts to projects when ref matches but projectId was never set (legacy load-outs). */
+async function repairOrphanedContractProjectLinks(): Promise<number> {
+  const result = await prisma.$executeRaw`
+    UPDATE contracts c
+    SET "projectId" = p.id
+    FROM projects p
+    WHERE c."projectId" IS NULL
+      AND c."referenceNumber" = p."referenceNumber"
+  `;
+  return typeof result === 'number' ? result : 0;
+}
+
+/** Exclude contracts whose reference already exists as an active (non-deleted) project. */
+async function applyLoadOutNotYetLoadedFilter(where: Record<string, any>) {
+  const projects = await prisma.project.findMany({
+    where: { deletedAt: null },
+    select: { referenceNumber: true },
+  });
+  const refs = [...new Set(projects.map((p) => p.referenceNumber).filter(Boolean))] as string[];
+  if (!refs.length) return;
+  mergeIntoWhereAnd(where, { NOT: { referenceNumber: { in: refs } } });
+}
+
+async function prepareLoadOutContractFilters(where: Record<string, any>) {
+  const repaired = await repairOrphanedContractProjectLinks();
+  if (repaired > 0) {
+    console.log(`🔗 Repaired ${repaired} orphaned contract→project link(s) for Load Out list`);
+  }
+  applyLoadOutPendingContractsFilter(where);
+  await applyLoadOutNotYetLoadedFilter(where);
+}
+
 // Get all contracts with filters
 export const getAllContracts = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -51,10 +242,15 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
       sortBy = 'createdAt',
       sortOrder = 'desc',
       forLoadOut, // Query parameter to indicate this is for Load Out modal (filter by assigned manager)
+      companyId: companyIdQuery,
     } = req.query;
 
+    const forLoadOutBool = String(forLoadOut || '').toLowerCase() === 'true';
+
     const pageNum = Math.max(1, parseInt(page as string, 10));
-    const limitNum = Math.max(1, Math.min(100, parseInt(limit as string, 10)));
+    const limitNum = forLoadOutBool
+      ? Math.max(1, Math.min(1000, parseInt(limit as string, 10) || 1000))
+      : Math.max(1, Math.min(100, parseInt(limit as string, 10)));
     const skip = (pageNum - 1) * limitNum;
 
     const where: any = {};
@@ -62,10 +258,10 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
 
     // STRICT ROLE-BASED FILTERING - Backend enforcement
     const userRole = req.user?.role;
+    const effectiveRole = getEffectiveRole(userRole);
     const userEmail = req.user?.email;
 
-    if (userRole === 'MANAGER') {
-      // Manager: Always return ONLY contracts assigned to this manager's email OR ID
+    if (requiresAssignedManagerScope(effectiveRole)) {
       if (!userEmail || !req.user?.id) {
         res.status(403).json({
           success: false,
@@ -74,13 +270,15 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
         });
         return;
       }
-      // Check both assignedManagerEmail (direct match) OR assignedManagerId (via relation)
-      // Store manager filter separately to combine with other filters later
       managerFilterApplied = true;
-      console.log(`🔒 Manager filtering: Only showing contracts assigned to ${userEmail} (ID: ${req.user.id})`);
-    } else if ((userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') && forLoadOut === 'true') {
-      // For Load Out modal: ADMIN/HR/PROJECT_MANAGER should only see contracts assigned to them
-      // This ensures managers only see their own contracts in the Load Out interface
+      console.log(
+        `🔒 ${effectiveRole} filtering: Only contracts assigned to ${userEmail} (ID: ${req.user.id})`,
+      );
+    } else if (
+      userRole !== 'SUPER_ADMIN' &&
+      (effectiveRole === 'ADMIN' || effectiveRole === 'HR') &&
+      forLoadOut === 'true'
+    ) {
       if (!userEmail || !req.user?.id) {
         res.status(403).json({
           success: false,
@@ -89,53 +287,14 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
         });
         return;
       }
-      // Check both assignedManagerEmail (direct match) OR assignedManagerId (via relation)
-      // Store manager filter separately to combine with other filters later
       managerFilterApplied = true;
       console.log(`🔒 Load Out filtering: Only showing contracts assigned to ${userEmail} (ID: ${req.user.id})`);
-    } else if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
-      // Admin, HR, Project Manager: Return all contracts (no filtering) for general contract list
-      // where clause remains empty
-    } else if (userRole === 'EMPLOYEE') {
-      // Employee: Do not return contracts unless specifically linked to their tasks
-      // Check if employee has tasks linked to contracts via projects
-      const employeeTasks = await prisma.task.findMany({
-        where: {
-          OR: [
-            { assignments: { some: { employeeId: req.user!.id } } },
-            { assignedEmployeeId: req.user!.id },
-          ],
-        },
-        select: {
-          projectId: true,
-        },
-        distinct: ['projectId'],
-      });
-
-      const projectIds = employeeTasks.map(t => t.projectId).filter(Boolean) as string[];
-      
-      if (projectIds.length === 0) {
-        // No tasks linked to projects, return empty result
-        res.json({
-          success: true,
-          data: {
-            contracts: [],
-            pagination: {
-              page: pageNum,
-              limit: limitNum,
-              total: 0,
-              totalPages: 0,
-            },
-          },
-        });
-        return;
-      }
-
-      // Only return contracts linked to projects where employee has tasks
-      where.projectId = {
-        in: projectIds,
-      };
-      console.log(`🔒 Employee filtering: Only showing contracts linked to projects with employee tasks`);
+    } else if (effectiveRole === 'ADMIN' || effectiveRole === 'HR') {
+      // Admin / HR: full catalog
+    } else if (effectiveRole === 'EMPLOYEE') {
+      // Employee: allow read-only access to the full contract catalog for company-wide project browsing.
+      // Write/load-out actions remain blocked by route role guards.
+      console.log('👁️ Employee read access: returning all contracts for view-only company projects');
     } else {
       // Other roles: No access
       res.status(403).json({
@@ -163,18 +322,33 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
       where.contractType = contractType as string;
     }
 
-    // Build manager filter (if needed)
-    const managerFilterConditions = managerFilterApplied ? [
-      { assignedManagerEmail: userEmail },
-      { assignedManagerId: req.user!.id }
-    ] : null;
+    const companyIdParam =
+      typeof companyIdQuery === 'string' && companyIdQuery.trim() ? companyIdQuery.trim() : '';
+    if (companyIdParam) {
+      const accessScope = await resolveCompanyAccessScope(req.user!.id, userRole);
+      if (!accessScope.unrestricted && !accessScope.companyIds.includes(companyIdParam)) {
+        res.status(403).json({
+          success: false,
+          message: 'Forbidden: you do not have access to contracts for this branch',
+        });
+        return;
+      }
+      mergeIntoWhere(where, await buildContractBranchFilter(companyIdParam));
+    }
+
+    const managerFilterConditions = managerFilterApplied
+      ? buildAssignedManagerFilter(req)
+      : null;
 
     if (search) {
       const searchTerm = (search as string).trim();
       
       // First, check if search term is an exact reference number match
       const exactReferenceMatchWhere: any = { referenceNumber: searchTerm };
-      
+      if (forLoadOutBool) {
+        exactReferenceMatchWhere.projectId = null;
+      }
+
       // Add manager filter to exact match check if needed
       if (managerFilterApplied) {
         exactReferenceMatchWhere.OR = [
@@ -282,6 +456,8 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
             });
             return;
           }
+        } else if (userRole === 'SUPER_ADMIN') {
+          // Org-wide access (ADMIN is assignment-scoped here for Load Out parity; Super Admin sees all matches)
         } else {
           res.status(403).json({
             success: false,
@@ -371,6 +547,10 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
       }
     }
 
+    if (forLoadOutBool) {
+      await prepareLoadOutContractFilters(where);
+    }
+
     const [contracts, total] = await Promise.all([
       prisma.contract.findMany({
         where,
@@ -386,6 +566,7 @@ export const getAllContracts = async (req: AuthRequest, res: Response): Promise<
               name: true,
               referenceNumber: true,
               status: true,
+              deletedAt: true,
             },
           },
           client: {
@@ -541,6 +722,7 @@ export const getContractByReferenceNumber = async (req: AuthRequest, res: Respon
       contractCategory: contract.contractCategory || null,
       plotNumber: contract.plotNumber || null,
       numberOfFloors: contract.numberOfFloors || null,
+      numberOfBasements: contract.numberOfBasements ?? null,
       region: contract.region || null,
       community: contract.community || null,
       makaniNumber: contract.makaniNumber || null,
@@ -632,13 +814,9 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // Role-based access control:
-    // - ADMIN/HR/PROJECT_MANAGER: may view any contract (except in Load Out context)
-    // - MANAGER: may only view contracts assigned to them
-    // - EMPLOYEE: may only view contracts linked to projects where they have tasks
-    //
-    // For Load Out flows, enforce "assigned only" for all privileged roles too.
-    if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
+    const effectiveRole = getEffectiveRole(userRole);
+
+    if (effectiveRole === 'ADMIN' || effectiveRole === 'HR') {
       if (forLoadOut) {
         if (!userEmail || !req.user?.id) {
           res.status(403).json({
@@ -648,7 +826,7 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
           });
           return;
         }
-        if (contract.assignedManagerEmail !== userEmail && contract.assignedManagerId !== req.user.id) {
+        if (!isContractAssignedToUser(contract, req)) {
           res.status(403).json({
             success: false,
             message: 'Access Denied: You can only view contracts assigned to you',
@@ -657,8 +835,7 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
           return;
         }
       }
-      // Otherwise: allowed
-    } else if (userRole === 'MANAGER') {
+    } else if (requiresAssignedManagerScope(effectiveRole)) {
       if (!userEmail || !req.user?.id) {
         res.status(403).json({
           success: false,
@@ -667,7 +844,7 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
         });
         return;
       }
-      if (contract.assignedManagerEmail !== userEmail && contract.assignedManagerId !== req.user.id) {
+      if (!isContractAssignedToUser(contract, req)) {
         res.status(403).json({
           success: false,
           message: 'Access Denied: You can only view contracts assigned to you',
@@ -675,7 +852,7 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
         });
         return;
       }
-    } else if (userRole === 'EMPLOYEE') {
+    } else if (effectiveRole === 'EMPLOYEE') {
       // Employee: Can only access contracts linked to projects where they have tasks
       if (contract.projectId) {
         const hasTask = await prisma.task.findFirst({
@@ -715,10 +892,9 @@ export const getContractById = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // data includes all contract fields (e.g. projectManager, referenceNumber, status, client, etc.)
     res.json({
       success: true,
-      data: contract,
+      data: shapeContractForClient(contract as Record<string, unknown>),
     });
   } catch (error: any) {
     console.error('❌ Error fetching contract:', error);
@@ -778,6 +954,7 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
       clientId,
       selectedClients, // Array of client IDs
       projectNature, // Array of project nature types
+      contractPhases, // Selected contract agreement phases (array of names)
       companyId,
       companyName,
       contractValue,
@@ -795,6 +972,7 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
       plotNumber,
       community,
       numberOfFloors,
+      numberOfBasements,
       // Building details
       buildingCost,
       builtUpArea,
@@ -1014,6 +1192,8 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
         parsedProjectNature = JSON.stringify(projectNature);
       }
     }
+
+    const parsedContractPhases = parseContractPhasesField(contractPhases);
 
     let parsedSelectedClients: string | null = null;
     if (selectedClients) {
@@ -1306,6 +1486,7 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
         clientId: clientId || null, // Primary client (if single)
         selectedClients: parsedSelectedClients, // Multiple clients as JSON
         projectNature: parsedProjectNature, // Project nature types as JSON
+        contractPhases: parsedContractPhases,
         companyId: companyId || null,
         companyName: companyName?.trim() || null,
         contractValue: contractValue ? parseFloat(contractValue) : null,
@@ -1392,6 +1573,42 @@ export const createContract = async (req: AuthRequest, res: Response): Promise<v
       console.log('✅ Project Manager Name from request was:', projectManagerName);
       if (finalAssignedManagerEmail) {
         console.log('✅ Contract assigned to manager:', finalAssignedManagerEmail);
+      }
+
+      if (finalAssignedManagerId && contract.projectId) {
+        await notifyPmProjectAssignment(
+          finalAssignedManagerId,
+          contract.projectId,
+          'ASSIGNMENT',
+          req.user.id,
+        );
+      } else if (finalAssignedManagerId) {
+        const manager = await prisma.user.findUnique({
+          where: { id: finalAssignedManagerId },
+          select: { id: true, email: true, firstName: true, lastName: true },
+        });
+        if (manager?.email) {
+          await notifyContractCreatedForPm({
+            manager,
+            contract: {
+              id: contract.id,
+              referenceNumber: contract.referenceNumber,
+              title: contract.title,
+              client: contract.clientId
+                ? await prisma.client.findUnique({
+                    where: { id: contract.clientId },
+                    select: { name: true },
+                  })
+                : null,
+            },
+            assignedBy: req.user
+              ? {
+                  firstName: (req.user as { firstName?: string }).firstName,
+                  lastName: (req.user as { lastName?: string }).lastName,
+                }
+              : null,
+          });
+        }
       }
 
       res.status(201).json({
@@ -1491,6 +1708,7 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       clientId,
       selectedClients,
       projectNature,
+      contractPhases,
       companyId,
       companyName,
       contractValue,
@@ -1508,6 +1726,7 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       plotNumber,
       community,
       numberOfFloors,
+      numberOfBasements,
       buildingCost,
       builtUpArea,
       buildingHeight,
@@ -1550,11 +1769,12 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
 
     // STRICT ROLE-BASED ACCESS CONTROL for updates
     const userRole = req.user?.role;
+    const effectiveRole = userRole === 'SUPER_ADMIN' ? 'ADMIN' : userRole;
     const userEmail = req.user?.email;
 
-    if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
+    if (effectiveRole === 'ADMIN' || effectiveRole === 'HR' || effectiveRole === 'PROJECT_MANAGER') {
       // Privileged roles: can update all contracts
-    } else if (userRole === 'MANAGER') {
+    } else if (effectiveRole === 'MANAGER') {
       // Manager: Can only update contracts assigned to their email OR ID
       if (!userEmail || !req.user?.id) {
         res.status(403).json({
@@ -1583,7 +1803,7 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
         });
         return;
       }
-    } else if (userRole === 'EMPLOYEE') {
+    } else if (effectiveRole === 'EMPLOYEE') {
       // Employee: Cannot update contracts
       res.status(403).json({
         success: false,
@@ -1607,7 +1827,7 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
 
     if (assignedManagerId !== undefined || assignedManagerEmail !== undefined) {
       // Only ADMIN can change manager assignment
-      if (userRole !== 'ADMIN') {
+      if (effectiveRole !== 'ADMIN') {
         res.status(403).json({
           success: false,
           message: 'Access Denied: Only admins can change manager assignments',
@@ -1631,7 +1851,7 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
           return;
         }
 
-        const allowedManagerRoles = ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'];
+        const allowedManagerRoles = ['MANAGER', 'PROJECT_MANAGER', 'ADMIN', 'SUPER_ADMIN'];
         if (!allowedManagerRoles.includes(manager.role)) {
           res.status(400).json({
             success: false,
@@ -1673,7 +1893,12 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
         finalAssignedManagerId = null;
         finalAssignedManagerEmail = null;
       }
-    } else if (userRole === 'ADMIN' && projectManagerName !== undefined && typeof projectManagerName === 'string' && projectManagerName.trim()) {
+    } else if (
+      (userRole === 'ADMIN' || userRole === 'SUPER_ADMIN') &&
+      projectManagerName !== undefined &&
+      typeof projectManagerName === 'string' &&
+      projectManagerName.trim()
+    ) {
       // Admin may have set/updated only the manager display name; resolve to ID/email so manager sees contract
       const nameTrimmed = projectManagerName.trim();
       let resolvedManager: { id: string; email: string } | null = null;
@@ -1826,6 +2051,11 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       } else {
         parsedSelectedClients = JSON.stringify(selectedClients);
       }
+    }
+
+    let parsedContractPhasesUpdate: string | null | undefined = undefined;
+    if (contractPhases !== undefined) {
+      parsedContractPhasesUpdate = parseContractPhasesField(contractPhases);
     }
 
     let parsedContractFees = existingContract.contractFees;
@@ -1986,6 +2216,8 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
         clientId: clientId !== undefined ? (clientId || null) : undefined,
         selectedClients: selectedClients !== undefined ? parsedSelectedClients : undefined,
         projectNature: projectNature !== undefined ? parsedProjectNature : undefined,
+        contractPhases:
+          contractPhases !== undefined ? parsedContractPhasesUpdate : undefined,
         companyId: companyId !== undefined ? (companyId || null) : undefined,
         companyName: companyName !== undefined ? (companyName?.trim() || null) : undefined,
         contractValue: contractValue !== undefined ? (contractValue ? parseFloat(contractValue) : null) : undefined,
@@ -2003,6 +2235,12 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
         plotNumber: plotNumber !== undefined ? (plotNumber?.trim() || null) : undefined,
         community: community !== undefined ? (community?.trim() || null) : undefined,
         numberOfFloors: numberOfFloors !== undefined ? (numberOfFloors ? parseInt(numberOfFloors) : null) : undefined,
+        numberOfBasements:
+          numberOfBasements !== undefined
+            ? numberOfBasements
+              ? parseInt(numberOfBasements)
+              : null
+            : undefined,
         // Building details
         buildingCost: buildingCost !== undefined ? parsedBuildingCost : undefined,
         builtUpArea: builtUpArea !== undefined ? parsedBuiltUpArea : undefined,
@@ -2069,9 +2307,36 @@ export const updateContract = async (req: AuthRequest, res: Response): Promise<v
       console.log('✅ Contract manager assignment updated:', finalAssignedManagerEmail || 'removed');
     }
 
+    if (
+      finalAssignedManagerId !== undefined &&
+      finalAssignedManagerId &&
+      finalAssignedManagerId !== existingContract.assignedManagerId
+    ) {
+      const linkedProjectId = contract.projectId ?? existingContract.projectId;
+      if (linkedProjectId) {
+        await notifyPmProjectAssignment(
+          finalAssignedManagerId,
+          linkedProjectId,
+          'ASSIGNMENT',
+          req.user?.id,
+        );
+      }
+    } else if (
+      projectId !== undefined &&
+      projectId &&
+      !existingContract.projectId &&
+      (contract.assignedManagerId || existingContract.assignedManagerId)
+    ) {
+      const linkedProjectId = contract.projectId ?? String(projectId);
+      const managerId = contract.assignedManagerId ?? existingContract.assignedManagerId;
+      if (managerId && linkedProjectId) {
+        await notifyPmProjectAssignment(managerId, linkedProjectId, 'ASSIGNMENT', req.user?.id);
+      }
+    }
+
     res.json({
       success: true,
-      data: contract,
+      data: shapeContractForClient(contract as Record<string, unknown>),
       message: 'Contract updated successfully',
     });
   } catch (error: any) {
@@ -2226,6 +2491,7 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
         plotNumber: true,
         community: true,
         numberOfFloors: true,
+        numberOfBasements: true,
         // Additional fields
         specialClauses: true,
         termsAndConditions: true,
@@ -2265,11 +2531,9 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // STRICT ROLE-BASED ACCESS CONTROL for load out
-    if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
-      // Admin, HR, and PROJECT_MANAGER can load out any contract
-    } else if (userRole === 'MANAGER') {
-      // Manager: Can only load out contracts assigned to them
+    if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'SUPER_ADMIN') {
+      // Admin / HR / Super Admin: any contract
+    } else if (userRole === 'MANAGER' || userRole === 'PROJECT_MANAGER') {
       if (!userEmail || !req.user?.id) {
         res.status(403).json({
           success: false,
@@ -2278,9 +2542,7 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
         });
         return;
       }
-      // Check both assignedManagerEmail and assignedManagerId
-      if (contract.assignedManagerEmail !== userEmail && 
-          contract.assignedManagerId !== req.user.id) {
+      if (!isContractAssignedToUser(contract, req)) {
         res.status(403).json({
           success: false,
           message: 'Access Denied: You can only load out contracts assigned to you',
@@ -2298,126 +2560,34 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // Allow loading out contracts multiple times - just log if already linked
-    if (contract.projectId && contract.project) {
-      console.log(`ℹ️ Contract ${contract.referenceNumber} already linked to project ${contract.project.referenceNumber}. Creating new project anyway.`);
+    const { project, mode } = await prisma.$transaction(
+      async (tx) => runContractLoadOutTransaction(tx, contract as any, req.user?.id ?? null),
+      { isolationLevel: 'Serializable' as any }
+    );
+
+    if (mode === 'copied') {
+      console.log(
+        `✅ Load Out (copy): Contract ${contract.referenceNumber} → Project ${project.referenceNumber} (duplicated ERP project + tasks)`
+      );
+    } else {
+      console.log(`✅ Load Out (new): Contract ${contract.referenceNumber} → Project ${project.referenceNumber}`);
     }
 
-    // Use contract reference number as project reference number
-    // If a project with this reference number already exists, append a suffix
-    const baseReferenceNumber = contract.referenceNumber;
-    let projectReferenceNumber: string = baseReferenceNumber;
-    let suffix = 1;
-
-    // Check if project with base reference number exists, if so, append suffix
-    while (true) {
-      const existingProject = await prisma.project.findUnique({
-        where: { referenceNumber: projectReferenceNumber },
-      });
-
-      if (!existingProject) {
-        // This reference number is available, use it
-        break;
-      }
-
-      // Append suffix to make it unique (e.g., "7896-1", "7896-2")
-      projectReferenceNumber = `${baseReferenceNumber}-${suffix}`;
-      suffix++;
-
-      // Safety check to prevent infinite loop
-      if (suffix > 1000) {
-        // Fallback to timestamp-based suffix if too many attempts
-        const timestamp = Date.now().toString(36).toUpperCase().substring(0, 6);
-        projectReferenceNumber = `${baseReferenceNumber}-${timestamp}`;
-        break;
-      }
+    if (contract.assignedManagerId) {
+      await notifyPmProjectAssignment(
+        contract.assignedManagerId,
+        project.id,
+        'ASSIGNMENT',
+        req.user?.id,
+      );
     }
-
-    if (suffix > 1) {
-      console.log(`ℹ️ Project with reference number ${baseReferenceNumber} already exists. Using: ${projectReferenceNumber}`);
-    }
-
-    // Calculate plan days from contract dates if available
-    let planDays: number | null = null;
-    if (contract.startDate && contract.endDate) {
-      const start = new Date(contract.startDate);
-      const end = new Date(contract.endDate);
-      const diffTime = Math.abs(end.getTime() - start.getTime());
-      planDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // +1 to include both start and end days
-    }
-
-    // Map contract fields to project fields
-    const projectName = contract.title || `Project ${contract.referenceNumber}`;
-    // Prefer assigned manager's name so project shows correct PM (e.g. muffazzal not mohammednazar)
-    const contractWithManager = contract as typeof contract & { assignedManager?: { firstName: string; lastName: string } | null };
-    const projectManager = (contractWithManager.assignedManager
-      ? `${contractWithManager.assignedManager.firstName} ${contractWithManager.assignedManager.lastName}`.trim().substring(0, 100)
-      : null)
-      || (contract.projectManager ? contract.projectManager.trim().substring(0, 100) : null)
-      || (contract.creator ? `${contract.creator.firstName} ${contract.creator.lastName}`.trim().substring(0, 100) : null);
-
-    // Build location string from coordinates or makani number
-    let locationString: string | null = null;
-    if (contract.makaniNumber) {
-      locationString = contract.makaniNumber;
-    } else if (contract.latitude && contract.longitude) {
-      locationString = `${contract.latitude}, ${contract.longitude}`;
-    }
-
-    // Create project from contract data
-    const project = await prisma.$transaction(async (tx) => {
-      const projectNumber = await computeNextProjectNumber(tx as any);
-      return tx.project.create({
-        data: {
-          projectNumber,
-          name: projectName,
-          referenceNumber: projectReferenceNumber,
-          pin: null, // Can be set later if needed
-          clientId: contract.clientId || null,
-          owner: contract.developerName || null,
-          description: contract.description || null,
-          status: 'OPEN', // Default status
-          projectManager: projectManager,
-          startDate: contract.startDate ? new Date(contract.startDate) : null,
-          endDate: contract.endDate ? new Date(contract.endDate) : null,
-          deadline: contract.endDate ? new Date(contract.endDate) : null, // Use end date as deadline
-          planDays: planDays,
-          remarks: contract.specialClauses || contract.termsAndConditions || null,
-          assigneeNotes: contract.paymentTerms || null,
-          // Location & Project Details from contract
-          location: locationString,
-          makaniNumber: contract.makaniNumber || null,
-          plotNumber: contract.plotNumber || null,
-          community: contract.community || null,
-          projectType: contract.contractType || null,
-          projectFloor: contract.numberOfFloors ? contract.numberOfFloors.toString() : null,
-          developerProject: contract.developerName || null,
-          createdBy: req.user?.id || null,
-        },
-        include: {
-          client: true,
-          contracts: {
-            select: {
-              id: true,
-              referenceNumber: true,
-              title: true,
-            },
-          },
-        },
-      });
-    }, { isolationLevel: 'Serializable' as any });
-
-    // Link contract to the created project
-    await prisma.contract.update({
-      where: { id: contract.id },
-      data: { projectId: project.id },
-    });
-
-    console.log(`✅ Load Out successful: Contract ${contract.referenceNumber} → Project ${project.referenceNumber}`);
 
     res.json({
       success: true,
-      message: `Project ${project.referenceNumber} created successfully from contract ${contract.referenceNumber}`,
+      message:
+        mode === 'copied'
+          ? `Project ${project.referenceNumber} duplicated from existing ERP work (including tasks) for contract ${contract.referenceNumber}`
+          : `Project ${project.referenceNumber} created successfully from contract ${contract.referenceNumber}`,
       data: {
         project: {
           id: project.id,
@@ -2444,6 +2614,7 @@ export const loadOutContract = async (req: AuthRequest, res: Response): Promise<
           community: contract.community,
           contractType: contract.contractType,
           numberOfFloors: contract.numberOfFloors,
+          numberOfBasements: contract.numberOfBasements,
           makaniNumber: contract.makaniNumber,
           developerName: contract.developerName,
         },
@@ -2525,6 +2696,7 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
             plotNumber: true,
             community: true,
             numberOfFloors: true,
+        numberOfBasements: true,
             specialClauses: true,
             termsAndConditions: true,
             paymentTerms: true,
@@ -2563,11 +2735,9 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
           continue;
         }
 
-        // STRICT ROLE-BASED ACCESS CONTROL for bulk load out
-        if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'PROJECT_MANAGER') {
-          // Admin, HR, and PROJECT_MANAGER can load out any contract
-        } else if (userRole === 'MANAGER') {
-          // Manager: Can only load out contracts assigned to them
+        if (userRole === 'ADMIN' || userRole === 'HR' || userRole === 'SUPER_ADMIN') {
+          // Admin / HR / Super Admin: any contract
+        } else if (userRole === 'MANAGER' || userRole === 'PROJECT_MANAGER') {
           if (!userEmail || !req.user?.id) {
             errors.push({
               contractId,
@@ -2575,9 +2745,7 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
             });
             continue;
           }
-          // Check both assignedManagerEmail and assignedManagerId
-          if (contract.assignedManagerEmail !== userEmail && 
-              contract.assignedManagerId !== req.user.id) {
+          if (!isContractAssignedToUser(contract, req)) {
             errors.push({
               contractId,
               message: `Access Denied: Contract ${contract.referenceNumber} is not assigned to you`,
@@ -2592,111 +2760,10 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
           continue;
         }
 
-        // Allow loading out contracts multiple times - just log if already linked
-        if (contract.projectId && contract.project) {
-          console.log(`ℹ️ Contract ${contract.referenceNumber} already linked to project ${contract.project.referenceNumber}. Creating new project anyway.`);
-        }
-
-        // Use contract reference number as project reference number
-        // If a project with this reference number already exists, append a suffix
-        const baseReferenceNumber = contract.referenceNumber;
-        let projectReferenceNumber: string = baseReferenceNumber;
-        let suffix = 1;
-
-        // Check if project with base reference number exists, if so, append suffix
-        while (true) {
-          const existingProject = await prisma.project.findUnique({
-            where: { referenceNumber: projectReferenceNumber },
-          });
-
-          if (!existingProject) {
-            // This reference number is available, use it
-            break;
-          }
-
-          // Append suffix to make it unique (e.g., "7896-1", "7896-2")
-          projectReferenceNumber = `${baseReferenceNumber}-${suffix}`;
-          suffix++;
-
-          // Safety check to prevent infinite loop
-          if (suffix > 1000) {
-            // Fallback to timestamp-based suffix if too many attempts
-            const timestamp = Date.now().toString(36).toUpperCase().substring(0, 6);
-            projectReferenceNumber = `${baseReferenceNumber}-${timestamp}`;
-            break;
-          }
-        }
-
-        if (suffix > 1) {
-          console.log(`ℹ️ Project with reference number ${baseReferenceNumber} already exists. Using: ${projectReferenceNumber}`);
-        }
-
-        // Calculate plan days
-        let planDays: number | null = null;
-        if (contract.startDate && contract.endDate) {
-          const start = new Date(contract.startDate);
-          const end = new Date(contract.endDate);
-          const diffTime = Math.abs(end.getTime() - start.getTime());
-          planDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-        }
-
-        // Map contract fields to project fields
-        const projectName = contract.title || `Project ${contract.referenceNumber}`;
-        const contractWithManager = contract as typeof contract & { assignedManager?: { firstName: string; lastName: string } | null };
-        const projectManager = (contractWithManager.assignedManager
-          ? `${contractWithManager.assignedManager.firstName} ${contractWithManager.assignedManager.lastName}`.trim().substring(0, 100)
-          : null)
-          || (contract.projectManager ? contract.projectManager.trim().substring(0, 100) : null)
-          || (contract.creator ? `${contract.creator.firstName} ${contract.creator.lastName}`.trim().substring(0, 100) : null);
-
-        // Build location string
-        let locationString: string | null = null;
-        if (contract.makaniNumber) {
-          locationString = contract.makaniNumber;
-        } else if (contract.latitude && contract.longitude) {
-          locationString = `${contract.latitude}, ${contract.longitude}`;
-        }
-
-        // Create project from contract data
-        const project = await prisma.$transaction(async (tx) => {
-          const projectNumber = await computeNextProjectNumber(tx as any);
-          return tx.project.create({
-            data: {
-              projectNumber,
-              name: projectName,
-              referenceNumber: projectReferenceNumber,
-              pin: null,
-              clientId: contract.clientId || null,
-              owner: contract.developerName || null,
-              description: contract.description || null,
-              status: 'OPEN', // Default status = Active
-              projectManager: projectManager,
-              startDate: contract.startDate ? new Date(contract.startDate) : null,
-              endDate: contract.endDate ? new Date(contract.endDate) : null,
-              deadline: contract.endDate ? new Date(contract.endDate) : null,
-              planDays: planDays,
-              remarks: contract.specialClauses || contract.termsAndConditions || null,
-              assigneeNotes: contract.paymentTerms || null,
-              location: locationString,
-              makaniNumber: contract.makaniNumber || null,
-              plotNumber: contract.plotNumber || null,
-              community: contract.community || null,
-              projectType: contract.contractType || null,
-              projectFloor: contract.numberOfFloors ? contract.numberOfFloors.toString() : null,
-              developerProject: contract.developerName || null,
-              createdBy: req.user?.id || null,
-            },
-            include: {
-              client: true,
-            },
-          });
-        }, { isolationLevel: 'Serializable' as any });
-
-        // Link contract to the created project
-        await prisma.contract.update({
-          where: { id: contract.id },
-          data: { projectId: project.id },
-        });
+        const { project, mode } = await prisma.$transaction(
+          async (tx) => runContractLoadOutTransaction(tx, contract as any, req.user?.id ?? null),
+          { isolationLevel: 'Serializable' as any }
+        );
 
         results.push({
           contractId: contract.id,
@@ -2705,9 +2772,25 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
           projectReference: project.referenceNumber,
           projectName: project.name,
           success: true,
+          loadOutMode: mode,
         });
 
-        console.log(`✅ Load Out successful: Contract ${contract.referenceNumber} → Project ${project.referenceNumber}`);
+        if (mode === 'copied') {
+          console.log(
+            `✅ Load Out (copy): Contract ${contract.referenceNumber} → Project ${project.referenceNumber} (duplicated ERP project + tasks)`
+          );
+        } else {
+          console.log(`✅ Load Out (new): Contract ${contract.referenceNumber} → Project ${project.referenceNumber}`);
+        }
+
+        if (contract.assignedManagerId) {
+          await notifyPmProjectAssignment(
+            contract.assignedManagerId,
+            project.id,
+            'ASSIGNMENT',
+            req.user?.id,
+          );
+        }
       } catch (error: any) {
         console.error(`❌ Error loading out contract ${contractId}:`, error);
         errors.push({
@@ -2742,22 +2825,37 @@ export const bulkLoadOutContracts = async (req: AuthRequest, res: Response): Pro
 // Get contract statistics
 export const getContractStats = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const effectiveRole = getEffectiveRole(req.user?.role);
+    let scopeWhere: Record<string, unknown> = {};
+    if (requiresAssignedManagerScope(effectiveRole)) {
+      if (!req.user?.email || !req.user?.id) {
+        res.status(403).json({
+          success: false,
+          message: 'Access Denied: Manager email or ID not found in session',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+      scopeWhere = { OR: buildAssignedManagerFilter(req) };
+    }
+
     const stats = await prisma.contract.groupBy({
       by: ['status'],
+      where: scopeWhere,
       _count: {
         id: true,
       },
     });
 
-    const total = await prisma.contract.count();
+    const total = await prisma.contract.count({ where: scopeWhere });
     const active = await prisma.contract.count({
-      where: { status: ContractStatus.ACTIVE },
+      where: { ...scopeWhere, status: ContractStatus.ACTIVE },
     });
     const expired = await prisma.contract.count({
-      where: { status: ContractStatus.EXPIRED },
+      where: { ...scopeWhere, status: ContractStatus.EXPIRED },
     });
     const draft = await prisma.contract.count({
-      where: { status: ContractStatus.DRAFT },
+      where: { ...scopeWhere, status: ContractStatus.DRAFT },
     });
 
     const statsMap: Record<string, number> = {};
@@ -2767,6 +2865,7 @@ export const getContractStats = async (req: AuthRequest, res: Response): Promise
 
     // Recent contract reference numbers for display in statistics section
     const recentContracts = await prisma.contract.findMany({
+      where: scopeWhere,
       take: 10,
       orderBy: { createdAt: 'desc' },
       select: { referenceNumber: true },
@@ -2797,7 +2896,8 @@ export const getContractStats = async (req: AuthRequest, res: Response): Promise
 /**
  * Get all managers for dropdown selection
  * GET /api/contracts/managers
- * Returns users with MANAGER, PROJECT_MANAGER, or ADMIN role (all can be assigned as project managers)
+ * Returns users with MANAGER, PROJECT_MANAGER, or ADMIN role (active).
+ * Excludes the main admin login from assignment (not used as day-to-day project manager).
  */
 export const getManagers = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -2809,6 +2909,9 @@ export const getManagers = async (req: AuthRequest, res: Response): Promise<void
       role: {
         in: ['MANAGER', 'PROJECT_MANAGER', 'ADMIN'] as UserRole[],
       },
+      NOT: {
+        email: { equals: 'admin@onixgroup.ae', mode: 'insensitive' },
+      },
     };
 
     // Build AND conditions array for combining filters
@@ -2817,14 +2920,24 @@ export const getManagers = async (req: AuthRequest, res: Response): Promise<void
     // Filter by company if companyId is provided
     if (companyId && typeof companyId === 'string' && companyId.trim()) {
       try {
-        // Look up the company name from companyId
+        // Look up the company name (+ parent) from companyId
         const company = await prisma.company.findUnique({
           where: { id: companyId.trim() },
-          select: { name: true },
+          select: { name: true, parentCompanyId: true },
         });
 
         if (company) {
           const companyName = company.name.trim();
+          let parentName: string | null = null;
+          if (company.parentCompanyId) {
+            const parent = await prisma.company.findUnique({
+              where: { id: company.parentCompanyId },
+              select: { name: true },
+            });
+            parentName = parent?.name ?? null;
+          }
+
+          const companyAliases = buildCompanyScopeAliases(companyName, parentName);
           
           // If "ONIX ENGINEERING CONSULTANCY" is selected, exclude managers from "onix" company
           if (companyName.toLowerCase() === 'onix engineering consultancy') {
@@ -2834,7 +2947,11 @@ export const getManagers = async (req: AuthRequest, res: Response): Promise<void
               AND: [
                 {
                   OR: [
-                    { company: { equals: companyName, mode: 'insensitive' } },
+                    ...(companyAliases.length > 0
+                      ? companyAliases.map((n) => ({
+                          company: { equals: n, mode: 'insensitive' as const },
+                        }))
+                      : [{ company: { equals: companyName, mode: 'insensitive' as const } }]),
                     { company: null },
                     { company: '' },
                   ],
@@ -2850,10 +2967,14 @@ export const getManagers = async (req: AuthRequest, res: Response): Promise<void
               ],
             });
           } else {
-            // For other companies, filter by exact company name match (case-insensitive)
+            // For other companies, filter by company aliases (case-insensitive)
             andConditions.push({
               OR: [
-                { company: { equals: companyName, mode: 'insensitive' } },
+                ...(companyAliases.length > 0
+                  ? companyAliases.map((n) => ({
+                      company: { equals: n, mode: 'insensitive' as const },
+                    }))
+                  : [{ company: { equals: companyName, mode: 'insensitive' as const } }]),
                 { company: null },
                 { company: '' },
               ],

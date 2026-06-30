@@ -4,7 +4,7 @@ import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
 
 function isAdminOrHr(role: string | undefined): boolean {
-  return role === 'ADMIN' || role === 'HR';
+  return role === 'ADMIN' || role === 'HR' || role === 'SUPER_ADMIN';
 }
 
 const MAX_MODULE = 512;

@@ -1,11 +1,11 @@
 -- DropIndex
-DROP INDEX "tasks_predecessorId_idx";
+DROP INDEX IF EXISTS "tasks_predecessorId_idx";
 
 -- DropIndex
-DROP INDEX "tasks_project_task_order_idx";
+DROP INDEX IF EXISTS "tasks_project_task_order_idx";
 
 -- AlterTable
-ALTER TABLE "contracts" DROP COLUMN "assignedmanageremail";
+ALTER TABLE "contracts" DROP COLUMN IF EXISTS "assignedmanageremail";
 
 -- AlterTable
 ALTER TABLE "projects" ADD COLUMN     "projectNumber" SERIAL NOT NULL;

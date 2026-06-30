@@ -1,0 +1,2869 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.removeEmployeeOrgPositionAssignment = exports.assignEmployeeToOrgPosition = exports.getEmployeeStatistics = exports.renameAttendanceProgram = exports.getEmployeeChangeHistory = exports.updateEmployeeRoleManagement = exports.getEmployeeRoleManagement = exports.restoreEmployee = exports.deleteEmployee = exports.updateEmployee = exports.getEmployeeById = exports.getEmployees = exports.checkEmployeeAvailability = exports.createEmployee = void 0;
+const employee_response_1 = require("../utils/employee-response");
+const workload_service_1 = require("../services/workload.service");
+const bcryptjs_1 = __importDefault(require("bcryptjs"));
+const database_1 = __importDefault(require("../config/database"));
+const payroll_utils_1 = require("../utils/payroll.utils");
+const employee_directory_body_1 = require("../utils/employee-directory-body");
+const employee_change_log_1 = require("../utils/employee-change-log");
+const employeeErpAccessEmail_service_1 = require("../services/employeeErpAccessEmail.service");
+const companyAccess_service_1 = require("../services/companyAccess.service");
+const client_1 = require("@prisma/client");
+const company_name_aliases_1 = require("../utils/company-name-aliases");
+const employeeSubDepartmentManagers_service_1 = require("../services/employeeSubDepartmentManagers.service");
+const managerPersonSelect = {
+    select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        email: true,
+    },
+};
+/** Prefer department id (authoritative name in DB); else use string from the form. */
+async function resolveDepartmentForUser(department, departmentId) {
+    if (departmentId != null && String(departmentId).trim() !== '') {
+        const row = await database_1.default.department.findUnique({
+            where: { id: String(departmentId).trim() },
+            select: { name: true },
+        });
+        if (row?.name)
+            return row.name;
+    }
+    if (department != null && String(department).trim() !== '') {
+        return String(department).trim();
+    }
+    return null;
+}
+/**
+ * Multipart forms often submit `""` for every key; empty string must not erase existing DB values.
+ * JSON `null` still means "clear this field" where we honor it below.
+ */
+function shouldPatchOptionalScalar(v) {
+    if (v === undefined)
+        return false;
+    if (v === null)
+        return true;
+    if (typeof v === 'string' && v.trim() === '')
+        return false;
+    return true;
+}
+/**
+ * Generate a secure random password
+ */
+const generateTemporaryPassword = () => {
+    const length = 12;
+    const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
+    let password = '';
+    for (let i = 0; i < length; i++) {
+        password += charset.charAt(Math.floor(Math.random() * charset.length));
+    }
+    return password;
+};
+/**
+ * Generate email from name
+ */
+const generateEmail = (firstName, lastName) => {
+    const baseEmail = `${firstName.toLowerCase()}.${lastName.toLowerCase()}@onixgroup.ae`;
+    return baseEmail;
+};
+/**
+ * Helper function to convert string/boolean to boolean
+ */
+const parseBoolean = (value) => {
+    if (typeof value === 'boolean')
+        return value;
+    if (typeof value === 'string') {
+        const lower = value.toLowerCase().trim();
+        return lower === 'true' || lower === '1' || lower === 'yes';
+    }
+    return false;
+};
+/** Parse projectIds from JSON body or multipart string. */
+function resolveProjectIdsList(projectIds) {
+    if (projectIds === undefined || projectIds === null)
+        return [];
+    if (Array.isArray(projectIds))
+        return projectIds.map((x) => String(x)).filter(Boolean);
+    if (typeof projectIds === 'string') {
+        const t = projectIds.trim();
+        if (!t)
+            return [];
+        try {
+            const parsed = JSON.parse(t);
+            if (Array.isArray(parsed))
+                return parsed.map((x) => String(x)).filter(Boolean);
+        }
+        catch {
+            /* use delimiter split */
+        }
+        return t.split(/[,;]/).map((s) => s.trim()).filter(Boolean);
+    }
+    return [];
+}
+function sortJoinProjectIds(ids) {
+    return [...new Set(ids)].sort().join(',');
+}
+function employeeAuditRoleLabel(role) {
+    if (role === 'ADMIN')
+        return 'Admin';
+    if (role === 'HR')
+        return 'HR';
+    if (role === 'SUPER_ADMIN')
+        return 'Super Admin';
+    return role ? String(role) : 'Unknown';
+}
+function formatSystemRoleLabel(role) {
+    if (!role)
+        return '—';
+    const labels = {
+        EMPLOYEE: 'Employee',
+        PROJECT_MANAGER: 'Project Manager',
+        MANAGER: 'Manager',
+        ADMIN: 'Admin',
+        HR: 'HR',
+        SUPER_ADMIN: 'Super Admin',
+        TENDER_ENGINEER: 'Tender Engineer',
+        CONTRACTOR: 'Contractor',
+        ACCOUNTANT: 'Accountant',
+    };
+    return labels[role] || role;
+}
+/** Roles HR / Super Admin may assign from Employee Details → Role Management. */
+const ROLE_MANAGEMENT_ASSIGNABLE = [
+    'EMPLOYEE',
+    'PROJECT_MANAGER',
+    'ADMIN',
+    'ACCOUNTANT',
+];
+function formatChangeActorName(actor) {
+    if (!actor)
+        return 'Unknown';
+    const name = `${actor.firstName ?? ''} ${actor.lastName ?? ''}`.trim();
+    return name || actor.email;
+}
+async function buildEmployeeRoleManagementPayload(employeeId) {
+    const employee = await database_1.default.user.findUnique({
+        where: { id: employeeId },
+        select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            role: true,
+            status: true,
+            isActive: true,
+        },
+    });
+    if (!employee)
+        return null;
+    const roleLogs = await database_1.default.employeeChangeLog.findMany({
+        where: { employeeId, fieldKey: 'role' },
+        orderBy: { createdAt: 'desc' },
+        include: {
+            changedBy: {
+                select: {
+                    id: true,
+                    firstName: true,
+                    lastName: true,
+                    email: true,
+                    role: true,
+                },
+            },
+        },
+    });
+    const isProjectManager = employee.role === 'PROJECT_MANAGER';
+    const canChangeRole = ROLE_MANAGEMENT_ASSIGNABLE.includes(employee.role);
+    const canToggle = canChangeRole;
+    const userName = `${employee.firstName ?? ''} ${employee.lastName ?? ''}`.trim() || employee.id;
+    let effectiveFrom = null;
+    let updatedBy = null;
+    const latestRoleLog = roleLogs[0];
+    if (latestRoleLog && latestRoleLog.newValue !== 'EMPLOYEE') {
+        effectiveFrom = latestRoleLog.createdAt.toISOString();
+        updatedBy = formatChangeActorName(latestRoleLog.changedBy);
+    }
+    else if (isProjectManager) {
+        const promoteLog = roleLogs.find((row) => row.newValue === 'PROJECT_MANAGER');
+        if (promoteLog) {
+            effectiveFrom = promoteLog.createdAt.toISOString();
+            updatedBy = formatChangeActorName(promoteLog.changedBy);
+        }
+    }
+    return {
+        userName,
+        employeeStatus: employee.status || (employee.isActive ? 'Active' : 'Inactive'),
+        systemRole: employee.role,
+        isProjectManager,
+        canChangeRole,
+        canToggle,
+        assignableRoles: ROLE_MANAGEMENT_ASSIGNABLE.map((role) => ({
+            value: role,
+            label: formatSystemRoleLabel(role),
+        })),
+        effectiveFrom,
+        updatedBy,
+        auditLog: roleLogs.map((row) => ({
+            id: row.id,
+            userName,
+            previousRole: formatSystemRoleLabel(row.oldValue),
+            newRole: formatSystemRoleLabel(row.newValue),
+            changedBy: formatChangeActorName(row.changedBy),
+            changedAt: row.createdAt.toISOString(),
+            reason: row.reason,
+        })),
+    };
+}
+/** Full directory parity with Admin/HR: inactive rows, unrestricted stats scope, viewing any profile. */
+function isEmployeeDirectoryPrivilegedRole(role) {
+    return role === 'ADMIN' || role === 'HR' || role === 'SUPER_ADMIN';
+}
+/**
+ * Check if email exists and generate unique one
+ */
+const generateUniqueEmail = async (firstName, lastName) => {
+    let email = generateEmail(firstName, lastName);
+    let counter = 1;
+    while (await database_1.default.user.findUnique({ where: { email } })) {
+        email = `${firstName.toLowerCase()}.${lastName.toLowerCase()}${counter}@onixgroup.ae`;
+        counter++;
+    }
+    return email;
+};
+/**
+ * Create new employee
+ * POST /api/employees
+ * Access: ADMIN, HR only
+ */
+const createEmployee = async (req, res) => {
+    try {
+        // Check authentication
+        if (!req.user || !req.user.id) {
+            console.error('❌ Authentication failed: No user ID found');
+            res.status(401).json({
+                success: false,
+                message: 'Authentication required. Please log in again.',
+            });
+            return;
+        }
+        console.log('📝 Creating employee - Request received');
+        console.log('📝 User ID:', req.user.id);
+        console.log('📝 User email:', req.user.email);
+        console.log('📝 User role:', req.user.role);
+        // Debug: Log entire req.body to see what's actually received
+        const rawCreateBody = (req.body || {});
+        const body = (0, employee_directory_body_1.normalizeEmployeeDirectoryBody)(rawCreateBody);
+        const flatForLegalResolversCreate = { ...rawCreateBody, ...body };
+        console.log('📦 Full req.body:', JSON.stringify(req.body, null, 2));
+        console.log('📦 req.body keys:', Object.keys(req.body || {}));
+        console.log('📦 Content-Type:', req.headers['content-type']);
+        console.log('📦 Files received:', req.files ? Object.keys(req.files) : 'No files');
+        const { 
+        // Basic fields
+        firstName, lastName, role, phone, department, departmentId, position, jobTitle, employeeId, projectIds, 
+        // ERP Access (login credentials)
+        workEmail, password: plainPassword, 
+        // Employee Directory - Personal Info
+        employeeType, status, userAccount, 
+        // Employee Directory - Personal Details
+        gender, maritalStatus, nationality, birthday, childrenCount, currentAddress, 
+        // Employee Directory - Contact Info (resolved via resolvePhoneNumbersJson / resolveEmailAddressesJson on body)
+        // Employee Directory - Company Info
+        company, companyLocation, managerId, secondLineManagerId, attendanceProgram, joiningDate, exitDate, isLineManager, 
+        // Employee Directory - Legal Documents
+        passportNumber, passportIssueDate, passportExpiryDate, passportAttachment, nationalIdNumber, nationalIdExpiryDate, nationalIdAttachment, residencyNumber, residencyExpiryDate, residencyAttachment, visaNumber, insuranceNumber, insuranceExpiryDate, insuranceAttachment, drivingLicenseNumber, drivingLicenseExpiryDate, drivingLicenseAttachment, labourIdNumber, labourIdExpiryDate, labourIdAttachment, educationalQualification, curriculumVitaeAttachment, remarks } = body;
+        // Debug: Log passport fields
+        console.log('📋 Received passport data:', {
+            passportNumber: passportNumber,
+            passportIssueDate: passportIssueDate,
+            passportExpiryDate: passportExpiryDate,
+            passportNumberType: typeof passportNumber,
+            passportIssueDateType: typeof passportIssueDate,
+            passportExpiryDateType: typeof passportExpiryDate,
+            bodyKeys: Object.keys(body).filter(k => k.includes('passport'))
+        });
+        // Get all uploaded files from multer (photo + legal documents)
+        const files = req.files || {};
+        // Get photo filename (photo is in files.photo array when using .fields())
+        const photoFilename = files.photo?.[0]?.filename || null;
+        // Get legal document filenames from uploaded files
+        const passportAttachmentFile = files.passportAttachment?.[0]?.filename || null;
+        const nationalIdAttachmentFile = files.nationalIdAttachment?.[0]?.filename || null;
+        const residencyAttachmentFile = files.residencyAttachment?.[0]?.filename || null;
+        const insuranceAttachmentFile = files.insuranceAttachment?.[0]?.filename || null;
+        const drivingLicenseAttachmentFile = files.drivingLicenseAttachment?.[0]?.filename || null;
+        const labourIdAttachmentFile = files.labourIdAttachment?.[0]?.filename || null;
+        const curriculumVitaeAttachmentFile = files.curriculumVitaeAttachment?.[0]?.filename || null;
+        // Validation - ensure required fields are present and valid
+        if (!firstName || typeof firstName !== 'string' || firstName.trim() === '') {
+            console.error('❌ Invalid firstName:', firstName, typeof firstName);
+            res.status(400).json({
+                success: false,
+                message: 'First name is required and must be a non-empty string'
+            });
+            return;
+        }
+        if (!lastName || typeof lastName !== 'string' || lastName.trim() === '') {
+            console.error('❌ Invalid lastName:', lastName, typeof lastName);
+            res.status(400).json({
+                success: false,
+                message: 'Last name is required and must be a non-empty string'
+            });
+            return;
+        }
+        // Trim names
+        const trimmedFirstName = firstName.trim();
+        const trimmedLastName = lastName.trim();
+        if (trimmedFirstName.length === 0 || trimmedLastName.length === 0) {
+            res.status(400).json({
+                success: false,
+                message: 'First name and last name cannot be empty'
+            });
+            return;
+        }
+        // Employee ID: required and unique
+        if (!employeeId || typeof employeeId !== 'string' || employeeId.trim() === '') {
+            res.status(400).json({
+                success: false,
+                message: 'Employee ID is required'
+            });
+            return;
+        }
+        const trimmedEmployeeId = employeeId.trim();
+        const existingByEmployeeId = await database_1.default.user.findFirst({
+            where: { employeeId: trimmedEmployeeId },
+        });
+        if (existingByEmployeeId) {
+            res.status(409).json({
+                success: false,
+                message: 'An employee with this Employee ID already exists. Please use a unique Employee ID.'
+            });
+            return;
+        }
+        // Status: required
+        if (!status || typeof status !== 'string' || status.trim() === '') {
+            res.status(400).json({
+                success: false,
+                message: 'Status is required'
+            });
+            return;
+        }
+        // Employee type: required
+        if (!employeeType || typeof employeeType !== 'string' || employeeType.trim() === '') {
+            res.status(400).json({
+                success: false,
+                message: 'Employee type is required'
+            });
+            return;
+        }
+        // Validate minimum age (18 years)
+        if (birthday) {
+            const birthDate = new Date(birthday);
+            const today = new Date();
+            let age = today.getFullYear() - birthDate.getFullYear();
+            const monthDiff = today.getMonth() - birthDate.getMonth();
+            if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+                age--;
+            }
+            if (age < 18) {
+                res.status(400).json({
+                    success: false,
+                    message: 'This employee cannot be added to the company unless they are at least 18 years old.'
+                });
+                return;
+            }
+        }
+        // Process passport fields - trim strings if they are strings
+        const passportNum = typeof passportNumber === 'string' ? passportNumber.trim() : passportNumber;
+        const passportIssue = typeof passportIssueDate === 'string' ? passportIssueDate.trim() : passportIssueDate;
+        const passportExpiry = typeof passportExpiryDate === 'string' ? passportExpiryDate.trim() : passportExpiryDate;
+        // Debug logging
+        console.log('Passport validation:', {
+            passportNumber: passportNumber,
+            passportNum: passportNum,
+            passportIssueDate: passportIssueDate,
+            passportIssue: passportIssue,
+            passportExpiryDate: passportExpiryDate,
+            passportExpiry: passportExpiry
+        });
+        // Validate passport fields - Passport is required
+        const missingFields = [];
+        if (!passportNum || passportNum === '') {
+            missingFields.push('passport number');
+        }
+        if (!passportIssue || passportIssue === '') {
+            missingFields.push('passport issue date');
+        }
+        if (!passportExpiry || passportExpiry === '') {
+            missingFields.push('passport expiry date');
+        }
+        if (missingFields.length > 0) {
+            res.status(400).json({
+                success: false,
+                message: `Passport ${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} required.`,
+                receivedData: { passportNumber, passportIssueDate, passportExpiryDate }
+            });
+            return;
+        }
+        // Validate passport expiry date - must be at least 6 months from today
+        if (passportExpiry) {
+            const expiryDate = new Date(passportExpiry);
+            const today = new Date();
+            // Check if date is valid
+            if (isNaN(expiryDate.getTime())) {
+                res.status(400).json({
+                    success: false,
+                    message: 'Invalid passport expiry date format.'
+                });
+                return;
+            }
+            // Calculate 6 months from today
+            const sixMonthsFromNow = new Date();
+            sixMonthsFromNow.setMonth(today.getMonth() + 6);
+            // Check if expiry date is at least 6 months away
+            if (expiryDate < sixMonthsFromNow) {
+                res.status(400).json({
+                    success: false,
+                    message: 'Passport must be valid for at least 6 months from today. Please upload a passport with a later expiry date.'
+                });
+                return;
+            }
+        }
+        // Validate role
+        const validRoles = ['EMPLOYEE', 'PROJECT_MANAGER', 'TENDER_ENGINEER', 'HR', 'ADMIN', 'ACCOUNTANT'];
+        if (role && !validRoles.includes(role)) {
+            res.status(400).json({
+                success: false,
+                message: `Invalid role. Must be one of: ${validRoles.join(', ')}`
+            });
+            return;
+        }
+        // Verify manager exists if provided
+        const resolvedCreateManagerId = (0, employee_directory_body_1.resolveManagerIdInput)(managerId);
+        if (resolvedCreateManagerId) {
+            const manager = await database_1.default.user.findUnique({
+                where: { id: resolvedCreateManagerId },
+            });
+            if (!manager) {
+                res.status(404).json({
+                    success: false,
+                    message: 'Manager not found'
+                });
+                return;
+            }
+        }
+        // Parse boolean values from FormData (they come as strings)
+        const userAccountBool = typeof userAccount === 'string'
+            ? (userAccount.toLowerCase().trim() === 'true' || userAccount.toLowerCase().trim() === '1' || userAccount.toLowerCase().trim() === 'yes')
+            : Boolean(userAccount);
+        // ERP Access: work email OR mobile number (use provided or generate email)
+        const emailOrMobileProvided = typeof workEmail === 'string' && workEmail.trim().length > 0;
+        let email;
+        let phoneForLogin = null;
+        if (userAccountBool && emailOrMobileProvided) {
+            const trimmed = workEmail.trim();
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            const mobileRegex = /^(\+?\d{1,3}[-.\s]?)?\(?\d{1,4}\)?[-.\s]?\d{1,9}[-.\s]?\d{1,9}$/;
+            const normalizedMobile = trimmed.replace(/[-.\s()]/g, '');
+            if (emailRegex.test(trimmed.toLowerCase())) {
+                // Email provided
+                email = trimmed.toLowerCase();
+                const existing = await database_1.default.user.findUnique({ where: { email } });
+                if (existing) {
+                    res.status(409).json({ success: false, message: 'An account with this email already exists. Please use a different work email.' });
+                    return;
+                }
+                console.log('📧 Using provided work email:', email);
+            }
+            else if (mobileRegex.test(normalizedMobile)) {
+                // Mobile number provided - store in phone, generate email
+                // Normalize phone: remove spaces, dashes, parentheses for consistent storage
+                phoneForLogin = normalizedMobile;
+                // Check if phone already exists (try both normalized and original format)
+                const existingByPhone = await database_1.default.user.findFirst({
+                    where: {
+                        OR: [
+                            { phone: trimmed },
+                            { phone: normalizedMobile }
+                        ]
+                    }
+                });
+                if (existingByPhone) {
+                    res.status(409).json({ success: false, message: 'An account with this mobile number already exists. Please use a different mobile number.' });
+                    return;
+                }
+                email = await generateUniqueEmail(firstName, lastName);
+                console.log('📱 Using provided mobile number:', phoneForLogin);
+                console.log('📧 Generated email for mobile login:', email);
+            }
+            else {
+                res.status(400).json({ success: false, message: 'Work email or mobile number must be a valid email address or mobile number.' });
+                return;
+            }
+        }
+        else {
+            email = await generateUniqueEmail(firstName, lastName);
+            console.log('📧 Generated email:', email);
+        }
+        // Password: use provided (when ERP access enabled) or generate temp, or dummy when no access
+        const passwordProvided = typeof plainPassword === 'string' && plainPassword.length > 0;
+        let temporaryPassword = null;
+        let hashedPassword = null;
+        if (userAccountBool) {
+            if (passwordProvided) {
+                if (plainPassword.length < 8) {
+                    res.status(400).json({ success: false, message: 'Password must be at least 8 characters long.' });
+                    return;
+                }
+                const hasLetter = /[a-zA-Z]/.test(plainPassword);
+                const hasNumber = /\d/.test(plainPassword);
+                if (!hasLetter || !hasNumber) {
+                    res.status(400).json({ success: false, message: 'Password must contain at least one letter and one number.' });
+                    return;
+                }
+                hashedPassword = await bcryptjs_1.default.hash(plainPassword, 10);
+                console.log('🔐 Using provided password (hashed)');
+            }
+            else {
+                temporaryPassword = generateTemporaryPassword();
+                hashedPassword = await bcryptjs_1.default.hash(temporaryPassword, 10);
+                console.log('🔐 Generated temporary password for user account');
+            }
+        }
+        else {
+            hashedPassword = await bcryptjs_1.default.hash('NO_ACCOUNT_' + Date.now(), 10);
+            console.log('🔐 Generated dummy password hash');
+        }
+        if (!hashedPassword) {
+            throw new Error('Failed to generate password hash');
+        }
+        const phoneNumbersJson = (0, employee_directory_body_1.resolvePhoneNumbersJson)(body);
+        const emailAddressesJson = (0, employee_directory_body_1.resolveEmailAddressesJson)(body);
+        /** Sync `User.phone` when only `contacts[]` was sent (directory UI often leaves top-level `phone` empty). */
+        let primaryPhoneForUser = phoneForLogin;
+        if (!primaryPhoneForUser && typeof phone === 'string' && phone.trim()) {
+            primaryPhoneForUser = phone.trim();
+        }
+        if (!primaryPhoneForUser && phoneNumbersJson) {
+            try {
+                const arr = JSON.parse(phoneNumbersJson);
+                if (Array.isArray(arr) && arr.length > 0) {
+                    const first = arr[0];
+                    const v = first?.value ?? first?.phone ?? first?.number ?? first?.mobile;
+                    if (v != null && String(v).trim() !== '')
+                        primaryPhoneForUser = String(v).trim();
+                }
+            }
+            catch {
+                /* ignore */
+            }
+        }
+        console.log('📋 Resolved phoneNumbers JSON length:', phoneNumbersJson?.length ?? 0);
+        console.log('📋 Resolved emailAddresses JSON length:', emailAddressesJson?.length ?? 0);
+        // Log data before creating employee
+        console.log('📝 About to create employee with:', {
+            email,
+            firstName,
+            lastName,
+            role: role || 'EMPLOYEE',
+            hasPassword: !!hashedPassword,
+            employeeId,
+            passportNumber: passportNum,
+            passportIssueDate: passportIssue,
+            passportExpiryDate: passportExpiry,
+            createdBy: req.user.id,
+        });
+        // Validate email and password before creating
+        if (!email || email.trim() === '') {
+            throw new Error('Generated email is empty');
+        }
+        if (!hashedPassword || hashedPassword.trim() === '') {
+            throw new Error('Password hash is empty');
+        }
+        console.log('✅ All validations passed, creating employee in database...');
+        const departmentStored = await resolveDepartmentForUser(department, departmentId ?? rawCreateBody.departmentId);
+        // Create employee with detailed error handling
+        let employee;
+        try {
+            employee = await database_1.default.user.create({
+                data: {
+                    email: email.trim(),
+                    password: hashedPassword,
+                    firstName: trimmedFirstName,
+                    lastName: trimmedLastName,
+                    role: role || 'EMPLOYEE',
+                    phone: primaryPhoneForUser, // work-email mobile, explicit phone, or first entry from contacts JSON
+                    department: departmentStored,
+                    position: position || null,
+                    jobTitle: jobTitle || null,
+                    photo: photoFilename || null,
+                    employeeId: trimmedEmployeeId,
+                    // First login must change password only when we generated a temp password (not when HR set one).
+                    forcePasswordChange: userAccountBool && !passwordProvided,
+                    isActive: status === 'active' || status === 'Active' || !status ? true : false,
+                    createdBy: req.user.id,
+                    // Employee Directory - Personal Info
+                    employeeType: employeeType || null,
+                    status: status || null,
+                    userAccount: parseBoolean(userAccount),
+                    // Employee Directory - Personal Details
+                    gender: gender || null,
+                    maritalStatus: maritalStatus || null,
+                    nationality: nationality || null,
+                    birthday: (0, employee_directory_body_1.parseEmployeeDate)(birthday),
+                    childrenCount: childrenCount ? (isNaN(parseInt(String(childrenCount))) ? null : parseInt(String(childrenCount))) : null,
+                    currentAddress: currentAddress || null,
+                    // Employee Directory - Contact Info
+                    phoneNumbers: phoneNumbersJson,
+                    emailAddresses: emailAddressesJson,
+                    // Employee Directory - Company Info
+                    company: company || null,
+                    companyLocation: companyLocation || null,
+                    managerId: resolvedCreateManagerId ?? null,
+                    attendanceProgram: attendanceProgram || null,
+                    joiningDate: (0, employee_directory_body_1.parseEmployeeDate)(joiningDate),
+                    exitDate: (0, employee_directory_body_1.parseEmployeeDate)(exitDate),
+                    isLineManager: parseBoolean(isLineManager),
+                    // Employee Directory - Legal Documents
+                    passportNumber: passportNum || null,
+                    passportIssueDate: (0, employee_directory_body_1.parseEmployeeDate)(passportIssue),
+                    passportExpiryDate: (0, employee_directory_body_1.parseEmployeeDate)(passportExpiry),
+                    passportAttachment: passportAttachmentFile || passportAttachment || null,
+                    nationalIdNumber: nationalIdNumber || null,
+                    nationalIdExpiryDate: (0, employee_directory_body_1.parseEmployeeDate)(nationalIdExpiryDate),
+                    nationalIdAttachment: nationalIdAttachmentFile || nationalIdAttachment || null,
+                    residencyNumber: residencyNumber || null,
+                    residencyExpiryDate: (0, employee_directory_body_1.parseEmployeeDate)(residencyExpiryDate),
+                    residencyAttachment: residencyAttachmentFile || residencyAttachment || null,
+                    visaNumber: typeof visaNumber === 'string' ? visaNumber.trim() || null : visaNumber || null,
+                    insuranceNumber: insuranceNumber || null,
+                    insuranceExpiryDate: (0, employee_directory_body_1.parseEmployeeDate)(insuranceExpiryDate),
+                    insuranceAttachment: insuranceAttachmentFile || insuranceAttachment || null,
+                    drivingLicenseNumber: (0, employee_directory_body_1.resolveDrivingLicenseNumberForDb)(flatForLegalResolversCreate) ??
+                        (drivingLicenseNumber != null && String(drivingLicenseNumber).trim() !== ''
+                            ? String(drivingLicenseNumber).trim()
+                            : null),
+                    drivingLicenseExpiryDate: (0, employee_directory_body_1.parseEmployeeDate)(drivingLicenseExpiryDate),
+                    drivingLicenseAttachment: drivingLicenseAttachmentFile || drivingLicenseAttachment || null,
+                    labourIdNumber: (0, employee_directory_body_1.resolveLabourIdNumberForDb)(flatForLegalResolversCreate) ??
+                        (labourIdNumber != null && String(labourIdNumber).trim() !== ''
+                            ? String(labourIdNumber).trim()
+                            : null),
+                    labourIdExpiryDate: (0, employee_directory_body_1.parseEmployeeDate)(labourIdExpiryDate),
+                    labourIdAttachment: labourIdAttachmentFile || labourIdAttachment || null,
+                    educationalQualification: educationalQualification != null && String(educationalQualification).trim() !== ''
+                        ? String(educationalQualification).trim()
+                        : null,
+                    curriculumVitaeAttachment: curriculumVitaeAttachmentFile || curriculumVitaeAttachment || null,
+                    remarks: remarks || null,
+                },
+                select: {
+                    id: true,
+                    email: true,
+                    firstName: true,
+                    lastName: true,
+                    role: true,
+                    phone: true,
+                    department: true,
+                    position: true,
+                    jobTitle: true,
+                    photo: true,
+                    employeeId: true,
+                    isActive: true,
+                    createdAt: true,
+                    // Employee Directory fields
+                    employeeType: true,
+                    status: true,
+                    userAccount: true,
+                    gender: true,
+                    maritalStatus: true,
+                    nationality: true,
+                    birthday: true,
+                    childrenCount: true,
+                    currentAddress: true,
+                    phoneNumbers: true,
+                    emailAddresses: true,
+                    company: true,
+                    companyLocation: true,
+                    managerId: true,
+                    manager: managerPersonSelect,
+                    secondLineManagerId: true,
+                    secondLineManager: managerPersonSelect,
+                    attendanceProgram: true,
+                    joiningDate: true,
+                    exitDate: true,
+                    isLineManager: true,
+                    passportNumber: true,
+                    passportIssueDate: true,
+                    passportExpiryDate: true,
+                    passportAttachment: true,
+                    nationalIdNumber: true,
+                    nationalIdExpiryDate: true,
+                    nationalIdAttachment: true,
+                    residencyNumber: true,
+                    residencyExpiryDate: true,
+                    residencyAttachment: true,
+                    visaNumber: true,
+                    insuranceNumber: true,
+                    insuranceExpiryDate: true,
+                    insuranceAttachment: true,
+                    drivingLicenseNumber: true,
+                    drivingLicenseExpiryDate: true,
+                    drivingLicenseAttachment: true,
+                    labourIdNumber: true,
+                    labourIdExpiryDate: true,
+                    labourIdAttachment: true,
+                    educationalQualification: true,
+                    curriculumVitaeAttachment: true,
+                    remarks: true,
+                }
+            });
+        }
+        catch (prismaError) {
+            console.error('❌ Prisma create error:', prismaError);
+            console.error('❌ Prisma error code:', prismaError.code);
+            console.error('❌ Prisma error meta:', prismaError.meta);
+            console.error('❌ Prisma error message:', prismaError.message);
+            // Handle specific Prisma errors
+            if (prismaError.code === 'P2002') {
+                const field = prismaError.meta?.target?.[0] || 'field';
+                res.status(409).json({
+                    success: false,
+                    message: `Employee with this ${field} already exists`,
+                    error: prismaError.message,
+                });
+                return;
+            }
+            // Re-throw to be caught by outer catch block
+            throw prismaError;
+        }
+        console.log('✅ Employee created successfully in database:', employee.id);
+        await (0, employeeSubDepartmentManagers_service_1.syncEmployeeManagersFromSubDepartments)(employee.id);
+        const employeeAfterSync = await database_1.default.user.findUnique({
+            where: { id: employee.id },
+            select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                role: true,
+                phone: true,
+                department: true,
+                position: true,
+                jobTitle: true,
+                photo: true,
+                employeeId: true,
+                isActive: true,
+                createdAt: true,
+                employeeType: true,
+                status: true,
+                userAccount: true,
+                gender: true,
+                maritalStatus: true,
+                nationality: true,
+                birthday: true,
+                childrenCount: true,
+                currentAddress: true,
+                phoneNumbers: true,
+                emailAddresses: true,
+                company: true,
+                companyLocation: true,
+                managerId: true,
+                manager: managerPersonSelect,
+                secondLineManagerId: true,
+                secondLineManager: managerPersonSelect,
+                attendanceProgram: true,
+                joiningDate: true,
+                exitDate: true,
+                isLineManager: true,
+                passportNumber: true,
+                passportIssueDate: true,
+                passportExpiryDate: true,
+                passportAttachment: true,
+                nationalIdNumber: true,
+                nationalIdExpiryDate: true,
+                nationalIdAttachment: true,
+                residencyNumber: true,
+                residencyExpiryDate: true,
+                residencyAttachment: true,
+                visaNumber: true,
+                insuranceNumber: true,
+                insuranceExpiryDate: true,
+                insuranceAttachment: true,
+                drivingLicenseNumber: true,
+                drivingLicenseExpiryDate: true,
+                drivingLicenseAttachment: true,
+                labourIdNumber: true,
+                labourIdExpiryDate: true,
+                labourIdAttachment: true,
+                educationalQualification: true,
+                curriculumVitaeAttachment: true,
+                remarks: true,
+            },
+        });
+        if (employeeAfterSync) {
+            employee = employeeAfterSync;
+        }
+        // Assign to projects if provided
+        if (projectIds && Array.isArray(projectIds) && projectIds.length > 0) {
+            await database_1.default.projectAssignment.createMany({
+                data: projectIds.map((projectId) => ({
+                    projectId,
+                    employeeId: employee.id,
+                    assignedBy: req.user.id,
+                })),
+                skipDuplicates: true,
+            });
+        }
+        // After successful DB commit: send ERP access email + log it (non-blocking for creation success)
+        let erpAccessEmailStatus = 'SKIPPED';
+        if (userAccountBool) {
+            try {
+                const fullName = `${employee.firstName || ''} ${employee.lastName || ''}`.trim();
+                const passToSend = passwordProvided ? plainPassword : temporaryPassword;
+                const result = await (0, employeeErpAccessEmail_service_1.sendEmployeeErpAccessEmail)({
+                    employeeId: employee.id,
+                    toEmail: employee.email,
+                    employeeName: fullName,
+                    department: employee.department || null,
+                    passwordToSend: passToSend || null,
+                });
+                erpAccessEmailStatus = result.status;
+            }
+            catch (e) {
+                // Safety: never fail employee creation due to email side-effect
+                console.warn('⚠️ ERP access email failed unexpectedly:', e);
+                erpAccessEmailStatus = 'FAILED';
+            }
+        }
+        // Return employee with temporary password (shown only once if userAccount is true)
+        const responseData = {
+            success: true,
+            message: 'Employee created successfully',
+            data: {
+                employee,
+            }
+        };
+        if (userAccountBool && temporaryPassword) {
+            responseData.data.credentials = {
+                email: employee.email,
+                temporaryPassword: temporaryPassword,
+                message: 'Please save these credentials. They will not be shown again. User should change password on first login.',
+            };
+        }
+        responseData.data.employee = (0, employee_response_1.shapeEmployeeForClient)(responseData.data.employee, req);
+        responseData.data.erpAccessEmail = { status: erpAccessEmailStatus };
+        res.status(201).json(responseData);
+    }
+    catch (error) {
+        console.error('❌ Create employee error:', error);
+        console.error('❌ Error stack:', error.stack);
+        console.error('❌ Error message:', error.message);
+        console.error('❌ Error code:', error.code);
+        console.error('❌ Error name:', error.name);
+        // Handle unique constraint violations
+        if (error.code === 'P2002') {
+            res.status(409).json({
+                success: false,
+                message: 'Employee with this email or employee ID already exists'
+            });
+            return;
+        }
+        // Log full error details
+        console.error('❌ Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+        console.error('❌ Error meta:', error.meta);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to create employee',
+            error: error.message || 'Unknown error occurred',
+            errorCode: error.code,
+            errorName: error.name,
+            details: process.env.NODE_ENV === 'development' ? error.stack : undefined,
+        });
+    }
+};
+exports.createEmployee = createEmployee;
+/**
+ * Check availability of Employee ID (and optionally email) for validation before create
+ * GET /api/employees/check-availability?employeeId=XXX&email=YYY
+ * Returns { employeeIdAvailable: boolean, emailAvailable?: boolean }
+ */
+const checkEmployeeAvailability = async (req, res) => {
+    try {
+        const { employeeId, email } = req.query;
+        const result = {};
+        if (employeeId !== undefined && employeeId !== null && String(employeeId).trim() !== '') {
+            const id = String(employeeId).trim();
+            const existing = await database_1.default.user.findFirst({ where: { employeeId: id } });
+            result.employeeIdAvailable = !existing;
+        }
+        if (email !== undefined && email !== null && String(email).trim() !== '') {
+            const e = String(email).trim().toLowerCase();
+            const existing = await database_1.default.user.findUnique({ where: { email: e } });
+            result.emailAvailable = !existing;
+        }
+        res.json({ success: true, ...result });
+    }
+    catch (error) {
+        console.error('Check availability error:', error);
+        res.status(500).json({ success: false, message: 'Failed to check availability' });
+    }
+};
+exports.checkEmployeeAvailability = checkEmployeeAvailability;
+/**
+ * Get all employees
+ * GET /api/employees
+ * Access: ADMIN, HR only
+ */
+const getEmployees = async (req, res) => {
+    try {
+        // For employee assignment dropdowns, allow fetching more employees (up to 500)
+        // Default limit increased to 200 to show more employees in dropdowns
+        const { page = 1, limit = 200, search, q, role, department, companyId, companyName, positionId, forTaskAssignment, } = req.query;
+        const searchTermRaw = search ?? q;
+        const searchTerm = searchTermRaw != null && String(searchTermRaw).trim() !== ''
+            ? String(searchTermRaw).trim()
+            : '';
+        const skip = (Number(page) - 1) * Number(limit);
+        console.log('📋 getEmployees called:', {
+            userRole: req.user?.role,
+            userEmail: req.user?.email,
+            userId: req.user?.id,
+            forTaskAssignment,
+            companyId,
+            companyName,
+            positionId,
+        });
+        const requestedPositionId = typeof positionId === 'string' && positionId.trim() ? positionId.trim() : '';
+        // Build where clause (exclude tender engineers from the general directory list;
+        // ADMIN / SUPER_ADMIN / etc. are normal directory users when given a company profile.)
+        const where = {
+            role: {
+                notIn: ['TENDER_ENGINEER'],
+            },
+        };
+        // By default, non‑privileged roles should only see active employees.
+        // ADMIN, HR, and SUPER_ADMIN see both active and inactive employees so they can restore.
+        const requesterRole = req.user?.role;
+        const isPrivilegedViewer = isEmployeeDirectoryPrivilegedRole(requesterRole);
+        if (!isPrivilegedViewer) {
+            where.isActive = true;
+        }
+        // For task assignment dropdowns: ALL managers (MANAGER, PROJECT_MANAGER) can see all employees
+        // ADMIN and HR also see all employees
+        // No managerId filter is applied - all managers can assign tasks to any employee
+        if (forTaskAssignment === 'true') {
+            console.log(`✅ ${req.user?.role} role: Showing all employees for task assignment (no managerId filter)`);
+        }
+        // Filter by company so each company's Employee Directory shows only its own employees.
+        // Skip company filtering for task assignment - managers should see their team members regardless of company.
+        if (forTaskAssignment !== 'true') {
+            let companyAliases = [];
+            if (companyName && typeof companyName === 'string' && companyName.trim()) {
+                const want = companyName.trim();
+                let parentName = null;
+                // If this company name corresponds to a branch, include parent company name too.
+                const nameAliases = (0, company_name_aliases_1.buildCompanyNameAliases)(want);
+                const companyRow = await database_1.default.company.findFirst({
+                    where: {
+                        OR: nameAliases.map((n) => ({ name: { equals: n, mode: 'insensitive' } })),
+                    },
+                    select: { parentCompanyId: true },
+                });
+                if (companyRow?.parentCompanyId) {
+                    const parent = await database_1.default.company.findUnique({
+                        where: { id: String(companyRow.parentCompanyId).trim() },
+                        select: { name: true },
+                    });
+                    parentName = parent?.name ? String(parent.name).trim() : null;
+                }
+                companyAliases = (0, company_name_aliases_1.buildCompanyScopeAliases)(want, parentName);
+            }
+            else if (companyId && typeof companyId === 'string' && companyId.trim()) {
+                const cid = companyId.trim();
+                const allowed = await (0, companyAccess_service_1.assertCanAccessCompany)(req.user.id, requesterRole || '', cid);
+                if (!allowed && (requesterRole === 'ADMIN' || requesterRole === 'HR')) {
+                    res.json({
+                        success: true,
+                        data: { employees: [], pagination: { page: Number(page), limit: Number(limit), total: 0, totalPages: 0 } },
+                    });
+                    return;
+                }
+                const company = await database_1.default.company.findUnique({
+                    where: { id: companyId.trim() },
+                    // Prisma client types may lag schema in some environments; keep select minimal.
+                    select: { name: true, parentCompanyId: true },
+                });
+                if (company?.name != null && String(company.name).trim() !== '') {
+                    let parentName = null;
+                    if (company?.parentCompanyId) {
+                        const parent = await database_1.default.company.findUnique({
+                            where: { id: String(company.parentCompanyId).trim() },
+                            select: { name: true },
+                        });
+                        parentName = parent?.name ? String(parent.name).trim() : null;
+                    }
+                    companyAliases = (0, company_name_aliases_1.buildCompanyScopeAliases)(String(company.name), parentName);
+                }
+            }
+            if (requestedPositionId) {
+                const scopedEmployeeSources = [];
+                if (companyAliases.length > 0) {
+                    scopedEmployeeSources.push({
+                        OR: companyAliases.map((n) => ({ company: { equals: n, mode: 'insensitive' } })),
+                    });
+                }
+                scopedEmployeeSources.push({
+                    positionAssignments: {
+                        some: {
+                            positionId: requestedPositionId,
+                        },
+                    },
+                });
+                where.AND = [
+                    ...(Array.isArray(where.AND) ? where.AND : []),
+                    { OR: scopedEmployeeSources },
+                ];
+            }
+            else if (companyAliases.length > 0) {
+                where.AND = [
+                    ...(Array.isArray(where.AND) ? where.AND : []),
+                    {
+                        OR: companyAliases.map((n) => ({ company: { equals: n, mode: 'insensitive' } })),
+                    },
+                ];
+            }
+            else if (forTaskAssignment !== 'true' &&
+                isPrivilegedViewer &&
+                (requesterRole === 'ADMIN' || requesterRole === 'HR')) {
+                const accessScope = await (0, companyAccess_service_1.resolveCompanyAccessScope)(req.user.id, requesterRole);
+                if (!accessScope.unrestricted) {
+                    const scopedEmployeeWhere = await (0, companyAccess_service_1.buildEmployeeWhereForCompanyScope)(accessScope);
+                    if (scopedEmployeeWhere) {
+                        where.AND = [...(Array.isArray(where.AND) ? where.AND : []), scopedEmployeeWhere];
+                    }
+                }
+            }
+        }
+        if (searchTerm) {
+            where.OR = [
+                { firstName: { contains: searchTerm, mode: 'insensitive' } },
+                { lastName: { contains: searchTerm, mode: 'insensitive' } },
+                { email: { contains: searchTerm, mode: 'insensitive' } },
+                { employeeId: { contains: searchTerm, mode: 'insensitive' } },
+                { department: { contains: searchTerm, mode: 'insensitive' } },
+                { jobTitle: { contains: searchTerm, mode: 'insensitive' } },
+                { position: { contains: searchTerm, mode: 'insensitive' } },
+                { company: { contains: searchTerm, mode: 'insensitive' } },
+                { phone: { contains: searchTerm, mode: 'insensitive' } },
+            ];
+        }
+        if (role) {
+            const roleStr = String(role);
+            if (Object.values(client_1.UserRole).includes(roleStr)) {
+                where.role = roleStr;
+            }
+        }
+        if (department) {
+            where.department = { contains: department, mode: 'insensitive' };
+        }
+        console.log('🔍 Query where clause:', JSON.stringify(where, null, 2));
+        // Get employees
+        const [employees, total] = await Promise.all([
+            database_1.default.user.findMany({
+                where,
+                skip,
+                take: Number(limit),
+                select: {
+                    id: true,
+                    email: true,
+                    firstName: true,
+                    lastName: true,
+                    role: true,
+                    phone: true,
+                    department: true,
+                    position: true,
+                    jobTitle: true,
+                    photo: true,
+                    employeeId: true,
+                    totalXp: true,
+                    starCount: true,
+                    isActive: true,
+                    forcePasswordChange: true,
+                    createdAt: true,
+                    updatedAt: true,
+                    // Employee Directory fields
+                    employeeType: true,
+                    status: true,
+                    userAccount: true,
+                    gender: true,
+                    maritalStatus: true,
+                    nationality: true,
+                    birthday: true,
+                    childrenCount: true,
+                    currentAddress: true,
+                    phoneNumbers: true,
+                    emailAddresses: true,
+                    company: true,
+                    companyLocation: true,
+                    managerId: true,
+                    manager: managerPersonSelect,
+                    secondLineManagerId: true,
+                    secondLineManager: managerPersonSelect,
+                    attendanceProgram: true,
+                    joiningDate: true,
+                    exitDate: true,
+                    isLineManager: true,
+                    passportNumber: true,
+                    passportIssueDate: true,
+                    passportExpiryDate: true,
+                    passportAttachment: true,
+                    nationalIdNumber: true,
+                    nationalIdExpiryDate: true,
+                    nationalIdAttachment: true,
+                    residencyNumber: true,
+                    residencyExpiryDate: true,
+                    residencyAttachment: true,
+                    visaNumber: true,
+                    insuranceNumber: true,
+                    insuranceExpiryDate: true,
+                    insuranceAttachment: true,
+                    drivingLicenseNumber: true,
+                    drivingLicenseExpiryDate: true,
+                    drivingLicenseAttachment: true,
+                    labourIdNumber: true,
+                    labourIdExpiryDate: true,
+                    labourIdAttachment: true,
+                    educationalQualification: true,
+                    curriculumVitaeAttachment: true,
+                    remarks: true,
+                    assignedProjects: {
+                        select: {
+                            project: {
+                                select: {
+                                    id: true,
+                                    name: true,
+                                    referenceNumber: true,
+                                }
+                            }
+                        }
+                    },
+                    positionAssignments: {
+                        select: { positionId: true },
+                    },
+                },
+                orderBy: { createdAt: 'desc' },
+            }),
+            database_1.default.user.count({ where }),
+        ]);
+        console.log(`✅ Found ${employees.length} employees (total: ${total})`);
+        const completionStats = await (0, workload_service_1.fetchCompletionStatsBatch)(employees.map((e) => e.id));
+        const employeesForClient = employees.map((e) => {
+            const stats = completionStats.get(e.id);
+            return (0, employee_response_1.shapeEmployeeForClient)({
+                ...e,
+                overallRating: stats?.overallRating ?? 0,
+                completionStarRating: stats?.completionStarRating ?? 0,
+                assignedTasksCompleted: stats?.assignedTasksCompleted ?? 0,
+                assignedTasksTotal: stats?.assignedTasksTotal ?? 0,
+            }, req);
+        });
+        res.json({
+            success: true,
+            data: {
+                employees: employeesForClient,
+                pagination: {
+                    page: Number(page),
+                    limit: Number(limit),
+                    total,
+                    pages: Math.ceil(total / Number(limit)),
+                }
+            }
+        });
+    }
+    catch (error) {
+        console.error('Get employees error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch employees'
+        });
+    }
+};
+exports.getEmployees = getEmployees;
+/**
+ * Get employee by ID
+ * GET /api/employees/:id
+ * Access: ADMIN, HR, or the employee themselves
+ */
+const getEmployeeById = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const currentUser = req.user;
+        // Check if user can access this employee
+        if (!isEmployeeDirectoryPrivilegedRole(currentUser.role) &&
+            currentUser.id !== id) {
+            res.status(403).json({
+                success: false,
+                message: 'Forbidden: You can only view your own profile'
+            });
+            return;
+        }
+        const employee = await database_1.default.user.findUnique({
+            where: { id },
+            select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                role: true,
+                phone: true,
+                department: true,
+                position: true,
+                jobTitle: true,
+                photo: true,
+                employeeId: true,
+                totalXp: true,
+                starCount: true,
+                isActive: true,
+                forcePasswordChange: true,
+                createdAt: true,
+                updatedAt: true,
+                // Employee Directory fields
+                employeeType: true,
+                status: true,
+                userAccount: true,
+                gender: true,
+                maritalStatus: true,
+                nationality: true,
+                birthday: true,
+                childrenCount: true,
+                currentAddress: true,
+                phoneNumbers: true,
+                emailAddresses: true,
+                company: true,
+                companyLocation: true,
+                managerId: true,
+                manager: managerPersonSelect,
+                secondLineManagerId: true,
+                secondLineManager: managerPersonSelect,
+                attendanceProgram: true,
+                joiningDate: true,
+                exitDate: true,
+                isLineManager: true,
+                passportNumber: true,
+                passportIssueDate: true,
+                passportExpiryDate: true,
+                passportAttachment: true,
+                nationalIdNumber: true,
+                nationalIdExpiryDate: true,
+                nationalIdAttachment: true,
+                residencyNumber: true,
+                residencyExpiryDate: true,
+                residencyAttachment: true,
+                visaNumber: true,
+                insuranceNumber: true,
+                insuranceExpiryDate: true,
+                insuranceAttachment: true,
+                drivingLicenseNumber: true,
+                drivingLicenseExpiryDate: true,
+                drivingLicenseAttachment: true,
+                labourIdNumber: true,
+                labourIdExpiryDate: true,
+                labourIdAttachment: true,
+                educationalQualification: true,
+                curriculumVitaeAttachment: true,
+                remarks: true,
+                isLabour: true,
+                labourDetails: {
+                    select: {
+                        basicSalary: true,
+                        contractTotalSalary: true,
+                        allowance1: true,
+                        allowance2: true,
+                    },
+                },
+                positionAssignments: {
+                    select: {
+                        positionId: true,
+                        position: {
+                            select: {
+                                id: true,
+                                name: true,
+                                subDepartment: {
+                                    select: {
+                                        name: true,
+                                        department: {
+                                            select: {
+                                                name: true,
+                                                company: { select: { name: true } },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                assignedProjects: {
+                    select: {
+                        project: {
+                            select: {
+                                id: true,
+                                name: true,
+                                referenceNumber: true,
+                                status: true,
+                            }
+                        },
+                        role: true,
+                        assignedAt: true,
+                    }
+                },
+                assignedTasks: {
+                    select: {
+                        taskId: true,
+                        status: true,
+                        assignedAt: true,
+                    }
+                }
+            }
+        });
+        if (!employee) {
+            res.status(404).json({
+                success: false,
+                message: 'Employee not found'
+            });
+            return;
+        }
+        const { labourDetails: employeeLabourDetails, ...employeeRest } = employee;
+        const shaped = (0, employee_response_1.shapeEmployeeForClient)(employeeRest, req);
+        res.json({
+            success: true,
+            data: {
+                ...shaped,
+                payroll: (0, payroll_utils_1.labourDetailsToSelfServicePayroll)(employeeLabourDetails),
+            },
+        });
+    }
+    catch (error) {
+        console.error('Get employee error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch employee'
+        });
+    }
+};
+exports.getEmployeeById = getEmployeeById;
+/**
+ * Update employee
+ * PUT /api/employees/:id
+ * Access: ADMIN, HR only
+ */
+const updateEmployee = async (req, res) => {
+    try {
+        const { id } = req.params;
+        // Log incoming request for debugging
+        console.log('📝 Update employee request received');
+        console.log('📝 Employee ID:', id);
+        console.log('📝 Request body keys:', Object.keys(req.body || {}));
+        console.log('📝 Request body (first 1000 chars):', JSON.stringify(req.body).substring(0, 1000));
+        console.log('📝 Content-Type:', req.headers['content-type']);
+        console.log('📝 Has files:', !!req.file || !!req.files);
+        const rawBody = (req.body || {});
+        const b = (0, employee_directory_body_1.normalizeEmployeeDirectoryBody)(rawBody);
+        /** Normalized wins over raw; then lift any nested legal/personal keys again (raw-only nesting). */
+        const mergedBody = { ...rawBody, ...b };
+        (0, employee_directory_body_1.liftNestedFormSectionsOntoRoot)(mergedBody);
+        const flatForLegalResolvers = mergedBody;
+        const { 
+        // Basic fields
+        firstName, lastName, role, phone, department, position, jobTitle, employeeId, isActive, projectIds, 
+        // ERP Access (login credentials)
+        workEmail, password: plainPasswordUpdate, 
+        // Employee Directory - Personal Info
+        employeeType, status, userAccount, 
+        // Employee Directory - Personal Details
+        gender, maritalStatus, nationality, birthday, childrenCount, currentAddress, 
+        // Employee Directory - Contact Info (patched via shouldPatch* + resolve* on b)
+        // Employee Directory - Company Info
+        company, companyLocation, managerId, secondLineManagerId, attendanceProgram, joiningDate, exitDate, isLineManager, 
+        // Employee Directory - Legal Documents
+        passportNumber, passportIssueDate, passportExpiryDate, passportAttachment, nationalIdNumber, nationalIdExpiryDate, nationalIdAttachment, residencyNumber, residencyExpiryDate, residencyAttachment, visaNumber, insuranceNumber, insuranceExpiryDate, insuranceAttachment, drivingLicenseNumber, drivingLicenseExpiryDate, drivingLicenseAttachment, labourIdNumber, labourIdExpiryDate, labourIdAttachment, educationalQualification, curriculumVitaeAttachment, remarks } = mergedBody;
+        // Get photo filename from uploaded file (if new photo uploaded)
+        const photoFilename = req.file ? req.file.filename : undefined;
+        // Get legal document filenames from uploaded files
+        const files = req.files || {};
+        const passportAttachmentFile = files.passportAttachment?.[0]?.filename;
+        const nationalIdAttachmentFile = files.nationalIdAttachment?.[0]?.filename;
+        const residencyAttachmentFile = files.residencyAttachment?.[0]?.filename;
+        const insuranceAttachmentFile = files.insuranceAttachment?.[0]?.filename;
+        const drivingLicenseAttachmentFile = files.drivingLicenseAttachment?.[0]?.filename;
+        const labourIdAttachmentFile = files.labourIdAttachment?.[0]?.filename;
+        const curriculumVitaeAttachmentFile = files.curriculumVitaeAttachment?.[0]?.filename;
+        // Check if employee exists
+        const existingEmployee = await database_1.default.user.findUnique({
+            where: { id }
+        });
+        if (!existingEmployee) {
+            res.status(404).json({
+                success: false,
+                message: 'Employee not found'
+            });
+            return;
+        }
+        // Validate minimum age (18 years) only when birthday is actually being changed (non-empty value)
+        if (shouldPatchOptionalScalar(birthday)) {
+            const birthDate = (0, employee_directory_body_1.parseEmployeeDate)(birthday);
+            if (!birthDate || Number.isNaN(birthDate.getTime())) {
+                res.status(400).json({
+                    success: false,
+                    message: 'Invalid birthday format.',
+                });
+                return;
+            }
+            const today = new Date();
+            let age = today.getFullYear() - birthDate.getFullYear();
+            const monthDiff = today.getMonth() - birthDate.getMonth();
+            if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
+                age--;
+            }
+            if (age < 18) {
+                res.status(400).json({
+                    success: false,
+                    message: 'This employee cannot be added to the company unless they are at least 18 years old.',
+                });
+                return;
+            }
+        }
+        // Passport 6-month rule only when client sends a real new expiry (not empty FormData placeholders)
+        if (shouldPatchOptionalScalar(passportExpiryDate)) {
+            const expiryDate = (0, employee_directory_body_1.parseEmployeeDate)(passportExpiryDate);
+            if (!expiryDate || Number.isNaN(expiryDate.getTime())) {
+                res.status(400).json({
+                    success: false,
+                    message: 'Invalid passport expiry date format.',
+                });
+                return;
+            }
+            const today = new Date();
+            const sixMonthsFromNow = new Date();
+            sixMonthsFromNow.setMonth(today.getMonth() + 6);
+            if (expiryDate < sixMonthsFromNow) {
+                res.status(400).json({
+                    success: false,
+                    message: 'Passport must be valid for at least 6 months from today. Please upload a passport with a later expiry date.',
+                });
+                return;
+            }
+        }
+        // Verify manager exists if provided (empty string from FormData means "no manager")
+        const resolvedManagerId = (0, employee_directory_body_1.resolveManagerIdInput)(managerId);
+        if (resolvedManagerId) {
+            const manager = await database_1.default.user.findUnique({
+                where: { id: resolvedManagerId },
+            });
+            if (!manager) {
+                res.status(404).json({
+                    success: false,
+                    message: 'Manager not found'
+                });
+                return;
+            }
+        }
+        // Update employee
+        const updateData = {};
+        if (firstName !== undefined)
+            updateData.firstName = firstName;
+        if (lastName !== undefined)
+            updateData.lastName = lastName;
+        if (shouldPatchOptionalScalar(role) && role !== null) {
+            updateData.role = role;
+        }
+        if (shouldPatchOptionalScalar(phone)) {
+            updateData.phone = phone === null ? null : String(phone).trim() || null;
+        }
+        const deptIdForUpdate = mergedBody.departmentId ?? rawBody.departmentId;
+        const wantsDepartmentUpdate = shouldPatchOptionalScalar(department) ||
+            (deptIdForUpdate !== undefined &&
+                deptIdForUpdate !== null &&
+                String(deptIdForUpdate).trim() !== '');
+        if (wantsDepartmentUpdate) {
+            updateData.department = await resolveDepartmentForUser(department, deptIdForUpdate);
+        }
+        if (shouldPatchOptionalScalar(position)) {
+            updateData.position = position === null ? null : String(position).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(jobTitle)) {
+            updateData.jobTitle = jobTitle === null ? null : String(jobTitle).trim() || null;
+        }
+        if (photoFilename !== undefined)
+            updateData.photo = photoFilename;
+        if (shouldPatchOptionalScalar(employeeId)) {
+            updateData.employeeId = employeeId === null ? null : String(employeeId).trim() || null;
+        }
+        if (isActive !== undefined)
+            updateData.isActive = parseBoolean(isActive);
+        // Employee Directory - Personal Info
+        if (shouldPatchOptionalScalar(employeeType)) {
+            updateData.employeeType = employeeType === null ? null : String(employeeType).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(status)) {
+            updateData.status = status === null ? null : String(status).trim() || null;
+        }
+        if (userAccount !== undefined) {
+            const enableAccess = parseBoolean(userAccount);
+            updateData.userAccount = enableAccess;
+            updateData.isActive = enableAccess ? true : false;
+        }
+        // ERP Access: work email (must be unique)
+        if (workEmail !== undefined && typeof workEmail === 'string' && workEmail.trim().length > 0) {
+            const trimmed = workEmail.trim().toLowerCase();
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(trimmed)) {
+                res.status(400).json({ success: false, message: 'Work email must be a valid email address.' });
+                return;
+            }
+            const existing = await database_1.default.user.findFirst({ where: { email: trimmed, id: { not: id } } });
+            if (existing) {
+                res.status(409).json({ success: false, message: 'An account with this email already exists.' });
+                return;
+            }
+            updateData.email = trimmed;
+        }
+        // ERP Access: password (when enabling or updating credentials)
+        if (plainPasswordUpdate !== undefined && typeof plainPasswordUpdate === 'string' && plainPasswordUpdate.length > 0) {
+            if (plainPasswordUpdate.length < 8) {
+                res.status(400).json({ success: false, message: 'Password must be at least 8 characters long.' });
+                return;
+            }
+            const hasLetter = /[a-zA-Z]/.test(plainPasswordUpdate);
+            const hasNumber = /\d/.test(plainPasswordUpdate);
+            if (!hasLetter || !hasNumber) {
+                res.status(400).json({ success: false, message: 'Password must contain at least one letter and one number.' });
+                return;
+            }
+            updateData.password = await bcryptjs_1.default.hash(plainPasswordUpdate, 10);
+            updateData.forcePasswordChange = false;
+        }
+        // Employee Directory - Personal Details
+        if (shouldPatchOptionalScalar(gender)) {
+            updateData.gender = gender === null ? null : String(gender).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(maritalStatus)) {
+            updateData.maritalStatus = maritalStatus === null ? null : String(maritalStatus).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(nationality)) {
+            updateData.nationality = nationality === null ? null : String(nationality).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(birthday)) {
+            updateData.birthday = (0, employee_directory_body_1.parseEmployeeDate)(birthday);
+        }
+        if (shouldPatchOptionalScalar(childrenCount)) {
+            if (childrenCount === null) {
+                updateData.childrenCount = null;
+            }
+            else {
+                const n = parseInt(String(childrenCount), 10);
+                updateData.childrenCount = Number.isNaN(n) ? null : n;
+            }
+        }
+        if (shouldPatchOptionalScalar(currentAddress)) {
+            updateData.currentAddress = currentAddress === null ? null : String(currentAddress).trim() || null;
+        }
+        // Employee Directory - Contact Info (FormData objects + flat phone/email fields)
+        if ((0, employee_directory_body_1.shouldPatchPhoneNumbers)(mergedBody)) {
+            updateData.phoneNumbers = (0, employee_directory_body_1.resolvePhoneNumbersJson)(mergedBody);
+        }
+        if ((0, employee_directory_body_1.shouldPatchEmailAddresses)(mergedBody)) {
+            updateData.emailAddresses = (0, employee_directory_body_1.resolveEmailAddressesJson)(mergedBody);
+        }
+        // Employee Directory - Company Info
+        if (shouldPatchOptionalScalar(company)) {
+            updateData.company = company === null ? null : String(company).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(companyLocation)) {
+            updateData.companyLocation = companyLocation === null ? null : String(companyLocation).trim() || null;
+        }
+        if (managerId !== undefined) {
+            updateData.managerId = (0, employee_directory_body_1.resolveManagerIdInput)(managerId) ?? null;
+        }
+        if (secondLineManagerId !== undefined) {
+            updateData.secondLineManagerId = (0, employee_directory_body_1.resolveManagerIdInput)(secondLineManagerId) ?? null;
+        }
+        if (shouldPatchOptionalScalar(attendanceProgram)) {
+            updateData.attendanceProgram =
+                attendanceProgram === null ? null : String(attendanceProgram).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(joiningDate)) {
+            updateData.joiningDate = (0, employee_directory_body_1.parseEmployeeDate)(joiningDate);
+        }
+        if (shouldPatchOptionalScalar(exitDate)) {
+            updateData.exitDate = (0, employee_directory_body_1.parseEmployeeDate)(exitDate);
+        }
+        if (isLineManager !== undefined)
+            updateData.isLineManager = parseBoolean(isLineManager);
+        // Employee Directory - Legal Documents
+        if (shouldPatchOptionalScalar(passportNumber)) {
+            updateData.passportNumber = passportNumber === null ? null : String(passportNumber).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(passportIssueDate)) {
+            updateData.passportIssueDate = (0, employee_directory_body_1.parseEmployeeDate)(passportIssueDate);
+        }
+        if (shouldPatchOptionalScalar(passportExpiryDate)) {
+            updateData.passportExpiryDate = (0, employee_directory_body_1.parseEmployeeDate)(passportExpiryDate);
+        }
+        if (passportAttachmentFile !== undefined) {
+            updateData.passportAttachment = passportAttachmentFile;
+        }
+        else if (shouldPatchOptionalScalar(passportAttachment)) {
+            updateData.passportAttachment =
+                passportAttachment === null ? null : String(passportAttachment).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(nationalIdNumber)) {
+            updateData.nationalIdNumber = nationalIdNumber === null ? null : String(nationalIdNumber).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(nationalIdExpiryDate)) {
+            updateData.nationalIdExpiryDate = (0, employee_directory_body_1.parseEmployeeDate)(nationalIdExpiryDate);
+        }
+        if (nationalIdAttachmentFile !== undefined) {
+            updateData.nationalIdAttachment = nationalIdAttachmentFile;
+        }
+        else if (shouldPatchOptionalScalar(nationalIdAttachment)) {
+            updateData.nationalIdAttachment =
+                nationalIdAttachment === null ? null : String(nationalIdAttachment).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(residencyNumber)) {
+            updateData.residencyNumber = residencyNumber === null ? null : String(residencyNumber).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(residencyExpiryDate)) {
+            updateData.residencyExpiryDate = (0, employee_directory_body_1.parseEmployeeDate)(residencyExpiryDate);
+        }
+        if (shouldPatchOptionalScalar(visaNumber)) {
+            updateData.visaNumber =
+                visaNumber === null ? null : typeof visaNumber === 'string' ? visaNumber.trim() || null : visaNumber;
+        }
+        if (residencyAttachmentFile !== undefined) {
+            updateData.residencyAttachment = residencyAttachmentFile;
+        }
+        else if (shouldPatchOptionalScalar(residencyAttachment)) {
+            updateData.residencyAttachment =
+                residencyAttachment === null ? null : String(residencyAttachment).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(insuranceNumber)) {
+            updateData.insuranceNumber = insuranceNumber === null ? null : String(insuranceNumber).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(insuranceExpiryDate)) {
+            updateData.insuranceExpiryDate = (0, employee_directory_body_1.parseEmployeeDate)(insuranceExpiryDate);
+        }
+        if (insuranceAttachmentFile !== undefined) {
+            updateData.insuranceAttachment = insuranceAttachmentFile;
+        }
+        else if (shouldPatchOptionalScalar(insuranceAttachment)) {
+            updateData.insuranceAttachment =
+                insuranceAttachment === null ? null : String(insuranceAttachment).trim() || null;
+        }
+        const resolvedDrivingNo = (0, employee_directory_body_1.resolveDrivingLicenseNumberForDb)(flatForLegalResolvers);
+        if (resolvedDrivingNo !== undefined && String(resolvedDrivingNo).trim() !== '') {
+            updateData.drivingLicenseNumber = String(resolvedDrivingNo).trim();
+        }
+        else if (shouldPatchOptionalScalar(drivingLicenseNumber)) {
+            updateData.drivingLicenseNumber =
+                drivingLicenseNumber === null ? null : String(drivingLicenseNumber).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(drivingLicenseExpiryDate)) {
+            updateData.drivingLicenseExpiryDate = (0, employee_directory_body_1.parseEmployeeDate)(drivingLicenseExpiryDate);
+        }
+        if (drivingLicenseAttachmentFile !== undefined) {
+            updateData.drivingLicenseAttachment = drivingLicenseAttachmentFile;
+        }
+        else if (shouldPatchOptionalScalar(drivingLicenseAttachment)) {
+            updateData.drivingLicenseAttachment =
+                drivingLicenseAttachment === null ? null : String(drivingLicenseAttachment).trim() || null;
+        }
+        const resolvedLabourNo = (0, employee_directory_body_1.resolveLabourIdNumberForDb)(flatForLegalResolvers);
+        if (resolvedLabourNo !== undefined && String(resolvedLabourNo).trim() !== '') {
+            updateData.labourIdNumber = String(resolvedLabourNo).trim();
+        }
+        else if (shouldPatchOptionalScalar(labourIdNumber)) {
+            updateData.labourIdNumber =
+                labourIdNumber === null ? null : String(labourIdNumber).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(labourIdExpiryDate)) {
+            updateData.labourIdExpiryDate = (0, employee_directory_body_1.parseEmployeeDate)(labourIdExpiryDate);
+        }
+        if (labourIdAttachmentFile !== undefined) {
+            updateData.labourIdAttachment = labourIdAttachmentFile;
+        }
+        else if (shouldPatchOptionalScalar(labourIdAttachment)) {
+            updateData.labourIdAttachment =
+                labourIdAttachment === null ? null : String(labourIdAttachment).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(remarks)) {
+            updateData.remarks = remarks === null ? null : String(remarks).trim() || null;
+        }
+        if (shouldPatchOptionalScalar(educationalQualification)) {
+            updateData.educationalQualification =
+                educationalQualification === null ? null : String(educationalQualification).trim() || null;
+        }
+        if (curriculumVitaeAttachmentFile !== undefined) {
+            updateData.curriculumVitaeAttachment = curriculumVitaeAttachmentFile;
+        }
+        else if (shouldPatchOptionalScalar(curriculumVitaeAttachment)) {
+            updateData.curriculumVitaeAttachment =
+                curriculumVitaeAttachment === null ? null : String(curriculumVitaeAttachment).trim() || null;
+        }
+        let hasProjectAssignmentChange = false;
+        let resolvedProjectIds = [];
+        let existingProjectIds = [];
+        if (projectIds !== undefined) {
+            resolvedProjectIds = resolveProjectIdsList(projectIds);
+            const existingAssignments = await database_1.default.projectAssignment.findMany({
+                where: { employeeId: id },
+                select: { projectId: true },
+            });
+            existingProjectIds = existingAssignments.map((a) => a.projectId);
+            hasProjectAssignmentChange =
+                sortJoinProjectIds(existingProjectIds) !== sortJoinProjectIds(resolvedProjectIds);
+        }
+        const changeReasonRaw = mergedBody.changeReason ?? mergedBody.updateReason;
+        let changeReason = '';
+        if (typeof changeReasonRaw === 'string') {
+            changeReason = changeReasonRaw.trim();
+        }
+        else if (Array.isArray(changeReasonRaw)) {
+            const first = changeReasonRaw.find((x) => x != null && String(x).trim() !== '');
+            changeReason = first != null ? String(first).trim() : '';
+        }
+        else if (changeReasonRaw != null && typeof changeReasonRaw !== 'object') {
+            changeReason = String(changeReasonRaw).trim();
+        }
+        const beforeSnapshot = { ...existingEmployee };
+        const previewRows = (0, employee_change_log_1.buildEmployeeUpdateChangeRows)({
+            before: beforeSnapshot,
+            updateData,
+            employeeId: id,
+            changedById: req.user.id,
+            changedByRole: '—',
+            reason: '—',
+        });
+        const changedFieldKeys = new Set(previewRows.map((r) => r.fieldKey));
+        const filteredUpdateData = {};
+        for (const key of Object.keys(updateData)) {
+            if (key === 'forcePasswordChange') {
+                if (changedFieldKeys.has('password'))
+                    filteredUpdateData[key] = updateData[key];
+                continue;
+            }
+            if (changedFieldKeys.has(key)) {
+                filteredUpdateData[key] = updateData[key];
+            }
+        }
+        const hasFieldUpdates = Object.keys(filteredUpdateData).length > 0;
+        // Log update data for debugging
+        console.log('📝 Update data being sent to Prisma:', JSON.stringify(filteredUpdateData, null, 2));
+        console.log('📝 Employee ID:', id);
+        console.log('📝 Update data keys:', Object.keys(filteredUpdateData));
+        if (!hasFieldUpdates && !hasProjectAssignmentChange) {
+            console.warn('⚠️ No fields to update - no effective changes');
+            const existing = await database_1.default.user.findUnique({
+                where: { id },
+                select: {
+                    id: true,
+                    email: true,
+                    firstName: true,
+                    lastName: true,
+                    role: true,
+                    phone: true,
+                    department: true,
+                    position: true,
+                    jobTitle: true,
+                    photo: true,
+                    employeeId: true,
+                    isActive: true,
+                    updatedAt: true,
+                },
+            });
+            if (!existing) {
+                res.status(404).json({
+                    success: false,
+                    message: 'Employee not found',
+                });
+                return;
+            }
+            res.json({
+                success: true,
+                message: 'No changes to update',
+                data: (0, employee_response_1.shapeEmployeeForClient)(existing, req),
+            });
+            return;
+        }
+        if ((hasFieldUpdates || hasProjectAssignmentChange) && !changeReason) {
+            res.status(400).json({
+                success: false,
+                message: 'A reason for this update is required (changeReason).',
+            });
+            return;
+        }
+        const actorId = req.user.id;
+        const auditRole = employeeAuditRoleLabel(req.user.role);
+        const fieldChangeRows = (0, employee_change_log_1.buildEmployeeUpdateChangeRows)({
+            before: beforeSnapshot,
+            updateData: filteredUpdateData,
+            employeeId: id,
+            changedById: actorId,
+            changedByRole: auditRole,
+            reason: changeReason,
+        });
+        const changeRows = [...fieldChangeRows];
+        if (hasProjectAssignmentChange) {
+            const oldVal = sortJoinProjectIds(existingProjectIds) || '(none)';
+            const newVal = sortJoinProjectIds(resolvedProjectIds) || '(none)';
+            changeRows.push({
+                employeeId: id,
+                changedById: actorId,
+                changedByRole: auditRole,
+                fieldKey: 'projectAssignments',
+                fieldLabel: 'Project assignments',
+                oldValue: oldVal,
+                newValue: newVal,
+                reason: changeReason,
+            });
+        }
+        const employeeSelect = {
+            id: true,
+            email: true,
+            firstName: true,
+            lastName: true,
+            role: true,
+            phone: true,
+            department: true,
+            position: true,
+            jobTitle: true,
+            photo: true,
+            employeeId: true,
+            isActive: true,
+            updatedAt: true,
+            employeeType: true,
+            status: true,
+            userAccount: true,
+            gender: true,
+            maritalStatus: true,
+            nationality: true,
+            birthday: true,
+            childrenCount: true,
+            currentAddress: true,
+            phoneNumbers: true,
+            emailAddresses: true,
+            company: true,
+            companyLocation: true,
+            managerId: true,
+            manager: managerPersonSelect,
+            secondLineManagerId: true,
+            secondLineManager: managerPersonSelect,
+            attendanceProgram: true,
+            joiningDate: true,
+            exitDate: true,
+            isLineManager: true,
+            passportNumber: true,
+            passportIssueDate: true,
+            passportExpiryDate: true,
+            passportAttachment: true,
+            nationalIdNumber: true,
+            nationalIdExpiryDate: true,
+            nationalIdAttachment: true,
+            residencyNumber: true,
+            residencyExpiryDate: true,
+            residencyAttachment: true,
+            visaNumber: true,
+            insuranceNumber: true,
+            insuranceExpiryDate: true,
+            insuranceAttachment: true,
+            drivingLicenseNumber: true,
+            drivingLicenseExpiryDate: true,
+            drivingLicenseAttachment: true,
+            labourIdNumber: true,
+            labourIdExpiryDate: true,
+            labourIdAttachment: true,
+            educationalQualification: true,
+            curriculumVitaeAttachment: true,
+            remarks: true,
+        };
+        await database_1.default.$transaction(async (tx) => {
+            if (changeRows.length > 0) {
+                await tx.employeeChangeLog.createMany({ data: changeRows });
+            }
+            if (hasFieldUpdates) {
+                await tx.user.update({
+                    where: { id },
+                    data: filteredUpdateData,
+                });
+            }
+            if (projectIds !== undefined) {
+                await tx.projectAssignment.deleteMany({
+                    where: { employeeId: id },
+                });
+                if (resolvedProjectIds.length > 0) {
+                    await tx.projectAssignment.createMany({
+                        data: resolvedProjectIds.map((projectId) => ({
+                            projectId,
+                            employeeId: id,
+                            assignedBy: actorId,
+                        })),
+                        skipDuplicates: true,
+                    });
+                }
+            }
+        });
+        await (0, employeeSubDepartmentManagers_service_1.syncEmployeeManagersFromSubDepartments)(id);
+        const manualManagerPatch = {};
+        if (managerId !== undefined) {
+            manualManagerPatch.managerId = (0, employee_directory_body_1.resolveManagerIdInput)(managerId) ?? null;
+        }
+        if (secondLineManagerId !== undefined) {
+            manualManagerPatch.secondLineManagerId = (0, employee_directory_body_1.resolveManagerIdInput)(secondLineManagerId) ?? null;
+        }
+        if (Object.keys(manualManagerPatch).length > 0) {
+            await database_1.default.user.update({
+                where: { id },
+                data: manualManagerPatch,
+            });
+        }
+        const employee = await database_1.default.user.findUnique({
+            where: { id },
+            select: employeeSelect,
+        });
+        if (!employee) {
+            res.status(404).json({
+                success: false,
+                message: 'Employee not found',
+            });
+            return;
+        }
+        res.json({
+            success: true,
+            message: 'Employee updated successfully',
+            data: (0, employee_response_1.shapeEmployeeForClient)(employee, req),
+        });
+    }
+    catch (error) {
+        console.error('❌ Update employee error:', error);
+        console.error('❌ Error details:', {
+            message: error?.message,
+            code: error?.code,
+            meta: error?.meta,
+            stack: error?.stack,
+        });
+        if (error.code === 'P2002') {
+            const field = error.meta?.target?.[0] || 'field';
+            res.status(409).json({
+                success: false,
+                message: `${field === 'email' ? 'Email' : field === 'employeeId' ? 'Employee ID' : 'Field'} already exists`
+            });
+            return;
+        }
+        if (error.code === 'P2025') {
+            res.status(404).json({
+                success: false,
+                message: 'Employee not found'
+            });
+            return;
+        }
+        // Return actual error message for debugging
+        const errorMessage = error?.message || 'Failed to update employee';
+        console.error('❌ Returning error to client:', errorMessage);
+        res.status(500).json({
+            success: false,
+            message: errorMessage,
+            error: process.env.NODE_ENV === 'development' ? {
+                code: error?.code,
+                meta: error?.meta,
+            } : undefined
+        });
+    }
+};
+exports.updateEmployee = updateEmployee;
+/**
+ * Delete/Deactivate employee
+ * DELETE /api/employees/:id
+ * Query: permanent=true — remove row and related data so email/employee ID can be reused (no restore).
+ *   **Only ADMIN or SUPER_ADMIN** may use permanent delete; HR and others get 403 (use default deactivate).
+ * Default: soft deactivate (isActive=false) — restore still possible.
+ * Access: EMPLOYEE_MANAGE ability (per route); permanent path restricted by role as above.
+ */
+const deleteEmployee = async (req, res) => {
+    try {
+        const { id } = req.params;
+        // Don't allow deleting yourself
+        if (req.user.id === id) {
+            res.status(400).json({
+                success: false,
+                message: 'You cannot delete your own account'
+            });
+            return;
+        }
+        const permanent = req.query.permanent === 'true' ||
+            req.query.permanent === '1' ||
+            (typeof req.body?.permanent === 'boolean' && req.body.permanent === true);
+        if (permanent) {
+            const r = req.user.role;
+            if (r !== client_1.UserRole.ADMIN && r !== client_1.UserRole.SUPER_ADMIN) {
+                res.status(403).json({
+                    success: false,
+                    message: 'Only administrators may permanently delete employees. Deactivate instead (do not send permanent=true).',
+                });
+                return;
+            }
+        }
+        const prior = await database_1.default.user.findUnique({
+            where: { id },
+            select: { isActive: true, email: true, firstName: true, lastName: true },
+        });
+        if (!prior) {
+            res.status(404).json({ success: false, message: 'Employee not found' });
+            return;
+        }
+        if (permanent) {
+            const { permanentlyDeleteUser } = await Promise.resolve().then(() => __importStar(require('../services/employeePermanentDelete.service')));
+            await permanentlyDeleteUser(id);
+            res.json({
+                success: true,
+                message: 'Employee permanently removed. Email and employee ID may be reused.',
+                data: { id, email: prior.email, firstName: prior.firstName, lastName: prior.lastName, permanent: true },
+            });
+            return;
+        }
+        const reasonRaw = (req.body && typeof req.body.changeReason === 'string' && req.body.changeReason.trim()) ||
+            (typeof req.query.changeReason === 'string' && req.query.changeReason.trim()) ||
+            'Employee deactivated';
+        const actorId = req.user.id;
+        const auditRole = employeeAuditRoleLabel(req.user.role);
+        await database_1.default.$transaction(async (tx) => {
+            await tx.employeeChangeLog.create({
+                data: {
+                    employeeId: id,
+                    changedById: actorId,
+                    changedByRole: auditRole,
+                    fieldKey: 'isActive',
+                    fieldLabel: 'Account active',
+                    oldValue: (0, employee_change_log_1.formatEmployeeFieldForLog)('isActive', prior.isActive) || null,
+                    newValue: (0, employee_change_log_1.formatEmployeeFieldForLog)('isActive', false) || null,
+                    reason: reasonRaw,
+                },
+            });
+            await tx.user.update({
+                where: { id },
+                data: { isActive: false },
+            });
+        });
+        const employee = await database_1.default.user.findUnique({
+            where: { id },
+            select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                isActive: true,
+            },
+        });
+        res.json({
+            success: true,
+            message: 'Employee deactivated successfully',
+            data: employee,
+        });
+    }
+    catch (error) {
+        console.error('Delete employee error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to deactivate employee'
+        });
+    }
+};
+exports.deleteEmployee = deleteEmployee;
+/**
+ * Restore/Reactivate employee
+ * PUT /api/employees/:id/restore
+ * Access: ADMIN, HR only
+ */
+const restoreEmployee = async (req, res) => {
+    try {
+        const { id } = req.params;
+        console.log(`🔄 Restoring employee: ${id}`);
+        // Check if employee exists
+        const existingEmployee = await database_1.default.user.findUnique({
+            where: { id },
+            select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                isActive: true,
+                role: true,
+            }
+        });
+        if (!existingEmployee) {
+            console.log(`❌ Employee not found: ${id}`);
+            res.status(404).json({
+                success: false,
+                message: 'Employee not found'
+            });
+            return;
+        }
+        // Check if employee is already active
+        if (existingEmployee.isActive) {
+            console.log(`ℹ️  Employee already active: ${id}`);
+            res.json({
+                success: true,
+                message: 'Employee is already active',
+                data: existingEmployee
+            });
+            return;
+        }
+        const reasonRaw = (req.body && typeof req.body.changeReason === 'string' && req.body.changeReason.trim()) ||
+            (typeof req.query.changeReason === 'string' && req.query.changeReason.trim()) ||
+            'Employee restored';
+        const actorId = req.user.id;
+        const auditRole = employeeAuditRoleLabel(req.user.role);
+        await database_1.default.$transaction(async (tx) => {
+            await tx.employeeChangeLog.create({
+                data: {
+                    employeeId: id,
+                    changedById: actorId,
+                    changedByRole: auditRole,
+                    fieldKey: 'isActive',
+                    fieldLabel: 'Account active',
+                    oldValue: (0, employee_change_log_1.formatEmployeeFieldForLog)('isActive', existingEmployee.isActive) || null,
+                    newValue: (0, employee_change_log_1.formatEmployeeFieldForLog)('isActive', true) || null,
+                    reason: reasonRaw,
+                },
+            });
+            await tx.user.update({
+                where: { id },
+                data: { isActive: true },
+            });
+        });
+        const employee = await database_1.default.user.findUnique({
+            where: { id },
+            select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                isActive: true,
+                role: true,
+                jobTitle: true,
+                department: true,
+                employeeId: true,
+            },
+        });
+        if (!employee) {
+            res.status(404).json({ success: false, message: 'Employee not found' });
+            return;
+        }
+        console.log(`✅ Employee restored successfully: ${employee.email} (${employee.id})`);
+        res.json({
+            success: true,
+            message: 'Employee restored successfully',
+            data: employee
+        });
+    }
+    catch (error) {
+        console.error('❌ Restore employee error:', error);
+        console.error('❌ Error details:', {
+            message: error?.message,
+            code: error?.code,
+            meta: error?.meta,
+        });
+        if (error.code === 'P2025') {
+            res.status(404).json({
+                success: false,
+                message: 'Employee not found'
+            });
+            return;
+        }
+        res.status(500).json({
+            success: false,
+            message: error?.message || 'Failed to restore employee'
+        });
+    }
+};
+exports.restoreEmployee = restoreEmployee;
+/**
+ * GET /api/employees/:id/role-management
+ * Super Admin / HR: Project Manager promotion status + role change audit log.
+ */
+const getEmployeeRoleManagement = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const gate = await (0, companyAccess_service_1.assertEmployeeInCompanyScope)(id, req.user.id, req.user.role);
+        if (!gate.ok) {
+            const err = gate;
+            res.status(err.status).json({ success: false, message: err.message });
+            return;
+        }
+        const payload = await buildEmployeeRoleManagementPayload(id);
+        if (!payload) {
+            res.status(404).json({ success: false, message: 'Employee not found' });
+            return;
+        }
+        res.json({ success: true, data: payload });
+    }
+    catch (error) {
+        console.error('Get employee role management error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch employee role management',
+        });
+    }
+};
+exports.getEmployeeRoleManagement = getEmployeeRoleManagement;
+/**
+ * PATCH /api/employees/:id/role-management
+ * Super Admin / HR: assign Employee, Project Manager, Admin, or Accountant.
+ * Body: { systemRole: string, reason: string }
+ * Legacy: { promoteToProjectManager: boolean, reason: string }
+ */
+const updateEmployeeRoleManagement = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const gate = await (0, companyAccess_service_1.assertEmployeeInCompanyScope)(id, req.user.id, req.user.role);
+        if (!gate.ok) {
+            const err = gate;
+            res.status(err.status).json({ success: false, message: err.message });
+            return;
+        }
+        const body = (req.body || {});
+        const promoteRaw = body.promoteToProjectManager;
+        const systemRoleRaw = body.systemRole;
+        const reasonRaw = body.reason;
+        let targetRole = null;
+        if (typeof systemRoleRaw === 'string' && systemRoleRaw.trim()) {
+            targetRole = systemRoleRaw.trim().toUpperCase();
+        }
+        else if (typeof promoteRaw === 'boolean') {
+            targetRole = promoteRaw ? 'PROJECT_MANAGER' : 'EMPLOYEE';
+        }
+        if (!targetRole) {
+            res.status(400).json({
+                success: false,
+                message: 'systemRole is required (EMPLOYEE, PROJECT_MANAGER, ADMIN, or ACCOUNTANT)',
+            });
+            return;
+        }
+        if (!ROLE_MANAGEMENT_ASSIGNABLE.includes(targetRole)) {
+            res.status(400).json({
+                success: false,
+                message: `Invalid systemRole. Allowed values: ${ROLE_MANAGEMENT_ASSIGNABLE.map(formatSystemRoleLabel).join(', ')}`,
+            });
+            return;
+        }
+        const reason = typeof reasonRaw === 'string' ? reasonRaw.trim() : '';
+        if (!reason) {
+            res.status(400).json({
+                success: false,
+                message: 'A reason for this role change is required (reason).',
+            });
+            return;
+        }
+        const employee = await database_1.default.user.findUnique({
+            where: { id },
+            select: { id: true, role: true, firstName: true, lastName: true },
+        });
+        if (!employee) {
+            res.status(404).json({ success: false, message: 'Employee not found' });
+            return;
+        }
+        const currentRole = employee.role;
+        if (!ROLE_MANAGEMENT_ASSIGNABLE.includes(currentRole)) {
+            res.status(400).json({
+                success: false,
+                message: `Cannot change role for users with role ${formatSystemRoleLabel(currentRole)}. Only Employee, Project Manager, Admin, and Accountant accounts can be updated here.`,
+            });
+            return;
+        }
+        if (currentRole === targetRole) {
+            const payload = await buildEmployeeRoleManagementPayload(id);
+            res.json({
+                success: true,
+                message: 'No role change needed',
+                data: payload,
+            });
+            return;
+        }
+        const actorId = req.user.id;
+        const auditRole = employeeAuditRoleLabel(req.user.role);
+        await database_1.default.$transaction([
+            database_1.default.user.update({
+                where: { id },
+                data: { role: targetRole },
+            }),
+            database_1.default.employeeChangeLog.create({
+                data: {
+                    employeeId: id,
+                    changedById: actorId,
+                    changedByRole: auditRole,
+                    fieldKey: 'role',
+                    fieldLabel: 'System role',
+                    oldValue: currentRole,
+                    newValue: targetRole,
+                    reason,
+                },
+            }),
+        ]);
+        const payload = await buildEmployeeRoleManagementPayload(id);
+        res.json({
+            success: true,
+            message: `Role updated to ${formatSystemRoleLabel(targetRole)}`,
+            data: payload,
+        });
+    }
+    catch (error) {
+        console.error('Update employee role management error:', error);
+        const prismaMsg = error && typeof error === 'object' && 'message' in error
+            ? String(error.message || '')
+            : '';
+        const hint = prismaMsg.includes('invalid input value for enum') || prismaMsg.includes('UserRole')
+            ? ' The ACCOUNTANT role may not be in the database yet — run: npx prisma migrate deploy'
+            : '';
+        res.status(500).json({
+            success: false,
+            message: prismaMsg
+                ? `Failed to update employee role: ${prismaMsg}${hint}`
+                : 'Failed to update employee role',
+        });
+    }
+};
+exports.updateEmployeeRoleManagement = updateEmployeeRoleManagement;
+/**
+ * GET /api/employees/:id/change-history
+ * Access: ADMIN, HR
+ */
+const getEmployeeChangeHistory = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const exists = await database_1.default.user.findUnique({
+            where: { id },
+            select: { id: true },
+        });
+        if (!exists) {
+            res.status(404).json({ success: false, message: 'Employee not found' });
+            return;
+        }
+        const logs = await database_1.default.employeeChangeLog.findMany({
+            where: { employeeId: id },
+            orderBy: { createdAt: 'desc' },
+            include: {
+                changedBy: {
+                    select: {
+                        id: true,
+                        firstName: true,
+                        lastName: true,
+                        email: true,
+                        role: true,
+                    },
+                },
+            },
+        });
+        res.json({
+            success: true,
+            data: logs.map((row) => {
+                const actor = row.changedBy;
+                const name = actor &&
+                    `${actor.firstName ?? ''} ${actor.lastName ?? ''}`.trim();
+                return {
+                    id: row.id,
+                    fieldKey: row.fieldKey,
+                    fieldLabel: row.fieldLabel,
+                    fieldChanged: row.fieldLabel,
+                    oldValue: row.oldValue,
+                    newValue: row.newValue,
+                    reason: row.reason,
+                    changedAt: row.createdAt.toISOString(),
+                    changedByRole: row.changedByRole,
+                    changedBy: name || actor?.email || 'Unknown',
+                    changedById: row.changedById,
+                    changeType: 'UPDATE',
+                };
+            }),
+        });
+    }
+    catch (error) {
+        console.error('Get employee change history error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch employee change history',
+        });
+    }
+};
+exports.getEmployeeChangeHistory = getEmployeeChangeHistory;
+/**
+ * POST /api/employees/rename-attendance-program
+ * When HR renames a program in the directory list, sync all users with the old label.
+ * Body: { from: string, to: string } (aliases: oldLabel/newLabel)
+ */
+const renameAttendanceProgram = async (req, res) => {
+    try {
+        const body = (req.body || {});
+        const fromRaw = body.from ?? body.oldLabel ?? body.oldName;
+        const toRaw = body.to ?? body.newLabel ?? body.newName;
+        const from = typeof fromRaw === 'string' ? fromRaw.trim() : '';
+        const to = typeof toRaw === 'string' ? toRaw.trim() : '';
+        if (!from || !to) {
+            res.status(400).json({
+                success: false,
+                message: 'Both current and new program names are required (from, to).',
+            });
+            return;
+        }
+        if (from === to) {
+            res.status(400).json({
+                success: false,
+                message: 'New name must differ from the current name.',
+            });
+            return;
+        }
+        const result = await database_1.default.user.updateMany({
+            where: { attendanceProgram: from },
+            data: { attendanceProgram: to },
+        });
+        res.json({
+            success: true,
+            message: 'Attendance program label updated for affected employees.',
+            updatedCount: result.count,
+        });
+    }
+    catch (error) {
+        console.error('Rename attendance program error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to rename attendance program',
+        });
+    }
+};
+exports.renameAttendanceProgram = renameAttendanceProgram;
+/**
+ * Get employee statistics
+ * GET /api/employees/statistics
+ * Access: ADMIN, HR only
+ */
+const getEmployeeStatistics = async (req, res) => {
+    try {
+        const { companyId, companyName } = req.query;
+        const role = req.user?.role;
+        // Non–HR/Admin/Super Admin roles may only request scoped statistics (prevents org-wide leakage)
+        const mustScopeCompany = role &&
+            !['ADMIN', 'HR', 'SUPER_ADMIN'].includes(role) &&
+            ['MANAGER', 'PROJECT_MANAGER', 'EMPLOYEE', 'CONTRACTOR'].includes(role);
+        if (mustScopeCompany) {
+            const hasScope = (companyId && typeof companyId === 'string' && companyId.trim()) ||
+                (companyName && typeof companyName === 'string' && companyName.trim());
+            if (!hasScope) {
+                res.status(403).json({
+                    success: false,
+                    message: 'Company scope is required for employee statistics',
+                });
+                return;
+            }
+        }
+        // Resolve company filter so stats are per-company when viewing a company's directory.
+        let companyNames = [];
+        if (companyName && typeof companyName === 'string' && companyName.trim()) {
+            const want = companyName.trim();
+            companyNames = [want];
+            // If it's a branch name, also include parent company name (legacy users store parent).
+            const nameAliases = (0, company_name_aliases_1.buildCompanyNameAliases)(want);
+            const companyRow = await database_1.default.company.findFirst({
+                where: {
+                    OR: nameAliases.map((n) => ({ name: { equals: n, mode: 'insensitive' } })),
+                },
+                select: { parentCompanyId: true },
+            });
+            if (companyRow?.parentCompanyId) {
+                const parent = await database_1.default.company.findUnique({
+                    where: { id: String(companyRow.parentCompanyId).trim() },
+                    select: { name: true },
+                });
+                if (parent?.name)
+                    companyNames.push(String(parent.name).trim());
+            }
+        }
+        else if (companyId && typeof companyId === 'string' && companyId.trim()) {
+            const company = await database_1.default.company.findUnique({
+                where: { id: companyId.trim() },
+                select: { name: true },
+            });
+            if (company?.name)
+                companyNames.push(String(company.name).trim());
+        }
+        companyNames = companyNames.filter((x, i) => x && companyNames.indexOf(x) === i);
+        const baseWhere = {
+            role: { notIn: ['TENDER_ENGINEER'] },
+        };
+        // When companyId points at a branch, include parent company name as well.
+        let companyAliases = companyNames.flatMap((n) => (0, company_name_aliases_1.buildCompanyNameAliases)(n));
+        if (companyId && typeof companyId === 'string' && companyId.trim()) {
+            const branch = await database_1.default.company.findUnique({
+                where: { id: companyId.trim() },
+                select: { name: true, parentCompanyId: true },
+            });
+            if (branch?.parentCompanyId) {
+                const parent = await database_1.default.company.findUnique({
+                    where: { id: String(branch.parentCompanyId).trim() },
+                    select: { name: true },
+                });
+                companyAliases = (0, company_name_aliases_1.buildCompanyScopeAliases)(branch?.name, parent?.name);
+            }
+        }
+        if (companyAliases.length > 0) {
+            baseWhere.AND = Array.isArray(baseWhere.AND) ? baseWhere.AND : [];
+            baseWhere.AND.push({
+                OR: companyAliases.map((n) => ({ company: { equals: n, mode: 'insensitive' } })),
+            });
+        }
+        // Get total employees count (exclude tender engineers only; admins count as directory members)
+        const totalEmployees = await database_1.default.user.count({
+            where: { ...baseWhere, isActive: true }
+        });
+        // Get active employees count (status = 'Active' or isActive = true)
+        const activeEmployees = await database_1.default.user.count({
+            where: {
+                ...baseWhere,
+                isActive: true,
+                OR: [
+                    { status: { equals: 'Active', mode: 'insensitive' } },
+                    { status: null }
+                ]
+            }
+        });
+        // Get inactive employees count
+        const inactiveEmployees = await database_1.default.user.count({
+            where: {
+                ...baseWhere,
+                OR: [
+                    { status: { equals: 'Inactive', mode: 'insensitive' } },
+                    { isActive: false }
+                ]
+            }
+        });
+        // Get employees by department (only active employees)
+        const employeesByDepartment = await database_1.default.user.groupBy({
+            by: ['department'],
+            where: {
+                ...baseWhere,
+                isActive: true,
+                department: {
+                    not: null
+                }
+            },
+            _count: {
+                id: true
+            }
+        });
+        // Get unique departments count (only from active employees)
+        const totalDepartments = await database_1.default.user.findMany({
+            where: {
+                ...baseWhere,
+                isActive: true,
+                department: {
+                    not: null
+                }
+            },
+            select: {
+                department: true
+            },
+            distinct: ['department']
+        });
+        res.json({
+            success: true,
+            data: {
+                totalEmployees,
+                activeEmployees,
+                inactiveEmployees,
+                totalDepartments: totalDepartments.length,
+                employeesByDepartment: employeesByDepartment.map(dept => ({
+                    department: dept.department,
+                    count: dept._count.id
+                }))
+            }
+        });
+    }
+    catch (error) {
+        console.error('Get employee statistics error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch employee statistics'
+        });
+    }
+};
+exports.getEmployeeStatistics = getEmployeeStatistics;
+const positionSelectForCompany = {
+    id: true,
+    subDepartment: {
+        select: {
+            department: {
+                select: {
+                    company: { select: { name: true } },
+                },
+            },
+        },
+    },
+};
+function isUuidString(s) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s.trim());
+}
+async function resolveSubDepartmentIdFromSlugOrName(departmentId, slugOrName) {
+    const raw = slugOrName.trim();
+    if (!raw)
+        return null;
+    const wantSlug = raw.toLowerCase().replace(/\s+/g, '-');
+    const subs = await database_1.default.subDepartment.findMany({
+        where: { departmentId },
+        select: { id: true, name: true },
+    });
+    for (const s of subs) {
+        const n = s.name.trim();
+        if (n.toLowerCase() === raw.toLowerCase())
+            return s.id;
+        if (n.toLowerCase().replace(/\s+/g, '-') === wantSlug)
+            return s.id;
+    }
+    return null;
+}
+async function resolveSubDepartmentIdForPositionLookup(subDepartmentIdInput, departmentIdInput) {
+    const raw = typeof subDepartmentIdInput === 'string' ? subDepartmentIdInput.trim() : '';
+    if (!raw)
+        return null;
+    if (isUuidString(raw))
+        return raw;
+    const dep = typeof departmentIdInput === 'string' ? departmentIdInput.trim() : '';
+    if (dep && isUuidString(dep)) {
+        const resolved = await resolveSubDepartmentIdFromSlugOrName(dep, raw);
+        if (resolved)
+            return resolved;
+    }
+    return null;
+}
+async function resolveOrgPositionForAssignment(positionIdInput, subDepartmentIdInput, positionNameInput, departmentIdInput) {
+    let pid = typeof positionIdInput === 'number' && Number.isFinite(positionIdInput)
+        ? String(positionIdInput)
+        : typeof positionIdInput === 'string'
+            ? positionIdInput.trim()
+            : '';
+    if (pid === 'undefined' || pid === 'null')
+        pid = '';
+    const nameFallback = typeof positionNameInput === 'string' ? positionNameInput.trim() : '';
+    const resolvedSubDeptId = await resolveSubDepartmentIdForPositionLookup(subDepartmentIdInput, departmentIdInput);
+    let position = null;
+    if (pid && isUuidString(pid)) {
+        position = await database_1.default.position.findUnique({
+            where: { id: pid },
+            select: positionSelectForCompany,
+        });
+    }
+    if (!position && resolvedSubDeptId && nameFallback) {
+        position = await database_1.default.position.findFirst({
+            where: {
+                subDepartmentId: resolvedSubDeptId,
+                name: { equals: nameFallback, mode: 'insensitive' },
+            },
+            select: positionSelectForCompany,
+        });
+    }
+    if (!position) {
+        const rawSd = typeof subDepartmentIdInput === 'string' ? subDepartmentIdInput.trim() : '';
+        const rawDep = typeof departmentIdInput === 'string' ? departmentIdInput.trim() : '';
+        const hint = resolvedSubDeptId && nameFallback
+            ? ' No matching position name under that sub-department.'
+            : rawSd && !isUuidString(rawSd) && (!rawDep || !isUuidString(rawDep))
+                ? ' subDepartmentId looks like a URL slug; send departmentId (UUID) in the JSON body.'
+                : ' Send positionId (UUID) or subDepartmentId + positionName.';
+        return {
+            ok: false,
+            status: 404,
+            message: `Position not found.${hint}` +
+                (pid && isUuidString(pid) ? ` (position id: ${pid.slice(0, 8)}…)` : ''),
+        };
+    }
+    const companyName = position.subDepartment?.department?.company?.name?.trim() ?? '';
+    if (!companyName) {
+        return {
+            ok: false,
+            status: 400,
+            message: 'Position is not linked to a company in the database',
+        };
+    }
+    return { ok: true, positionId: position.id, companyName };
+}
+async function assertEmployeeMatchesPositionCompany(employeeId, companyName) {
+    const user = await database_1.default.user.findUnique({
+        where: { id: employeeId },
+        select: { id: true, company: true },
+    });
+    if (!user) {
+        return { ok: false, status: 404, message: 'Employee not found' };
+    }
+    const userCompany = user.company?.trim() ?? '';
+    if (!userCompany) {
+        return {
+            ok: false,
+            status: 400,
+            message: 'Employee has no company set; set company on their profile before assigning org positions',
+        };
+    }
+    const compatible = await (0, companyAccess_service_1.employeeCompanyCompatibleWithPositionCompany)(userCompany, companyName);
+    if (!compatible) {
+        return {
+            ok: false,
+            status: 403,
+            message: 'This position belongs to a different company than the employee. ' +
+                'Employees from the main company or sibling branches can be added via Load from Employee Directory when they share the same parent company.',
+        };
+    }
+    return { ok: true };
+}
+/**
+ * POST /api/employees/:id/position-assignments
+ * Adds org-chart visibility for this position without changing primary department/position/jobTitle.
+ */
+const assignEmployeeToOrgPosition = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const reasonRaw = req.body?.reason;
+        const reason = typeof reasonRaw === 'string' && reasonRaw.trim() ? reasonRaw.trim() : undefined;
+        const resolved = await resolveOrgPositionForAssignment(req.body?.positionId, req.body?.subDepartmentId, req.body?.positionName, req.body?.departmentId);
+        if (!resolved.ok) {
+            const err = resolved;
+            res.status(err.status).json({ success: false, message: err.message });
+            return;
+        }
+        const positionId = resolved.positionId;
+        const gate = await assertEmployeeMatchesPositionCompany(id, resolved.companyName);
+        if (!gate.ok) {
+            const err = gate;
+            res.status(err.status).json({ success: false, message: err.message });
+            return;
+        }
+        const existing = await database_1.default.employeePositionAssignment.findUnique({
+            where: { userId_positionId: { userId: id, positionId } },
+        });
+        if (existing) {
+            res.json({
+                success: true,
+                message: 'Employee already appears on this position',
+                data: { alreadyAssigned: true, positionId },
+            });
+            return;
+        }
+        await database_1.default.employeePositionAssignment.create({
+            data: {
+                userId: id,
+                positionId,
+                assignedById: req.user?.id ?? null,
+                reason: reason ?? null,
+            },
+        });
+        await (0, employeeSubDepartmentManagers_service_1.syncEmployeeManagersFromSubDepartments)(id);
+        const assignee = await database_1.default.user.findUnique({
+            where: { id },
+            select: { role: true },
+        });
+        if (assignee?.role === client_1.UserRole.ADMIN || assignee?.role === client_1.UserRole.HR) {
+            await (0, companyAccess_service_1.grantCompanyAccessForOrgPosition)(id, positionId, req.user?.id ?? null);
+        }
+        res.json({
+            success: true,
+            message: 'Employee assigned to this position (primary directory fields unchanged)',
+            data: { alreadyAssigned: false, positionId },
+        });
+    }
+    catch (error) {
+        console.error('assignEmployeeToOrgPosition error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to assign employee to position',
+        });
+    }
+};
+exports.assignEmployeeToOrgPosition = assignEmployeeToOrgPosition;
+/**
+ * DELETE /api/employees/:id/position-assignments/:positionId
+ * Removes an additional org-chart assignment only (does not change primary directory fields).
+ */
+const removeEmployeeOrgPositionAssignment = async (req, res) => {
+    try {
+        const { id, positionId } = req.params;
+        const pid = typeof positionId === 'string' ? positionId.trim() : '';
+        if (!pid) {
+            res.status(400).json({ success: false, message: 'positionId is required' });
+            return;
+        }
+        const resolved = await resolveOrgPositionForAssignment(pid, undefined, undefined, undefined);
+        if (!resolved.ok) {
+            const err = resolved;
+            res.status(err.status).json({ success: false, message: err.message });
+            return;
+        }
+        const gate = await assertEmployeeMatchesPositionCompany(id, resolved.companyName);
+        if (!gate.ok) {
+            const err = gate;
+            res.status(err.status).json({ success: false, message: err.message });
+            return;
+        }
+        const result = await database_1.default.employeePositionAssignment.deleteMany({
+            where: { userId: id, positionId: resolved.positionId },
+        });
+        if (result.count === 0) {
+            res.status(404).json({
+                success: false,
+                message: 'No assignment found for this employee and position',
+            });
+            return;
+        }
+        await (0, employeeSubDepartmentManagers_service_1.syncEmployeeManagersFromSubDepartments)(id);
+        res.json({ success: true, message: 'Removed additional position assignment' });
+    }
+    catch (error) {
+        console.error('removeEmployeeOrgPositionAssignment error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to remove position assignment',
+        });
+    }
+};
+exports.removeEmployeeOrgPositionAssignment = removeEmployeeOrgPositionAssignment;
+//# sourceMappingURL=employee.controller.js.map

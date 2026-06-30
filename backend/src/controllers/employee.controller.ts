@@ -1,5 +1,6 @@
 import { Response } from 'express';
 import { shapeEmployeeForClient } from '../utils/employee-response';
+import { fetchCompletionStatsBatch } from '../services/workload.service';
 import bcrypt from 'bcryptjs';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
@@ -11,12 +12,35 @@ import {
   resolveDrivingLicenseNumberForDb,
   resolveEmailAddressesJson,
   resolveLabourIdNumberForDb,
+  resolveManagerIdInput,
   resolvePhoneNumbersJson,
   shouldPatchEmailAddresses,
   shouldPatchPhoneNumbers,
 } from '../utils/employee-directory-body';
 import { buildEmployeeUpdateChangeRows, formatEmployeeFieldForLog } from '../utils/employee-change-log';
 import { sendEmployeeErpAccessEmail } from '../services/employeeErpAccessEmail.service';
+import {
+  assertCanAccessCompany,
+  assertEmployeeInCompanyScope,
+  buildEmployeeWhereForCompanyScope,
+  employeeCompanyCompatibleWithPositionCompany,
+  grantCompanyAccessForOrgPosition,
+  resolveCompanyAccessScope,
+} from '../services/companyAccess.service';
+import { UserRole } from '@prisma/client';
+import { buildCompanyNameAliases, buildCompanyScopeAliases } from '../utils/company-name-aliases';
+import {
+  syncEmployeeManagersFromSubDepartments,
+} from '../services/employeeSubDepartmentManagers.service';
+
+const managerPersonSelect = {
+  select: {
+    id: true,
+    firstName: true,
+    lastName: true,
+    email: true,
+  },
+} as const;
 
 /** Prefer department id (authoritative name in DB); else use string from the form. */
 async function resolveDepartmentForUser(department: unknown, departmentId: unknown): Promise<string | null> {
@@ -102,7 +126,122 @@ function sortJoinProjectIds(ids: string[]): string {
 function employeeAuditRoleLabel(role: string | undefined): string {
   if (role === 'ADMIN') return 'Admin';
   if (role === 'HR') return 'HR';
+  if (role === 'SUPER_ADMIN') return 'Super Admin';
   return role ? String(role) : 'Unknown';
+}
+
+function formatSystemRoleLabel(role: string | null | undefined): string {
+  if (!role) return '—';
+  const labels: Record<string, string> = {
+    EMPLOYEE: 'Employee',
+    PROJECT_MANAGER: 'Project Manager',
+    MANAGER: 'Manager',
+    ADMIN: 'Admin',
+    HR: 'HR',
+    SUPER_ADMIN: 'Super Admin',
+    TENDER_ENGINEER: 'Tender Engineer',
+    CONTRACTOR: 'Contractor',
+    ACCOUNTANT: 'Accountant',
+  };
+  return labels[role] || role;
+}
+
+/** Roles HR / Super Admin may assign from Employee Details → Role Management. */
+const ROLE_MANAGEMENT_ASSIGNABLE: UserRole[] = [
+  'EMPLOYEE',
+  'PROJECT_MANAGER',
+  'ADMIN',
+  'ACCOUNTANT',
+];
+
+function formatChangeActorName(actor: {
+  firstName: string | null;
+  lastName: string | null;
+  email: string;
+} | null): string {
+  if (!actor) return 'Unknown';
+  const name = `${actor.firstName ?? ''} ${actor.lastName ?? ''}`.trim();
+  return name || actor.email;
+}
+
+async function buildEmployeeRoleManagementPayload(employeeId: string) {
+  const employee = await prisma.user.findUnique({
+    where: { id: employeeId },
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      role: true,
+      status: true,
+      isActive: true,
+    },
+  });
+
+  if (!employee) return null;
+
+  const roleLogs = await prisma.employeeChangeLog.findMany({
+    where: { employeeId, fieldKey: 'role' },
+    orderBy: { createdAt: 'desc' },
+    include: {
+      changedBy: {
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          email: true,
+          role: true,
+        },
+      },
+    },
+  });
+
+  const isProjectManager = employee.role === 'PROJECT_MANAGER';
+  const canChangeRole = ROLE_MANAGEMENT_ASSIGNABLE.includes(employee.role);
+  const canToggle = canChangeRole;
+  const userName = `${employee.firstName ?? ''} ${employee.lastName ?? ''}`.trim() || employee.id;
+
+  let effectiveFrom: string | null = null;
+  let updatedBy: string | null = null;
+  const latestRoleLog = roleLogs[0];
+  if (latestRoleLog && latestRoleLog.newValue !== 'EMPLOYEE') {
+    effectiveFrom = latestRoleLog.createdAt.toISOString();
+    updatedBy = formatChangeActorName(latestRoleLog.changedBy);
+  } else if (isProjectManager) {
+    const promoteLog = roleLogs.find((row) => row.newValue === 'PROJECT_MANAGER');
+    if (promoteLog) {
+      effectiveFrom = promoteLog.createdAt.toISOString();
+      updatedBy = formatChangeActorName(promoteLog.changedBy);
+    }
+  }
+
+  return {
+    userName,
+    employeeStatus: employee.status || (employee.isActive ? 'Active' : 'Inactive'),
+    systemRole: employee.role,
+    isProjectManager,
+    canChangeRole,
+    canToggle,
+    assignableRoles: ROLE_MANAGEMENT_ASSIGNABLE.map((role) => ({
+      value: role,
+      label: formatSystemRoleLabel(role),
+    })),
+    effectiveFrom,
+    updatedBy,
+    auditLog: roleLogs.map((row) => ({
+      id: row.id,
+      userName,
+      previousRole: formatSystemRoleLabel(row.oldValue),
+      newRole: formatSystemRoleLabel(row.newValue),
+      changedBy: formatChangeActorName(row.changedBy),
+      changedAt: row.createdAt.toISOString(),
+      reason: row.reason,
+    })),
+  };
+}
+
+/** Full directory parity with Admin/HR: inactive rows, unrestricted stats scope, viewing any profile. */
+function isEmployeeDirectoryPrivilegedRole(role: string | undefined): boolean {
+  return role === 'ADMIN' || role === 'HR' || role === 'SUPER_ADMIN';
 }
 
 /**
@@ -163,7 +302,7 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
       gender, maritalStatus, nationality, birthday, childrenCount, currentAddress,
       // Employee Directory - Contact Info (resolved via resolvePhoneNumbersJson / resolveEmailAddressesJson on body)
       // Employee Directory - Company Info
-      company, companyLocation, managerId, attendanceProgram, joiningDate, exitDate, isLineManager,
+      company, companyLocation, managerId, secondLineManagerId, attendanceProgram, joiningDate, exitDate, isLineManager,
       // Employee Directory - Legal Documents
       passportNumber, passportIssueDate, passportExpiryDate, passportAttachment,
       nationalIdNumber, nationalIdExpiryDate, nationalIdAttachment,
@@ -171,6 +310,7 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
       insuranceNumber, insuranceExpiryDate, insuranceAttachment,
       drivingLicenseNumber, drivingLicenseExpiryDate, drivingLicenseAttachment,
       labourIdNumber, labourIdExpiryDate, labourIdAttachment,
+      educationalQualification, curriculumVitaeAttachment,
       remarks
     } = body;
     
@@ -198,6 +338,7 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
     const insuranceAttachmentFile = files.insuranceAttachment?.[0]?.filename || null;
     const drivingLicenseAttachmentFile = files.drivingLicenseAttachment?.[0]?.filename || null;
     const labourIdAttachmentFile = files.labourIdAttachment?.[0]?.filename || null;
+    const curriculumVitaeAttachmentFile = files.curriculumVitaeAttachment?.[0]?.filename || null;
 
     // Validation - ensure required fields are present and valid
     if (!firstName || typeof firstName !== 'string' || firstName.trim() === '') {
@@ -352,7 +493,7 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
     }
 
     // Validate role
-    const validRoles = ['EMPLOYEE', 'PROJECT_MANAGER', 'TENDER_ENGINEER', 'HR', 'ADMIN'];
+    const validRoles = ['EMPLOYEE', 'PROJECT_MANAGER', 'TENDER_ENGINEER', 'HR', 'ADMIN', 'ACCOUNTANT'];
     if (role && !validRoles.includes(role)) {
       res.status(400).json({
         success: false,
@@ -362,9 +503,10 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
     }
 
     // Verify manager exists if provided
-    if (managerId) {
+    const resolvedCreateManagerId = resolveManagerIdInput(managerId);
+    if (resolvedCreateManagerId) {
       const manager = await prisma.user.findUnique({
-        where: { id: managerId },
+        where: { id: resolvedCreateManagerId },
       });
       if (!manager) {
         res.status(404).json({
@@ -554,7 +696,7 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
         // Employee Directory - Company Info
         company: company || null,
         companyLocation: companyLocation || null,
-        managerId: managerId || null,
+        managerId: resolvedCreateManagerId ?? null,
         attendanceProgram: attendanceProgram || null,
         joiningDate: parseEmployeeDate(joiningDate),
         exitDate: parseEmployeeDate(exitDate),
@@ -594,6 +736,13 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
             : null),
         labourIdExpiryDate: parseEmployeeDate(labourIdExpiryDate),
         labourIdAttachment: labourIdAttachmentFile || labourIdAttachment || null,
+
+        educationalQualification:
+          educationalQualification != null && String(educationalQualification).trim() !== ''
+            ? String(educationalQualification).trim()
+            : null,
+        curriculumVitaeAttachment:
+          curriculumVitaeAttachmentFile || curriculumVitaeAttachment || null,
         
         remarks: remarks || null,
       },
@@ -626,14 +775,9 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
         company: true,
         companyLocation: true,
         managerId: true,
-        manager: {
-          select: {
-            id: true,
-            firstName: true,
-            lastName: true,
-            email: true,
-          }
-        },
+        manager: managerPersonSelect,
+        secondLineManagerId: true,
+        secondLineManager: managerPersonSelect,
         attendanceProgram: true,
         joiningDate: true,
         exitDate: true,
@@ -658,6 +802,8 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
         labourIdNumber: true,
         labourIdExpiryDate: true,
         labourIdAttachment: true,
+        educationalQualification: true,
+        curriculumVitaeAttachment: true,
         remarks: true,
       }
     });
@@ -683,6 +829,73 @@ export const createEmployee = async (req: AuthRequest, res: Response): Promise<v
     }
 
     console.log('✅ Employee created successfully in database:', employee.id);
+
+    await syncEmployeeManagersFromSubDepartments(employee.id);
+    const employeeAfterSync = await prisma.user.findUnique({
+      where: { id: employee.id },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        phone: true,
+        department: true,
+        position: true,
+        jobTitle: true,
+        photo: true,
+        employeeId: true,
+        isActive: true,
+        createdAt: true,
+        employeeType: true,
+        status: true,
+        userAccount: true,
+        gender: true,
+        maritalStatus: true,
+        nationality: true,
+        birthday: true,
+        childrenCount: true,
+        currentAddress: true,
+        phoneNumbers: true,
+        emailAddresses: true,
+        company: true,
+        companyLocation: true,
+        managerId: true,
+        manager: managerPersonSelect,
+        secondLineManagerId: true,
+        secondLineManager: managerPersonSelect,
+        attendanceProgram: true,
+        joiningDate: true,
+        exitDate: true,
+        isLineManager: true,
+        passportNumber: true,
+        passportIssueDate: true,
+        passportExpiryDate: true,
+        passportAttachment: true,
+        nationalIdNumber: true,
+        nationalIdExpiryDate: true,
+        nationalIdAttachment: true,
+        residencyNumber: true,
+        residencyExpiryDate: true,
+        residencyAttachment: true,
+        visaNumber: true,
+        insuranceNumber: true,
+        insuranceExpiryDate: true,
+        insuranceAttachment: true,
+        drivingLicenseNumber: true,
+        drivingLicenseExpiryDate: true,
+        drivingLicenseAttachment: true,
+        labourIdNumber: true,
+        labourIdExpiryDate: true,
+        labourIdAttachment: true,
+        educationalQualification: true,
+        curriculumVitaeAttachment: true,
+        remarks: true,
+      },
+    });
+    if (employeeAfterSync) {
+      employee = employeeAfterSync as typeof employee;
+    }
 
     // Assign to projects if provided
     if (projectIds && Array.isArray(projectIds) && projectIds.length > 0) {
@@ -811,7 +1024,23 @@ export const getEmployees = async (req: AuthRequest, res: Response): Promise<voi
   try {
     // For employee assignment dropdowns, allow fetching more employees (up to 500)
     // Default limit increased to 200 to show more employees in dropdowns
-    const { page = 1, limit = 200, search, role, department, companyId, companyName, forTaskAssignment } = req.query;
+    const {
+      page = 1,
+      limit = 200,
+      search,
+      q,
+      role,
+      department,
+      companyId,
+      companyName,
+      positionId,
+      forTaskAssignment,
+    } = req.query;
+    const searchTermRaw = search ?? q;
+    const searchTerm =
+      searchTermRaw != null && String(searchTermRaw).trim() !== ''
+        ? String(searchTermRaw).trim()
+        : '';
     const skip = (Number(page) - 1) * Number(limit);
 
     console.log('📋 getEmployees called:', {
@@ -820,21 +1049,25 @@ export const getEmployees = async (req: AuthRequest, res: Response): Promise<voi
       userId: req.user?.id,
       forTaskAssignment,
       companyId,
-      companyName
+      companyName,
+      positionId,
     });
 
-    // Build where clause
+    const requestedPositionId =
+      typeof positionId === 'string' && positionId.trim() ? positionId.trim() : '';
+
+    // Build where clause (exclude tender engineers from the general directory list;
+    // ADMIN / SUPER_ADMIN / etc. are normal directory users when given a company profile.)
     const where: any = {
-      // Exclude ADMIN and TENDER_ENGINEER roles - only show actual employees
       role: {
-        notIn: ['ADMIN', 'TENDER_ENGINEER']
+        notIn: ['TENDER_ENGINEER'],
       },
     };
 
-    // By default, non‑ADMIN/HR roles should only see active employees.
-    // ADMIN and HR see both active and inactive employees so they can restore.
+    // By default, non‑privileged roles should only see active employees.
+    // ADMIN, HR, and SUPER_ADMIN see both active and inactive employees so they can restore.
     const requesterRole = req.user?.role;
-    const isPrivilegedViewer = requesterRole === 'ADMIN' || requesterRole === 'HR';
+    const isPrivilegedViewer = isEmployeeDirectoryPrivilegedRole(requesterRole);
     if (!isPrivilegedViewer) {
       where.isActive = true;
     }
@@ -846,37 +1079,116 @@ export const getEmployees = async (req: AuthRequest, res: Response): Promise<voi
       console.log(`✅ ${req.user?.role} role: Showing all employees for task assignment (no managerId filter)`);
     }
 
-    // Filter by company so each company's Employee Directory shows only its employees
-    // Skip company filtering for task assignment - managers should see their team members regardless of company
+    // Filter by company so each company's Employee Directory shows only its own employees.
+    // Skip company filtering for task assignment - managers should see their team members regardless of company.
     if (forTaskAssignment !== 'true') {
-      let companyNameFilter: string | null = null;
+      let companyAliases: string[] = [];
+
       if (companyName && typeof companyName === 'string' && companyName.trim()) {
-        companyNameFilter = companyName.trim();
+        const want = companyName.trim();
+        let parentName: string | null = null;
+        // If this company name corresponds to a branch, include parent company name too.
+        const nameAliases = buildCompanyNameAliases(want);
+        const companyRow = await prisma.company.findFirst({
+          where: {
+            OR: nameAliases.map((n) => ({ name: { equals: n, mode: 'insensitive' as const } })),
+          } as any,
+          select: { parentCompanyId: true } as any,
+        }) as any;
+        if (companyRow?.parentCompanyId) {
+          const parent = await prisma.company.findUnique({
+            where: { id: String(companyRow.parentCompanyId).trim() },
+            select: { name: true } as any,
+          }) as any;
+          parentName = parent?.name ? String(parent.name).trim() : null;
+        }
+        companyAliases = buildCompanyScopeAliases(want, parentName);
       } else if (companyId && typeof companyId === 'string' && companyId.trim()) {
+        const cid = companyId.trim();
+        const allowed = await assertCanAccessCompany(req.user!.id, requesterRole || '', cid);
+        if (!allowed && (requesterRole === 'ADMIN' || requesterRole === 'HR')) {
+          res.json({
+            success: true,
+            data: { employees: [], pagination: { page: Number(page), limit: Number(limit), total: 0, totalPages: 0 } },
+          });
+          return;
+        }
         const company = await prisma.company.findUnique({
           where: { id: companyId.trim() },
-          select: { name: true },
-        });
-        if (company) companyNameFilter = company.name.trim();
+          // Prisma client types may lag schema in some environments; keep select minimal.
+          select: { name: true, parentCompanyId: true } as any,
+        }) as any;
+        if (company?.name != null && String(company.name).trim() !== '') {
+          let parentName: string | null = null;
+          if (company?.parentCompanyId) {
+            const parent = await prisma.company.findUnique({
+              where: { id: String(company.parentCompanyId).trim() },
+              select: { name: true } as any,
+            }) as any;
+            parentName = parent?.name ? String(parent.name).trim() : null;
+          }
+          companyAliases = buildCompanyScopeAliases(String(company.name), parentName);
+        }
       }
-      if (companyNameFilter) {
-        where.company = { equals: companyNameFilter, mode: 'insensitive' };
+
+      if (requestedPositionId) {
+        const scopedEmployeeSources: any[] = [];
+        if (companyAliases.length > 0) {
+          scopedEmployeeSources.push({
+            OR: companyAliases.map((n) => ({ company: { equals: n, mode: 'insensitive' as const } })),
+          });
+        }
+        scopedEmployeeSources.push({
+          positionAssignments: {
+            some: {
+              positionId: requestedPositionId,
+            },
+          },
+        });
+        where.AND = [
+          ...(Array.isArray(where.AND) ? where.AND : []),
+          { OR: scopedEmployeeSources },
+        ];
+      } else if (companyAliases.length > 0) {
+        where.AND = [
+          ...(Array.isArray(where.AND) ? where.AND : []),
+          {
+            OR: companyAliases.map((n) => ({ company: { equals: n, mode: 'insensitive' as const } })),
+          },
+        ];
+      } else if (
+        forTaskAssignment !== 'true' &&
+        isPrivilegedViewer &&
+        (requesterRole === 'ADMIN' || requesterRole === 'HR')
+      ) {
+        const accessScope = await resolveCompanyAccessScope(req.user!.id, requesterRole);
+        if (!accessScope.unrestricted) {
+          const scopedEmployeeWhere = await buildEmployeeWhereForCompanyScope(accessScope);
+          if (scopedEmployeeWhere) {
+            where.AND = [...(Array.isArray(where.AND) ? where.AND : []), scopedEmployeeWhere];
+          }
+        }
       }
     }
     
-    if (search) {
+    if (searchTerm) {
       where.OR = [
-        { firstName: { contains: search as string, mode: 'insensitive' } },
-        { lastName: { contains: search as string, mode: 'insensitive' } },
-        { email: { contains: search as string, mode: 'insensitive' } },
-        { employeeId: { contains: search as string, mode: 'insensitive' } },
+        { firstName: { contains: searchTerm, mode: 'insensitive' } },
+        { lastName: { contains: searchTerm, mode: 'insensitive' } },
+        { email: { contains: searchTerm, mode: 'insensitive' } },
+        { employeeId: { contains: searchTerm, mode: 'insensitive' } },
+        { department: { contains: searchTerm, mode: 'insensitive' } },
+        { jobTitle: { contains: searchTerm, mode: 'insensitive' } },
+        { position: { contains: searchTerm, mode: 'insensitive' } },
+        { company: { contains: searchTerm, mode: 'insensitive' } },
+        { phone: { contains: searchTerm, mode: 'insensitive' } },
       ];
     }
 
     if (role) {
-      // Only allow EMPLOYEE, HR, PROJECT_MANAGER roles
-      if (['EMPLOYEE', 'HR', 'PROJECT_MANAGER'].includes(role as string)) {
-        where.role = role;
+      const roleStr = String(role);
+      if ((Object.values(UserRole) as string[]).includes(roleStr)) {
+        where.role = roleStr as UserRole;
       }
     }
 
@@ -904,6 +1216,8 @@ export const getEmployees = async (req: AuthRequest, res: Response): Promise<voi
           jobTitle: true,
           photo: true,
           employeeId: true,
+          totalXp: true,
+          starCount: true,
           isActive: true,
           forcePasswordChange: true,
           createdAt: true,
@@ -923,14 +1237,9 @@ export const getEmployees = async (req: AuthRequest, res: Response): Promise<voi
           company: true,
           companyLocation: true,
           managerId: true,
-          manager: {
-            select: {
-              id: true,
-              firstName: true,
-              lastName: true,
-              email: true,
-            }
-          },
+          manager: managerPersonSelect,
+          secondLineManagerId: true,
+          secondLineManager: managerPersonSelect,
           attendanceProgram: true,
           joiningDate: true,
           exitDate: true,
@@ -955,6 +1264,8 @@ export const getEmployees = async (req: AuthRequest, res: Response): Promise<voi
           labourIdNumber: true,
           labourIdExpiryDate: true,
           labourIdAttachment: true,
+          educationalQualification: true,
+          curriculumVitaeAttachment: true,
           remarks: true,
           assignedProjects: {
             select: {
@@ -978,9 +1289,21 @@ export const getEmployees = async (req: AuthRequest, res: Response): Promise<voi
 
     console.log(`✅ Found ${employees.length} employees (total: ${total})`);
 
-    const employeesForClient = employees.map((e) =>
-      shapeEmployeeForClient(e as unknown as Record<string, unknown>, req)
-    );
+    const completionStats = await fetchCompletionStatsBatch(employees.map((e) => e.id));
+
+    const employeesForClient = employees.map((e) => {
+      const stats = completionStats.get(e.id);
+      return shapeEmployeeForClient(
+        {
+          ...(e as unknown as Record<string, unknown>),
+          overallRating: stats?.overallRating ?? 0,
+          completionStarRating: stats?.completionStarRating ?? 0,
+          assignedTasksCompleted: stats?.assignedTasksCompleted ?? 0,
+          assignedTasksTotal: stats?.assignedTasksTotal ?? 0,
+        },
+        req,
+      );
+    });
 
     res.json({
       success: true,
@@ -1014,7 +1337,10 @@ export const getEmployeeById = async (req: AuthRequest, res: Response): Promise<
     const currentUser = req.user!;
 
     // Check if user can access this employee
-    if (currentUser.role !== 'ADMIN' && currentUser.role !== 'HR' && currentUser.id !== id) {
+    if (
+      !isEmployeeDirectoryPrivilegedRole(currentUser.role) &&
+      currentUser.id !== id
+    ) {
       res.status(403).json({
         success: false,
         message: 'Forbidden: You can only view your own profile'
@@ -1036,6 +1362,8 @@ export const getEmployeeById = async (req: AuthRequest, res: Response): Promise<
         jobTitle: true,
         photo: true,
         employeeId: true,
+        totalXp: true,
+        starCount: true,
         isActive: true,
         forcePasswordChange: true,
         createdAt: true,
@@ -1055,14 +1383,9 @@ export const getEmployeeById = async (req: AuthRequest, res: Response): Promise<
         company: true,
         companyLocation: true,
         managerId: true,
-        manager: {
-          select: {
-            id: true,
-            firstName: true,
-            lastName: true,
-            email: true,
-          }
-        },
+        manager: managerPersonSelect,
+        secondLineManagerId: true,
+        secondLineManager: managerPersonSelect,
         attendanceProgram: true,
         joiningDate: true,
         exitDate: true,
@@ -1087,6 +1410,8 @@ export const getEmployeeById = async (req: AuthRequest, res: Response): Promise<
         labourIdNumber: true,
         labourIdExpiryDate: true,
         labourIdAttachment: true,
+        educationalQualification: true,
+        curriculumVitaeAttachment: true,
         remarks: true,
         isLabour: true,
         labourDetails: {
@@ -1098,7 +1423,26 @@ export const getEmployeeById = async (req: AuthRequest, res: Response): Promise<
           },
         },
         positionAssignments: {
-          select: { positionId: true },
+          select: {
+            positionId: true,
+            position: {
+              select: {
+                id: true,
+                name: true,
+                subDepartment: {
+                  select: {
+                    name: true,
+                    department: {
+                      select: {
+                        name: true,
+                        company: { select: { name: true } },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
         },
         assignedProjects: {
           select: {
@@ -1185,7 +1529,7 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
       gender, maritalStatus, nationality, birthday, childrenCount, currentAddress,
       // Employee Directory - Contact Info (patched via shouldPatch* + resolve* on b)
       // Employee Directory - Company Info
-      company, companyLocation, managerId, attendanceProgram, joiningDate, exitDate, isLineManager,
+      company, companyLocation, managerId, secondLineManagerId, attendanceProgram, joiningDate, exitDate, isLineManager,
       // Employee Directory - Legal Documents
       passportNumber, passportIssueDate, passportExpiryDate, passportAttachment,
       nationalIdNumber, nationalIdExpiryDate, nationalIdAttachment,
@@ -1193,6 +1537,7 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
       insuranceNumber, insuranceExpiryDate, insuranceAttachment,
       drivingLicenseNumber, drivingLicenseExpiryDate, drivingLicenseAttachment,
       labourIdNumber, labourIdExpiryDate, labourIdAttachment,
+      educationalQualification, curriculumVitaeAttachment,
       remarks
     } = mergedBody;
     
@@ -1207,6 +1552,7 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
     const insuranceAttachmentFile = files.insuranceAttachment?.[0]?.filename;
     const drivingLicenseAttachmentFile = files.drivingLicenseAttachment?.[0]?.filename;
     const labourIdAttachmentFile = files.labourIdAttachment?.[0]?.filename;
+    const curriculumVitaeAttachmentFile = files.curriculumVitaeAttachment?.[0]?.filename;
 
     // Check if employee exists
     const existingEmployee = await prisma.user.findUnique({
@@ -1269,10 +1615,11 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    // Verify manager exists if provided
-    if (managerId !== undefined && managerId !== null) {
+    // Verify manager exists if provided (empty string from FormData means "no manager")
+    const resolvedManagerId = resolveManagerIdInput(managerId);
+    if (resolvedManagerId) {
       const manager = await prisma.user.findUnique({
-        where: { id: managerId },
+        where: { id: resolvedManagerId },
       });
       if (!manager) {
         res.status(404).json({
@@ -1400,13 +1747,10 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
       updateData.companyLocation = companyLocation === null ? null : String(companyLocation).trim() || null;
     }
     if (managerId !== undefined) {
-      if (managerId === null) {
-        updateData.managerId = null;
-      } else if (typeof managerId === 'string' && managerId.trim() === '') {
-        updateData.managerId = null;
-      } else {
-        updateData.managerId = managerId;
-      }
+      updateData.managerId = resolveManagerIdInput(managerId) ?? null;
+    }
+    if (secondLineManagerId !== undefined) {
+      updateData.secondLineManagerId = resolveManagerIdInput(secondLineManagerId) ?? null;
     }
     if (shouldPatchOptionalScalar(attendanceProgram)) {
       updateData.attendanceProgram =
@@ -1516,6 +1860,17 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
 
     if (shouldPatchOptionalScalar(remarks)) {
       updateData.remarks = remarks === null ? null : String(remarks).trim() || null;
+    }
+
+    if (shouldPatchOptionalScalar(educationalQualification)) {
+      updateData.educationalQualification =
+        educationalQualification === null ? null : String(educationalQualification).trim() || null;
+    }
+    if (curriculumVitaeAttachmentFile !== undefined) {
+      updateData.curriculumVitaeAttachment = curriculumVitaeAttachmentFile;
+    } else if (shouldPatchOptionalScalar(curriculumVitaeAttachment)) {
+      updateData.curriculumVitaeAttachment =
+        curriculumVitaeAttachment === null ? null : String(curriculumVitaeAttachment).trim() || null;
     }
 
     let hasProjectAssignmentChange = false;
@@ -1673,15 +2028,10 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
       emailAddresses: true,
       company: true,
       companyLocation: true,
-      managerId: true,
-      manager: {
-        select: {
-          id: true,
-          firstName: true,
-          lastName: true,
-          email: true,
-        },
-      },
+        managerId: true,
+        manager: managerPersonSelect,
+        secondLineManagerId: true,
+        secondLineManager: managerPersonSelect,
       attendanceProgram: true,
       joiningDate: true,
       exitDate: true,
@@ -1706,6 +2056,8 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
       labourIdNumber: true,
       labourIdExpiryDate: true,
       labourIdAttachment: true,
+      educationalQualification: true,
+      curriculumVitaeAttachment: true,
       remarks: true,
     } as const;
 
@@ -1735,6 +2087,22 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
         }
       }
     });
+
+    await syncEmployeeManagersFromSubDepartments(id);
+
+    const manualManagerPatch: { managerId?: string | null; secondLineManagerId?: string | null } = {};
+    if (managerId !== undefined) {
+      manualManagerPatch.managerId = resolveManagerIdInput(managerId) ?? null;
+    }
+    if (secondLineManagerId !== undefined) {
+      manualManagerPatch.secondLineManagerId = resolveManagerIdInput(secondLineManagerId) ?? null;
+    }
+    if (Object.keys(manualManagerPatch).length > 0) {
+      await prisma.user.update({
+        where: { id },
+        data: manualManagerPatch,
+      });
+    }
 
     const employee = await prisma.user.findUnique({
       where: { id },
@@ -1799,8 +2167,9 @@ export const updateEmployee = async (req: AuthRequest, res: Response): Promise<v
  * Delete/Deactivate employee
  * DELETE /api/employees/:id
  * Query: permanent=true — remove row and related data so email/employee ID can be reused (no restore).
+ *   **Only ADMIN or SUPER_ADMIN** may use permanent delete; HR and others get 403 (use default deactivate).
  * Default: soft deactivate (isActive=false) — restore still possible.
- * Access: ADMIN, HR only
+ * Access: EMPLOYEE_MANAGE ability (per route); permanent path restricted by role as above.
  */
 export const deleteEmployee = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -1819,6 +2188,18 @@ export const deleteEmployee = async (req: AuthRequest, res: Response): Promise<v
       req.query.permanent === 'true' ||
       req.query.permanent === '1' ||
       (typeof req.body?.permanent === 'boolean' && req.body.permanent === true);
+
+    if (permanent) {
+      const r = req.user!.role;
+      if (r !== UserRole.ADMIN && r !== UserRole.SUPER_ADMIN) {
+        res.status(403).json({
+          success: false,
+          message:
+            'Only administrators may permanently delete employees. Deactivate instead (do not send permanent=true).',
+        });
+        return;
+      }
+    }
 
     const prior = await prisma.user.findUnique({
       where: { id },
@@ -2012,6 +2393,163 @@ export const restoreEmployee = async (req: AuthRequest, res: Response): Promise<
 };
 
 /**
+ * GET /api/employees/:id/role-management
+ * Super Admin / HR: Project Manager promotion status + role change audit log.
+ */
+export const getEmployeeRoleManagement = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const gate = await assertEmployeeInCompanyScope(id, req.user!.id, req.user!.role);
+    if (!gate.ok) {
+      const err = gate as { status: number; message: string };
+      res.status(err.status).json({ success: false, message: err.message });
+      return;
+    }
+    const payload = await buildEmployeeRoleManagementPayload(id);
+    if (!payload) {
+      res.status(404).json({ success: false, message: 'Employee not found' });
+      return;
+    }
+    res.json({ success: true, data: payload });
+  } catch (error) {
+    console.error('Get employee role management error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch employee role management',
+    });
+  }
+};
+
+/**
+ * PATCH /api/employees/:id/role-management
+ * Super Admin / HR: assign Employee, Project Manager, Admin, or Accountant.
+ * Body: { systemRole: string, reason: string }
+ * Legacy: { promoteToProjectManager: boolean, reason: string }
+ */
+export const updateEmployeeRoleManagement = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const gate = await assertEmployeeInCompanyScope(id, req.user!.id, req.user!.role);
+    if (!gate.ok) {
+      const err = gate as { status: number; message: string };
+      res.status(err.status).json({ success: false, message: err.message });
+      return;
+    }
+    const body = (req.body || {}) as Record<string, unknown>;
+    const promoteRaw = body.promoteToProjectManager;
+    const systemRoleRaw = body.systemRole;
+    const reasonRaw = body.reason;
+
+    let targetRole: UserRole | null = null;
+    if (typeof systemRoleRaw === 'string' && systemRoleRaw.trim()) {
+      targetRole = systemRoleRaw.trim().toUpperCase() as UserRole;
+    } else if (typeof promoteRaw === 'boolean') {
+      targetRole = promoteRaw ? 'PROJECT_MANAGER' : 'EMPLOYEE';
+    }
+
+    if (!targetRole) {
+      res.status(400).json({
+        success: false,
+        message: 'systemRole is required (EMPLOYEE, PROJECT_MANAGER, ADMIN, or ACCOUNTANT)',
+      });
+      return;
+    }
+
+    if (!ROLE_MANAGEMENT_ASSIGNABLE.includes(targetRole)) {
+      res.status(400).json({
+        success: false,
+        message: `Invalid systemRole. Allowed values: ${ROLE_MANAGEMENT_ASSIGNABLE.map(formatSystemRoleLabel).join(', ')}`,
+      });
+      return;
+    }
+
+    const reason = typeof reasonRaw === 'string' ? reasonRaw.trim() : '';
+    if (!reason) {
+      res.status(400).json({
+        success: false,
+        message: 'A reason for this role change is required (reason).',
+      });
+      return;
+    }
+
+    const employee = await prisma.user.findUnique({
+      where: { id },
+      select: { id: true, role: true, firstName: true, lastName: true },
+    });
+
+    if (!employee) {
+      res.status(404).json({ success: false, message: 'Employee not found' });
+      return;
+    }
+
+    const currentRole = employee.role;
+
+    if (!ROLE_MANAGEMENT_ASSIGNABLE.includes(currentRole)) {
+      res.status(400).json({
+        success: false,
+        message: `Cannot change role for users with role ${formatSystemRoleLabel(currentRole)}. Only Employee, Project Manager, Admin, and Accountant accounts can be updated here.`,
+      });
+      return;
+    }
+
+    if (currentRole === targetRole) {
+      const payload = await buildEmployeeRoleManagementPayload(id);
+      res.json({
+        success: true,
+        message: 'No role change needed',
+        data: payload,
+      });
+      return;
+    }
+
+    const actorId = req.user!.id;
+    const auditRole = employeeAuditRoleLabel(req.user!.role);
+
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id },
+        data: { role: targetRole },
+      }),
+      prisma.employeeChangeLog.create({
+        data: {
+          employeeId: id,
+          changedById: actorId,
+          changedByRole: auditRole,
+          fieldKey: 'role',
+          fieldLabel: 'System role',
+          oldValue: currentRole,
+          newValue: targetRole,
+          reason,
+        },
+      }),
+    ]);
+
+    const payload = await buildEmployeeRoleManagementPayload(id);
+    res.json({
+      success: true,
+      message: `Role updated to ${formatSystemRoleLabel(targetRole)}`,
+      data: payload,
+    });
+  } catch (error) {
+    console.error('Update employee role management error:', error);
+    const prismaMsg =
+      error && typeof error === 'object' && 'message' in error
+        ? String((error as { message?: unknown }).message || '')
+        : '';
+    const hint =
+      prismaMsg.includes('invalid input value for enum') || prismaMsg.includes('UserRole')
+        ? ' The ACCOUNTANT role may not be in the database yet — run: npx prisma migrate deploy'
+        : '';
+    res.status(500).json({
+      success: false,
+      message: prismaMsg
+        ? `Failed to update employee role: ${prismaMsg}${hint}`
+        : 'Failed to update employee role',
+    });
+  }
+};
+
+/**
  * GET /api/employees/:id/change-history
  * Access: ADMIN, HR
  */
@@ -2133,10 +2671,10 @@ export const getEmployeeStatistics = async (req: AuthRequest, res: Response): Pr
     const { companyId, companyName } = req.query;
     const role = req.user?.role;
 
-    // Non–HR/Admin roles may only request scoped statistics (prevents org-wide leakage)
+    // Non–HR/Admin/Super Admin roles may only request scoped statistics (prevents org-wide leakage)
     const mustScopeCompany =
       role &&
-      !['ADMIN', 'HR'].includes(role) &&
+      !['ADMIN', 'HR', 'SUPER_ADMIN'].includes(role) &&
       ['MANAGER', 'PROJECT_MANAGER', 'EMPLOYEE', 'CONTRACTOR'].includes(role);
     if (mustScopeCompany) {
       const hasScope =
@@ -2151,26 +2689,61 @@ export const getEmployeeStatistics = async (req: AuthRequest, res: Response): Pr
       }
     }
 
-    // Resolve company filter so stats are per-company when viewing a company's directory
-    let companyNameFilter: string | null = null;
+    // Resolve company filter so stats are per-company when viewing a company's directory.
+    let companyNames: string[] = [];
     if (companyName && typeof companyName === 'string' && companyName.trim()) {
-      companyNameFilter = companyName.trim();
+      const want = companyName.trim();
+      companyNames = [want];
+      // If it's a branch name, also include parent company name (legacy users store parent).
+      const nameAliases = buildCompanyNameAliases(want);
+      const companyRow = await prisma.company.findFirst({
+        where: {
+          OR: nameAliases.map((n) => ({ name: { equals: n, mode: 'insensitive' as const } })),
+        } as any,
+        select: { parentCompanyId: true } as any,
+      }) as any;
+      if (companyRow?.parentCompanyId) {
+        const parent = await prisma.company.findUnique({
+          where: { id: String(companyRow.parentCompanyId).trim() },
+          select: { name: true } as any,
+        }) as any;
+        if (parent?.name) companyNames.push(String(parent.name).trim());
+      }
     } else if (companyId && typeof companyId === 'string' && companyId.trim()) {
       const company = await prisma.company.findUnique({
         where: { id: companyId.trim() },
-        select: { name: true },
-      });
-      if (company) companyNameFilter = company.name.trim();
+        select: { name: true } as any,
+      }) as any;
+      if (company?.name) companyNames.push(String(company.name).trim());
     }
+    companyNames = companyNames.filter((x, i) => x && companyNames.indexOf(x) === i);
 
     const baseWhere: any = {
-      role: { notIn: ['ADMIN', 'TENDER_ENGINEER'] },
+      role: { notIn: ['TENDER_ENGINEER'] },
     };
-    if (companyNameFilter) {
-      baseWhere.company = { equals: companyNameFilter, mode: 'insensitive' };
+    // When companyId points at a branch, include parent company name as well.
+    let companyAliases = companyNames.flatMap((n) => buildCompanyNameAliases(n));
+    if (companyId && typeof companyId === 'string' && companyId.trim()) {
+      const branch = await prisma.company.findUnique({
+        where: { id: companyId.trim() },
+        select: { name: true, parentCompanyId: true } as any,
+      }) as any;
+      if (branch?.parentCompanyId) {
+        const parent = await prisma.company.findUnique({
+          where: { id: String(branch.parentCompanyId).trim() },
+          select: { name: true } as any,
+        }) as any;
+        companyAliases = buildCompanyScopeAliases(branch?.name, parent?.name);
+      }
+    }
+    if (companyAliases.length > 0) {
+      baseWhere.AND = Array.isArray(baseWhere.AND) ? baseWhere.AND : [];
+      baseWhere.AND.push({
+        OR: companyAliases.map((n) => ({ company: { equals: n, mode: 'insensitive' as const } })),
+      });
     }
 
-    // Get total employees count (exclude ADMIN and TENDER_ENGINEER roles, only active employees)
+    // Get total employees count (exclude tender engineers only; admins count as directory members)
     const totalEmployees = await prisma.user.count({
       where: { ...baseWhere, isActive: true }
     });
@@ -2404,11 +2977,18 @@ async function assertEmployeeMatchesPositionCompany(
       message: 'Employee has no company set; set company on their profile before assigning org positions',
     };
   }
-  if (userCompany.toLowerCase() !== companyName.toLowerCase()) {
+
+  const compatible = await employeeCompanyCompatibleWithPositionCompany(
+    userCompany,
+    companyName,
+  );
+  if (!compatible) {
     return {
       ok: false,
       status: 403,
-      message: 'This position belongs to a different company than the employee',
+      message:
+        'This position belongs to a different company than the employee. ' +
+        'Employees from the main company or sibling branches can be added via Load from Employee Directory when they share the same parent company.',
     };
   }
 
@@ -2432,7 +3012,8 @@ export const assignEmployeeToOrgPosition = async (req: AuthRequest, res: Respons
       req.body?.departmentId
     );
     if (!resolved.ok) {
-      res.status(resolved.status).json({ success: false, message: resolved.message });
+      const err = resolved as { status: number; message: string };
+      res.status(err.status).json({ success: false, message: err.message });
       return;
     }
 
@@ -2440,7 +3021,8 @@ export const assignEmployeeToOrgPosition = async (req: AuthRequest, res: Respons
 
     const gate = await assertEmployeeMatchesPositionCompany(id, resolved.companyName);
     if (!gate.ok) {
-      res.status(gate.status).json({ success: false, message: gate.message });
+      const err = gate as { status: number; message: string };
+      res.status(err.status).json({ success: false, message: err.message });
       return;
     }
 
@@ -2464,6 +3046,16 @@ export const assignEmployeeToOrgPosition = async (req: AuthRequest, res: Respons
         reason: reason ?? null,
       },
     });
+
+    await syncEmployeeManagersFromSubDepartments(id);
+
+    const assignee = await prisma.user.findUnique({
+      where: { id },
+      select: { role: true },
+    });
+    if (assignee?.role === UserRole.ADMIN || assignee?.role === UserRole.HR) {
+      await grantCompanyAccessForOrgPosition(id, positionId, req.user?.id ?? null);
+    }
 
     res.json({
       success: true,
@@ -2494,13 +3086,15 @@ export const removeEmployeeOrgPositionAssignment = async (req: AuthRequest, res:
 
     const resolved = await resolveOrgPositionForAssignment(pid, undefined, undefined, undefined);
     if (!resolved.ok) {
-      res.status(resolved.status).json({ success: false, message: resolved.message });
+      const err = resolved as { status: number; message: string };
+      res.status(err.status).json({ success: false, message: err.message });
       return;
     }
 
     const gate = await assertEmployeeMatchesPositionCompany(id, resolved.companyName);
     if (!gate.ok) {
-      res.status(gate.status).json({ success: false, message: gate.message });
+      const err = gate as { status: number; message: string };
+      res.status(err.status).json({ success: false, message: err.message });
       return;
     }
 
@@ -2515,6 +3109,8 @@ export const removeEmployeeOrgPositionAssignment = async (req: AuthRequest, res:
       });
       return;
     }
+
+    await syncEmployeeManagersFromSubDepartments(id);
 
     res.json({ success: true, message: 'Removed additional position assignment' });
   } catch (error) {

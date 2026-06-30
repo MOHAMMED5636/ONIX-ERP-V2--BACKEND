@@ -2,7 +2,7 @@ import type { FeedbackSurveyLogicRule, FeedbackSurveyQuestion, FeedbackSurveySet
 
 export const FEEDBACK_SURVEY_RECIPIENT_ROLES = ['EMPLOYEE', 'MANAGER', 'PROJECT_MANAGER'] as const;
 
-export const SURVEY_ADMIN_ROLES = ['ADMIN', 'HR'] as const;
+export const SURVEY_ADMIN_ROLES = ['ADMIN', 'HR', 'SUPER_ADMIN'] as const;
 
 export const ALLOWED_QUESTION_TYPES = [
   'SHORT_TEXT',

@@ -24,6 +24,11 @@ router.get('/runs/:runId/lines', payrollController.getRunLines);
 // HR/Admin: create run
 router.post('/runs', payrollController.createPayrollRun);
 
+// HR/Admin: delete runs (clear list / fresh start) — POST avoids dev-proxy DELETE issues
+router.post('/runs/clear-all', payrollController.deleteAllPayrollRuns);
+router.delete('/runs', payrollController.deleteAllPayrollRuns);
+router.delete('/runs/:id', payrollController.deletePayrollRun);
+
 // HR/Admin: manual adjustments
 router.patch('/runs/:runId/lines/:lineId/adjustment', payrollController.adjustPayrollLine);
 router.put('/runs/:id/lines/:lineId', payrollController.updatePayrollLine);

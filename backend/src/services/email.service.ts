@@ -54,6 +54,19 @@ export const sendEmail = async (to: string, subject: string, html: string, attac
     
     // Provide more specific error messages
     if (error.code === 'EAUTH') {
+      const response = String(error.response || error.message || '');
+      if (/smtp_auth_disabled|SmtpClientAuthentication is disabled/i.test(response)) {
+        console.error('   ❌ Microsoft 365 SMTP AUTH is disabled for this tenant/mailbox');
+        throw new Error(
+          'Office 365 SMTP authentication is disabled for your organization. Ask your IT admin to enable SMTP AUTH (see https://aka.ms/smtp_auth_disabled) for the mailbox used by the ERP.',
+        );
+      }
+      if (/basic authentication|basicauth/i.test(response)) {
+        console.error('   ❌ Basic auth / SMTP AUTH blocked by Microsoft 365 policy');
+        throw new Error(
+          'Office 365 blocked SMTP login for this mailbox. Enable SMTP AUTH for the sender mailbox or use an app-specific mail relay.',
+        );
+      }
       console.error('   ❌ Authentication failed - check EMAIL_USER and EMAIL_PASS');
       throw new Error('SMTP authentication failed. Please check your email credentials.');
     } else if (error.code === 'ECONNECTION' || error.code === 'ETIMEDOUT') {

@@ -1,100 +1,195 @@
-import { Task, TaskAssignment, UserRole } from '@prisma/client';
+import { Task, TaskAssignment, TaskStatus, UserRole } from '@prisma/client';
+import {
+  isProjectSuspendedStatus,
+  PROJECT_SUSPENDED_MESSAGE,
+  userCanBypassProjectSuspension,
+} from './project-suspension';
+import { enrichTaskNodeForClient, isTaskLockedByPredecessor } from './task-predecessor-unlock';
 
-// Shape of the current authenticated user needed for permission checks
 export type CurrentUser = {
   id: string;
   role: UserRole;
 };
 
-// Task plus minimal relations needed for permission evaluation
 export type TaskWithAssignments = Task & {
   assignments?: Pick<TaskAssignment, 'employeeId'>[];
+  delegations?: Record<string, unknown>[];
 };
 
 export type TaskPermissionContext = {
   user: CurrentUser;
   task: TaskWithAssignments;
+  /** Project.creator user id — allows project owner to delete work items they did not personally create. */
+  projectCreatedById?: string | null;
+  /**
+   * When the project is Suspended (Prisma `ON_HOLD`), assigned users cannot edit tasks/subtasks
+   * except admins / HR / super-admin / project creator / project manager.
+   */
+  projectStatus?: string | null;
+  /** True when the user is the contract/text PM for this project (not task-only manager access). */
+  userManagesProject?: boolean;
 };
 
 export type TaskPermissions = {
-  /**
-   * Full control over main task fields such as:
-   * - title, description
-   * - priority, dates (startDate, dueDate)
-   * - assignee (assignedEmployeeId, TaskAssignment)
-   * - predecessors
-   *
-   * Granted only to:
-   * - privileged roles (ADMIN / PROJECT_MANAGER / HR / MANAGER)
-   * - the task creator
-   *
-   * Assignees who did not create the task cannot edit main fields.
-   */
   canEditMainFields: boolean;
-
-  /**
-   * Assignee‑side fields:
-   * - remarks
-   * - assigneeNotes
-   * - attachments (handled in attachment controllers)
-   * - status (so assignees can mark tasks done)
-   *
-   * Granted to: privileged roles, creator, and the assignee.
-   * Assignees can only edit these fields, not main fields.
-   */
   canEditAssigneeFields: boolean;
-
-  /**
-   * Whether the user can delete this task entirely.
-   * (You can keep using the existing deleteTask logic; this is provided
-   *  for reuse where convenient.)
-   */
   canDelete: boolean;
+  isProjectSuspended: boolean;
+  suspensionMessage: string | null;
+  /** Assignee cannot edit after marking task Done until a PM / project owner reopens it. */
+  isDoneLocked: boolean;
+  doneLockMessage: string | null;
 };
 
-const PRIVILEGED_ROLES: UserRole[] = ['ADMIN', 'PROJECT_MANAGER', 'HR', 'MANAGER'];
+export const TASK_DONE_LOCK_MESSAGE =
+  'This task is completed and locked. Contact your project manager to request edits.';
 
-/**
- * Compute permissions for a given user on a specific task, based on:
- * - global role (ADMIN / PROJECT_MANAGER / HR)
- * - whether they created the task
- * - whether they are an assignee (root assignment or direct assignedEmployeeId)
- */
+export function isTaskDoneLockedStatus(status: unknown): boolean {
+  return String(status ?? '').trim().toUpperCase() === TaskStatus.COMPLETED;
+}
+
+/** PM, manager, admin/HR, or project creator may edit or reopen completed tasks. */
+export function userCanUnlockCompletedTask(
+  user: CurrentUser,
+  projectCreatedById: string | null | undefined,
+  userManagesProject?: boolean,
+): boolean {
+  if (user.role === 'ADMIN' || user.role === 'HR' || user.role === 'SUPER_ADMIN') return true;
+  if (user.role === 'PROJECT_MANAGER' || user.role === 'MANAGER') {
+    return userManagesProject === true;
+  }
+  if (
+    projectCreatedById != null &&
+    String(projectCreatedById).trim() !== '' &&
+    projectCreatedById === user.id
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isPrivilegedForProject(user: CurrentUser, userManagesProject?: boolean): boolean {
+  if (user.role === 'ADMIN' || user.role === 'HR' || user.role === 'SUPER_ADMIN') return true;
+  if (user.role === 'PROJECT_MANAGER' || user.role === 'MANAGER') {
+    return userManagesProject === true;
+  }
+  return false;
+}
+
+function delegationInvolvesUser(d: any, userId: string): boolean {
+  const newId = d?.newAssigneeId ?? d?.newAssignee?.id;
+  const origId = d?.originalAssigneeId ?? d?.originalAssignee?.id;
+  return newId === userId || origId === userId;
+}
+
+/** Assignee via direct assignee, task_assignments, or delegations (minimal or expanded relation shape). */
+export function taskRowIsAssignee(
+  task: {
+    assignedEmployeeId: string | null;
+    assignments?: { employeeId: string }[];
+    delegations?: Record<string, unknown>[];
+  },
+  userId: string,
+): boolean {
+  if (task.assignedEmployeeId === userId) return true;
+  if (task.assignments?.some((a) => a.employeeId === userId)) return true;
+  return task.delegations?.some((d) => delegationInvolvesUser(d, userId)) ?? false;
+}
+
+export const MESSAGE_NO_PERMISSION_DELETE_TASK =
+  'You can only delete this item if you manage the project as PM, created it, created the project, or are an administrator.';
+
 export function computeTaskPermissions(ctx: TaskPermissionContext): TaskPermissions {
-  const { user, task } = ctx;
+  const { user, task, projectCreatedById, projectStatus, userManagesProject } = ctx;
 
-  const isPrivileged = PRIVILEGED_ROLES.includes(user.role);
-  const isCreator = task.createdBy === user.id;
+  const isElevated = user.role === 'ADMIN' || user.role === 'HR' || user.role === 'SUPER_ADMIN';
+  const isPrivileged = isPrivilegedForProject(user, userManagesProject);
+  const projectCreator =
+    projectCreatedById != null && String(projectCreatedById).trim() !== '' && projectCreatedById === user.id;
+  const taskCreator = task.createdBy != null && task.createdBy === user.id;
 
-  const isAssignedViaRoot =
-    task.assignments?.some((a) => a.employeeId === user.id) ?? false;
-  const isAssignedViaChild = task.assignedEmployeeId === user.id;
-  const isAssignee = isAssignedViaRoot || isAssignedViaChild;
+  const isAssignee = taskRowIsAssignee(task, user.id);
+  // Non-privileged assignees on someone else's row may only edit assignee-scoped fields.
+  // PMs / managers keep full main-field access even when they are the assignee.
+  const assigneeRestricted =
+    isAssignee && !taskCreator && !projectCreator && !isPrivileged;
 
-  // Main fields (title, description, priority, deadline, assignee, predecessors)
-  // only for privileged roles and the task creator. Assignees cannot edit these.
-  const canEditMainFields = isPrivileged || isCreator;
+  let canEditMainFields = isElevated || taskCreator || projectCreator || (isPrivileged && !assigneeRestricted);
 
-  // Assignee fields (remarks, assigneeNotes, attachments) and status:
-  // privileged, creator, and assignee. So assignees can add remarks/notes
-  // and mark status (e.g. Done) but not change core task definition.
-  const canEditAssigneeFields = isPrivileged || isCreator || isAssignee;
+  let canEditAssigneeFields = canEditMainFields || isAssignee;
 
-  // Deletion is intentionally stricter: privileged roles or creator.
-  const canDelete = isPrivileged || isCreator;
+  let canDelete =
+    isElevated || taskCreator || projectCreator || (isPrivileged && userManagesProject === true);
+
+  const projectSuspended = isProjectSuspendedStatus(projectStatus);
+  const canBypassProjectSuspension =
+    isElevated || userCanBypassProjectSuspension(user, projectCreatedById ?? null);
+
+  if (projectSuspended && !canBypassProjectSuspension) {
+    canEditMainFields = false;
+    canEditAssigneeFields = false;
+    canDelete = false;
+  }
+
+  const canUnlockDone = userCanUnlockCompletedTask(user, projectCreatedById, userManagesProject);
+  const doneLocked = isTaskDoneLockedStatus(task.status) && !canUnlockDone;
+
+  if (doneLocked) {
+    canEditMainFields = false;
+    canEditAssigneeFields = false;
+    canDelete = false;
+  }
 
   return {
     canEditMainFields,
     canEditAssigneeFields,
     canDelete,
+    isProjectSuspended: projectSuspended,
+    suspensionMessage: projectSuspended ? PROJECT_SUSPENDED_MESSAGE : null,
+    isDoneLocked: doneLocked,
+    doneLockMessage: doneLocked ? TASK_DONE_LOCK_MESSAGE : null,
   };
 }
 
-/**
- * Utility to detect whether the incoming payload is attempting to
- * modify any "main" task fields. Used to enforce read‑only behaviour
- * for assignees while still allowing them to touch remarks/notes.
- */
+/** Attach `permissions` on each task node (recursive `subtasks`). */
+export function mapTaskTreeWithPermissions(
+  tasks: any[] | undefined,
+  user: CurrentUser | null | undefined,
+  projectCreatedById: string | null | undefined,
+  projectStatus?: string | null,
+  userManagesProject?: boolean,
+): any[] {
+  if (!tasks || !Array.isArray(tasks)) {
+    return [];
+  }
+  const pid = projectCreatedById ?? null;
+  return tasks.map((t) => {
+    const perms = user
+      ? computeTaskPermissions({
+          user,
+          task: t as TaskWithAssignments,
+          projectCreatedById: pid,
+          projectStatus,
+          userManagesProject,
+        })
+      : null;
+    const locked = isTaskLockedByPredecessor(t);
+    const doneLocked = perms?.isDoneLocked ?? false;
+    const nested = t.subtasks;
+    const withPerms = {
+      ...t,
+      ...(perms ? { permissions: perms } : {}),
+      isLockedByPredecessor: locked,
+      canChangeStatus: locked || doneLocked ? false : true,
+      subtasks:
+        nested && Array.isArray(nested) && nested.length > 0
+          ? mapTaskTreeWithPermissions(nested, user, pid, projectStatus, userManagesProject)
+          : nested,
+    };
+    return enrichTaskNodeForClient(withPerms);
+  });
+}
+
 export function hasMainFieldChanges(body: any): boolean {
   if (!body || typeof body !== 'object') {
     return false;
@@ -103,8 +198,6 @@ export function hasMainFieldChanges(body: any): boolean {
   const {
     title,
     description,
-    // status is intentionally excluded here: assignees are allowed
-    // to change status, so it is not treated as a "main" field
     priority,
     startDate,
     dueDate,
@@ -134,4 +227,3 @@ export function hasMainFieldChanges(body: any): boolean {
     parentTaskId,
   ].some((v) => v !== undefined);
 }
-

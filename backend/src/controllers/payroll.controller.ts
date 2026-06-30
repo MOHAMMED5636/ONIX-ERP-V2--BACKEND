@@ -8,9 +8,27 @@ import {
   approvePayrollRunStageService,
   lockPayrollRunService,
   generatePayslipsForRunService,
+  deletePayrollRunService,
+  deleteAllPayrollRunsService,
 } from '../services/payrollWorkflow.service';
+import { generatePayslipPdfBuffer, loadPayslipPdfInput } from '../services/payslipPdf.service';
+import {
+  generatePayrollRegisterPdfBuffer,
+  loadPayrollRegisterPdfInput,
+} from '../services/payrollRegisterPdf.service';
+import {
+  getMonthlySalarySheet,
+  payrollTotalsFromPayableSheetRows,
+  syncPayrollRunLinesFromSalarySheet,
+} from '../services/salary-monthly-sheet.service';
+import {
+  canApprovePayrollStage,
+  canManagePayrollRuns,
+  canViewPayrollRuns,
+} from '../utils/payrollApprovalAccess';
+import { listPayrollCompanyOptions } from '../services/payroll-company.service';
 
-const isHrAdmin = (role: string | undefined): boolean => role === 'ADMIN' || role === 'HR';
+const isHrAdmin = (role: string | undefined): boolean => canManagePayrollRuns(role);
 const isSelfReadOnlyRole = (role: string | undefined): boolean =>
   role === 'MANAGER' || role === 'EMPLOYEE' || role === 'PROJECT_MANAGER';
 
@@ -33,6 +51,42 @@ const parseIntRequired = (value: unknown): number | null => {
   return Number.isFinite(n) ? Math.trunc(n) : null;
 };
 
+type ApproverSummary = { id: string; firstName: string; lastName: string; email: string };
+
+async function enrichPayrollRunWithApprovers<T extends {
+  hrApprovedById?: string | null;
+  financeApprovedById?: string | null;
+  finalApprovedById?: string | null;
+}>(run: T) {
+  const ids = [run.hrApprovedById, run.financeApprovedById, run.finalApprovedById].filter(
+    Boolean,
+  ) as string[];
+  if (!ids.length) {
+    return { ...run, hrApprovedBy: null, financeApprovedBy: null, finalApprovedBy: null };
+  }
+  const users = await prisma.user.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, firstName: true, lastName: true, email: true },
+  });
+  const byId = new Map(users.map((u) => [u.id, u]));
+  return {
+    ...run,
+    hrApprovedBy: run.hrApprovedById ? (byId.get(run.hrApprovedById) as ApproverSummary | undefined) ?? null : null,
+    financeApprovedBy: run.financeApprovedById
+      ? (byId.get(run.financeApprovedById) as ApproverSummary | undefined) ?? null
+      : null,
+    finalApprovedBy: run.finalApprovedById
+      ? (byId.get(run.finalApprovedById) as ApproverSummary | undefined) ?? null
+      : null,
+  };
+}
+
+const payrollApprovalErrorStatus = (code?: string): number => {
+  if (code === 'LOCKED' || code === 'INVALID_STATUS') return 409;
+  if (code === 'FORBIDDEN_STAGE') return 403;
+  return 500;
+};
+
 /**
  * Self payslips (finalized payroll lines only).
  * GET /api/payroll/self
@@ -48,7 +102,10 @@ export const getSelfPayslips = async (req: AuthRequest, res: Response): Promise<
     const lines = await prisma.payrollLine.findMany({
       where: {
         employeeId: user.id,
-        payrollRun: { status: { in: [PayrollStatus.FINAL_APPROVED, PayrollStatus.LOCKED] } },
+        OR: [
+          { payslipGenerated: true },
+          { payrollRun: { status: { in: [PayrollStatus.FINAL_APPROVED, PayrollStatus.LOCKED] } } },
+        ],
       },
       include: {
         payrollRun: { select: { id: true, periodStart: true, periodEnd: true, periodMonth: true, periodYear: true, status: true } },
@@ -76,20 +133,20 @@ export const getRunLines = async (req: AuthRequest, res: Response): Promise<void
     const { runId } = req.params;
 
     // Managers/Employees must not access payroll run details/processing endpoints.
-    if (!isHrAdmin(user.role)) {
+    if (!canViewPayrollRuns(user.role)) {
       res.status(403).json({ success: false, message: 'Access Denied' });
       return;
     }
 
-    const lines = await prisma.payrollLine.findMany({
-      where: { payrollRunId: runId },
-      include: {
-        employee: { select: { id: true, firstName: true, lastName: true, employeeId: true, department: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+    const lines = await syncPayrollRunLinesFromSalarySheet(runId);
+    if (!lines) {
+      res.status(404).json({ success: false, message: 'Payroll run not found' });
+      return;
+    }
 
-    res.json({ success: true, data: { lines } });
+    const companyOptions = await listPayrollCompanyOptions();
+
+    res.json({ success: true, data: { lines, companyOptions } });
   } catch (error) {
     console.error('getRunLines error:', error);
     res.status(500).json({ success: false, message: 'Failed to fetch payroll lines' });
@@ -188,11 +245,6 @@ export const adjustPayrollLine = async (req: AuthRequest, res: Response): Promis
 export const approvePayrollRun = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const user = getUserOrThrow(req);
-    if (!isHrAdmin(user.role)) {
-      res.status(403).json({ success: false, message: 'Access Denied: HR/Admin only' });
-      return;
-    }
-
     const { runId } = req.params;
     const { stage, approved, comments } = req.body as any;
 
@@ -204,20 +256,26 @@ export const approvePayrollRun = async (req: AuthRequest, res: Response): Promis
       return;
     }
 
+    if (!canApprovePayrollStage(user.role, approvedStage)) {
+      res.status(403).json({ success: false, message: 'Access Denied for this approval stage' });
+      return;
+    }
+
     const updatedRun = await approvePayrollRunStageService({
       userId: user.id,
+      userRole: user.role,
       runId,
       stage: approvedStage,
       approved: isApproved,
       comments,
     });
 
-    res.json({ success: true, data: updatedRun });
+    res.json({ success: true, data: await enrichPayrollRunWithApprovers(updatedRun!) });
   } catch (error) {
     console.error('approvePayrollRun error:', error);
     const msg = error instanceof Error ? error.message : 'Failed to approve payroll run';
-    const code = (error as any)?.code;
-    res.status(code === 'LOCKED' ? 409 : 500).json({ success: false, message: msg });
+    const code = (error as { code?: string })?.code;
+    res.status(payrollApprovalErrorStatus(code)).json({ success: false, message: msg });
   }
 };
 
@@ -357,7 +415,7 @@ export const updatePayrollSettings = async (req: AuthRequest, res: Response): Pr
 export const listPayrollRuns = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const user = getUserOrThrow(req);
-    if (!isHrAdmin(user.role)) {
+    if (!canViewPayrollRuns(user.role)) {
       res.status(403).json({ success: false, message: 'Access Denied' });
       return;
     }
@@ -419,7 +477,7 @@ export const listPayrollRuns = async (req: AuthRequest, res: Response): Promise<
 export const getPayrollRun = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const user = getUserOrThrow(req);
-    if (!isHrAdmin(user.role)) {
+    if (!canViewPayrollRuns(user.role)) {
       res.status(403).json({ success: false, message: 'Access Denied' });
       return;
     }
@@ -430,7 +488,45 @@ export const getPayrollRun = async (req: AuthRequest, res: Response): Promise<vo
       res.status(404).json({ success: false, message: 'Payroll run not found' });
       return;
     }
-    res.json({ success: true, data: run });
+
+    const sheet = await getMonthlySalarySheet({
+      year: run.periodYear,
+      month: run.periodMonth,
+    });
+    const payableRows = sheet.rows.filter((row) => {
+      const net = row.paidSalary ?? row.finalSalary;
+      return net != null && net > 0;
+    });
+    const sheetTotals = payrollTotalsFromPayableSheetRows(payableRows);
+
+    if (
+      sheetTotals.totalEmployees > 0 &&
+      (Number(run.totalGross) !== sheetTotals.totalGross ||
+        Number(run.totalDeductions) !== sheetTotals.totalDeductions ||
+        Number(run.totalNet) !== sheetTotals.totalNet ||
+        run.totalEmployees !== sheetTotals.totalEmployees)
+    ) {
+      await prisma.payrollRun.update({
+        where: { id },
+        data: {
+          totalEmployees: sheetTotals.totalEmployees,
+          totalGross: sheetTotals.totalGross,
+          totalDeductions: sheetTotals.totalDeductions,
+          totalNet: sheetTotals.totalNet,
+        },
+      });
+    }
+
+    res.json({
+      success: true,
+      data: await enrichPayrollRunWithApprovers({
+        ...run,
+        totalEmployees: sheetTotals.totalEmployees || run.totalEmployees,
+        totalGross: sheetTotals.totalGross,
+        totalDeductions: sheetTotals.totalDeductions,
+        totalNet: sheetTotals.totalNet,
+      }),
+    });
   } catch (error) {
     console.error('getPayrollRun error:', error);
     res.status(500).json({ success: false, message: 'Failed to fetch payroll run' });
@@ -487,23 +583,26 @@ export const updatePayrollLine = async (req: AuthRequest, res: Response): Promis
 export const approvePayrollHR = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const user = getUserOrThrow(req);
-    if (!isHrAdmin(user.role)) {
-      res.status(403).json({ success: false, message: 'Access Denied' });
+    if (!canApprovePayrollStage(user.role, PayrollApprovalStage.HR_REVIEW)) {
+      res.status(403).json({ success: false, message: 'Access Denied: HR review only' });
       return;
     }
     const { id } = req.params;
     const { comments } = req.body as any;
     const updatedRun = await approvePayrollRunStageService({
       userId: user.id,
+      userRole: user.role,
       runId: id,
       stage: PayrollApprovalStage.HR_REVIEW,
       approved: true,
       comments,
     });
-    res.json({ success: true, data: updatedRun });
+    res.json({ success: true, data: await enrichPayrollRunWithApprovers(updatedRun!) });
   } catch (error) {
     console.error('approvePayrollHR error:', error);
-    res.status(500).json({ success: false, message: 'Failed to approve HR stage' });
+    const msg = error instanceof Error ? error.message : 'Failed to approve HR stage';
+    const code = (error as { code?: string })?.code;
+    res.status(payrollApprovalErrorStatus(code)).json({ success: false, message: msg });
   }
 };
 
@@ -514,23 +613,26 @@ export const approvePayrollHR = async (req: AuthRequest, res: Response): Promise
 export const approvePayrollFinance = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const user = getUserOrThrow(req);
-    if (!isHrAdmin(user.role)) {
-      res.status(403).json({ success: false, message: 'Access Denied' });
+    if (!canApprovePayrollStage(user.role, PayrollApprovalStage.FINANCE_REVIEW)) {
+      res.status(403).json({ success: false, message: 'Access Denied: Accountant approval only' });
       return;
     }
     const { id } = req.params;
     const { comments } = req.body as any;
     const updatedRun = await approvePayrollRunStageService({
       userId: user.id,
+      userRole: user.role,
       runId: id,
       stage: PayrollApprovalStage.FINANCE_REVIEW,
       approved: true,
       comments,
     });
-    res.json({ success: true, data: updatedRun });
+    res.json({ success: true, data: await enrichPayrollRunWithApprovers(updatedRun!) });
   } catch (error) {
     console.error('approvePayrollFinance error:', error);
-    res.status(500).json({ success: false, message: 'Failed to approve Finance stage' });
+    const msg = error instanceof Error ? error.message : 'Failed to approve Finance stage';
+    const code = (error as { code?: string })?.code;
+    res.status(payrollApprovalErrorStatus(code)).json({ success: false, message: msg });
   }
 };
 
@@ -541,50 +643,75 @@ export const approvePayrollFinance = async (req: AuthRequest, res: Response): Pr
 export const approvePayrollFinal = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const user = getUserOrThrow(req);
-    if (!isHrAdmin(user.role)) {
-      res.status(403).json({ success: false, message: 'Access Denied' });
+    if (!canApprovePayrollStage(user.role, PayrollApprovalStage.FINAL_APPROVAL)) {
+      res.status(403).json({ success: false, message: 'Access Denied: Super Admin final approval only' });
       return;
     }
     const { id } = req.params;
     const { comments } = req.body as any;
     const updatedRun = await approvePayrollRunStageService({
       userId: user.id,
+      userRole: user.role,
       runId: id,
       stage: PayrollApprovalStage.FINAL_APPROVAL,
       approved: true,
       comments,
     });
-    res.json({ success: true, data: updatedRun });
+    res.json({ success: true, data: await enrichPayrollRunWithApprovers(updatedRun!) });
   } catch (error) {
     console.error('approvePayrollFinal error:', error);
-    res.status(500).json({ success: false, message: 'Failed to approve Final stage' });
+    const msg = error instanceof Error ? error.message : 'Failed to approve Final stage';
+    const code = (error as { code?: string })?.code;
+    res.status(payrollApprovalErrorStatus(code)).json({ success: false, message: msg });
   }
 };
 
 /**
- * Generate payslip PDF for a specific employee (HR/Admin)
+ * Download payslip PDF — HR/Admin any employee; employee own payslip when published.
  * GET /api/payroll/runs/:id/payslip/:employeeId
  */
 export const generatePayslip = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const user = getUserOrThrow(req);
-    if (!isHrAdmin(user.role)) {
+    const { id: runId, employeeId } = req.params;
+
+    const isSelf = isSelfReadOnlyRole(user.role) && employeeId === user.id;
+    const isHr = isHrAdmin(user.role);
+    if (!isSelf && !isHr) {
       res.status(403).json({ success: false, message: 'Access Denied' });
       return;
     }
 
-    const { id: runId, employeeId } = req.params;
+    const input = await loadPayslipPdfInput(runId, employeeId);
+    if (!input) {
+      res.status(404).json({ success: false, message: 'Payslip not found for this employee and period' });
+      return;
+    }
 
-    await prisma.payrollLine.updateMany({
-      where: { payrollRunId: runId, employeeId },
-      data: {
-        payslipGenerated: true,
-        payslipGeneratedAt: new Date(),
-        payslipPath: `/uploads/payslips/${runId}/${employeeId}.pdf`,
-      },
-    });
+    if (isSelf && !input.line.payslipGenerated) {
+      res.status(403).json({ success: false, message: 'Payslip is not published yet' });
+      return;
+    }
 
-    sendMinimalPdf(res);
+    const pdf = await generatePayslipPdfBuffer(input);
+
+    if (isHr) {
+      await prisma.payrollLine.updateMany({
+        where: { payrollRunId: runId, employeeId },
+        data: {
+          payslipGenerated: true,
+          payslipGeneratedAt: new Date(),
+          payslipPath: `/uploads/payslips/${runId}/${employeeId}.pdf`,
+        },
+      });
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="payslip-${employeeId}-${runId}.pdf"`,
+    );
+    res.send(pdf);
   } catch (error) {
     console.error('generatePayslip error:', error);
     res.status(500).json({ success: false, message: 'Failed to generate payslip' });
@@ -598,16 +725,86 @@ export const generatePayslip = async (req: AuthRequest, res: Response): Promise<
 export const generateRegister = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const user = getUserOrThrow(req);
-    if (!isHrAdmin(user.role)) {
+    if (!canViewPayrollRuns(user.role)) {
       res.status(403).json({ success: false, message: 'Access Denied' });
       return;
     }
 
-    // Currently returns a minimal PDF placeholder.
-    sendMinimalPdf(res);
+    const { id } = req.params;
+    const input = await loadPayrollRegisterPdfInput(id);
+    if (!input) {
+      res.status(404).json({ success: false, message: 'Payroll run not found' });
+      return;
+    }
+
+    if (!input.rows.length) {
+      res.status(404).json({ success: false, message: 'No payroll lines found for this run' });
+      return;
+    }
+
+    const pdf = await generatePayrollRegisterPdfBuffer(input);
+    const filename = `payroll-register-${input.run.periodYear}-${String(input.run.periodMonth).padStart(2, '0')}.pdf`;
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', pdf.length);
+    res.send(pdf);
   } catch (error) {
     console.error('generateRegister error:', error);
     res.status(500).json({ success: false, message: 'Failed to generate register' });
+  }
+};
+
+/**
+ * DELETE payroll run (HR/Admin) — not allowed when locked.
+ * DELETE /api/payroll/runs/:id
+ */
+export const deletePayrollRun = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const user = getUserOrThrow(req);
+    if (!isHrAdmin(user.role)) {
+      res.status(403).json({ success: false, message: 'Access Denied: HR/Admin only' });
+      return;
+    }
+
+    const { id } = req.params;
+    const result = await deletePayrollRunService({ userId: user.id, runId: id });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    console.error('deletePayrollRun error:', error);
+    const code = (error as Error & { code?: string })?.code;
+    const message = error instanceof Error ? error.message : 'Failed to delete payroll run';
+    const status = code === 'NOT_FOUND' ? 404 : code === 'LOCKED' ? 409 : 500;
+    res.status(status).json({ success: false, message, code });
+  }
+};
+
+/**
+ * DELETE all non-locked payroll runs (fresh start).
+ * DELETE /api/payroll/runs
+ */
+export const deleteAllPayrollRuns = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const user = getUserOrThrow(req);
+    if (!isHrAdmin(user.role)) {
+      res.status(403).json({ success: false, message: 'Access Denied: HR/Admin only' });
+      return;
+    }
+
+    const confirm = req.body?.confirm === true || req.query?.confirm === 'true';
+    if (!confirm) {
+      res.status(400).json({
+        success: false,
+        message: 'Send confirm=true to delete all non-locked payroll runs.',
+      });
+      return;
+    }
+
+    const result = await deleteAllPayrollRunsService({ userId: user.id });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    console.error('deleteAllPayrollRuns error:', error);
+    res.status(500).json({ success: false, message: 'Failed to clear payroll runs' });
   }
 };
 

@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { LeaveType, LeaveStatus, LeaveManagerApprovalStatus } from '@prisma/client';
+import { LeaveType, LeaveStatus, LeaveManagerApprovalStatus, LeaveWorkflowStage } from '@prisma/client';
 import {
   VALID_LEAVE_TYPES,
   getActivePolicies,
@@ -14,16 +14,47 @@ import {
   validateMaternityLeave,
   getAnnualBalance,
 } from '../services/leavePolicy.service';
+import {
+  usesAnnualEnterpriseWorkflow,
+  appendWorkflowLog,
+  notifyLeaveWorkflow,
+  finalizeHrApproval,
+  isFinanceClearanceUser,
+} from '../services/leaveAnnualWorkflow.service';
+
+import {
+  resolveLineManagers,
+  bothManagersApproved,
+  requiresSecondManagerApproval,
+  pendingManagerActorLabel,
+  employeeHasLineManager,
+} from '../services/leaveLineManagers.service';
 
 const LEAVE_DOCUMENTS_DIR = path.join(process.cwd(), 'uploads', 'leave-documents');
 
 /** Org-wide leave listing, approval, and HR tools — not project/managers (they use self-service leave only). */
 function isHrLeaveRole(role: string | undefined): boolean {
-  return role === 'ADMIN' || role === 'HR';
+  return role === 'ADMIN' || role === 'HR' || role === 'SUPER_ADMIN';
 }
 
 function isManagerLeaveRole(role: string | undefined): boolean {
   return role === 'MANAGER' || role === 'PROJECT_MANAGER';
+}
+
+/** Annual & unpaid go to line manager first when employee has a manager assigned. */
+function managersApprovalStillPending(leave: {
+  managerApprovalStatus: string;
+  secondManagerApprovalStatus?: string;
+  assignedSecondLineManagerId?: string | null;
+}): boolean {
+  if (leave.managerApprovalStatus === 'PENDING') return true;
+  if (
+    leave.assignedSecondLineManagerId &&
+    leave.secondManagerApprovalStatus === 'PENDING'
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /** Annual & unpaid go to line manager first when employee has a manager assigned. */
@@ -44,6 +75,11 @@ const leaveIncludeStandard = {
   approvedBy: { select: { id: true, firstName: true, lastName: true } },
   rejectedBy: { select: { id: true, firstName: true, lastName: true } },
   managerActionBy: { select: { id: true, firstName: true, lastName: true } },
+  assignedLineManager: { select: { id: true, firstName: true, lastName: true } },
+  assignedSecondLineManager: { select: { id: true, firstName: true, lastName: true } },
+  secondManagerActionBy: { select: { id: true, firstName: true, lastName: true } },
+  projectConfirmedBy: { select: { id: true, firstName: true, lastName: true } },
+  financeActionBy: { select: { id: true, firstName: true, lastName: true } },
 };
 
 /**
@@ -59,6 +95,12 @@ async function getManagedEmployeeIdsForLeaveManager(managerUserId: string): Prom
     select: { id: true },
   });
   direct.forEach((u) => ids.add(u.id));
+
+  const secondDirect = await prisma.user.findMany({
+    where: { secondLineManagerId: managerUserId, isActive: true },
+    select: { id: true },
+  });
+  secondDirect.forEach((u) => ids.add(u.id));
 
   const managedDepts = await prisma.department.findMany({
     where: { managerId: managerUserId },
@@ -120,9 +162,7 @@ async function getManagedEmployeeIdsForLeaveManager(managerUserId: string): Prom
 }
 
 async function employeeIsManagedByLineManager(employeeUserId: string, managerUserId: string): Promise<boolean> {
-  if (employeeUserId === managerUserId) return false;
-  const managed = await getManagedEmployeeIdsForLeaveManager(managerUserId);
-  return managed.includes(employeeUserId);
+  return employeeHasLineManager(employeeUserId, managerUserId);
 }
 
 /**
@@ -286,9 +326,18 @@ export const createLeave = async (req: AuthRequest, res: Response): Promise<void
         break;
     }
 
-    const lineManagerId = await resolveLineManagerUserId(userId);
+    const { primaryId: lineManagerId, secondaryId: secondLineManagerId } = await resolveLineManagers(userId);
     const needsManagerApproval =
       leaveTypeRequiresManagerFirst(type as LeaveType) && !!lineManagerId;
+    const needsSecondManager =
+      needsManagerApproval && !!secondLineManagerId && secondLineManagerId !== lineManagerId;
+    const isAnnualEnterprise = usesAnnualEnterpriseWorkflow(type as LeaveType);
+
+    const initialWorkflowStage: LeaveWorkflowStage | null = isAnnualEnterprise
+      ? needsManagerApproval
+        ? 'PENDING_LINE_MANAGER'
+        : 'PENDING_HR_REVIEW'
+      : null;
 
     const leave = await prisma.leave.create({
       data: {
@@ -305,9 +354,33 @@ export const createLeave = async (req: AuthRequest, res: Response): Promise<void
         managerApprovalStatus: needsManagerApproval
           ? LeaveManagerApprovalStatus.PENDING
           : LeaveManagerApprovalStatus.NOT_REQUIRED,
+        secondManagerApprovalStatus: needsSecondManager
+          ? LeaveManagerApprovalStatus.PENDING
+          : LeaveManagerApprovalStatus.NOT_REQUIRED,
+        workflowStage: initialWorkflowStage,
+        assignedLineManagerId: needsManagerApproval ? lineManagerId : null,
+        assignedSecondLineManagerId: needsSecondManager ? secondLineManagerId : null,
       },
       include: leaveIncludeStandard,
     });
+
+    if (isAnnualEnterprise && initialWorkflowStage) {
+      await appendWorkflowLog({
+        leaveId: leave.id,
+        actorId: userId,
+        action: 'EMPLOYEE_SUBMIT',
+        previousStage: 'DRAFT',
+        newStage: initialWorkflowStage,
+        comment: String(reason).trim(),
+      });
+      await notifyLeaveWorkflow({
+        leaveId: leave.id,
+        event: 'submitted',
+        employeeUserId: userId,
+        lineManagerId,
+        secondLineManagerId: needsSecondManager ? secondLineManagerId : null,
+      });
+    }
 
     res.status(201).json({
       success: true,
@@ -405,7 +478,7 @@ export const listLeaves = async (req: AuthRequest, res: Response): Promise<void>
 };
 
 /**
- * Line managers: list leave requests for their team (explicit managerId + department/position hierarchy).
+ * Line managers + finance officers: team leaves, assigned line-manager queue, finance clearance queue.
  */
 export const listTeamLeaves = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -415,8 +488,20 @@ export const listTeamLeaves = async (req: AuthRequest, res: Response): Promise<v
       res.status(401).json({ success: false, message: 'Unauthorized' });
       return;
     }
-    if (!isManagerLeaveRole(role)) {
-      res.status(403).json({ success: false, message: 'Only line managers can view team leave requests' });
+
+    const isFinanceOfficer = await isFinanceClearanceUser(userId);
+    const isManager = isManagerLeaveRole(role);
+    const managedIds = isManager ? await getManagedEmployeeIdsForLeaveManager(userId) : [];
+
+    const assignedAsLineManagerCount = await prisma.leave.count({
+      where: {
+        OR: [{ assignedLineManagerId: userId }, { assignedSecondLineManagerId: userId }],
+        status: 'PENDING',
+      },
+    });
+
+    if (!isManager && !isFinanceOfficer && assignedAsLineManagerCount === 0) {
+      res.status(403).json({ success: false, message: 'You do not have a team or finance leave queue' });
       return;
     }
 
@@ -425,76 +510,102 @@ export const listTeamLeaves = async (req: AuthRequest, res: Response): Promise<v
     const limitNum = Math.min(parseInt(limit as string, 10) || 50, 100);
     const skip = (pageNum - 1) * limitNum;
 
-    const managedIds = await getManagedEmployeeIdsForLeaveManager(userId);
-    if (managedIds.length === 0) {
+    const orConditions: Record<string, unknown>[] = [];
+
+    if (managedIds.length > 0) {
+      let teamUserIds = managedIds;
+      if (search && String(search).trim()) {
+        const term = String(search).trim();
+        const matched = await prisma.user.findMany({
+          where: {
+            id: { in: managedIds },
+            OR: [
+              { firstName: { contains: term, mode: 'insensitive' } },
+              { lastName: { contains: term, mode: 'insensitive' } },
+              { email: { contains: term, mode: 'insensitive' } },
+            ],
+          },
+          select: { id: true },
+        });
+        teamUserIds = matched.map((u) => u.id);
+      }
+      if (teamUserIds.length > 0) {
+        orConditions.push({ userId: { in: teamUserIds } });
+      }
+    }
+
+    orConditions.push({
+      OR: [
+        { assignedLineManagerId: userId },
+        { assignedSecondLineManagerId: userId },
+      ],
+      workflowStage: {
+        in: ['PENDING_LINE_MANAGER', 'PENDING_PROJECT_CONFIRMATION'] as LeaveWorkflowStage[],
+      },
+    });
+
+    if (isFinanceOfficer) {
+      const financeHistoryFilter: Record<string, unknown> = {
+        type: 'ANNUAL',
+        workflowStage: { not: null },
+      };
+      if (search && String(search).trim()) {
+        const term = String(search).trim();
+        const users = await prisma.user.findMany({
+          where: {
+            OR: [
+              { firstName: { contains: term, mode: 'insensitive' } },
+              { lastName: { contains: term, mode: 'insensitive' } },
+              { email: { contains: term, mode: 'insensitive' } },
+            ],
+          },
+          select: { id: true },
+        });
+        const userIds = users.map((u) => u.id);
+        if (userIds.length > 0) {
+          financeHistoryFilter.userId = { in: userIds };
+          orConditions.push(financeHistoryFilter);
+        }
+      } else {
+        orConditions.push(financeHistoryFilter);
+      }
+    }
+
+    if (orConditions.length === 0) {
       res.json({
         success: true,
         data: [],
-        pagination: {
-          page: pageNum,
-          limit: limitNum,
-          total: 0,
-          totalPages: 0,
-        },
+        meta: { isFinanceOfficer, isLineManager: isManager, managedTeamCount: managedIds.length },
+        pagination: { page: pageNum, limit: limitNum, total: 0, totalPages: 0 },
       });
       return;
     }
 
-    let filterUserIds = managedIds;
-    if (search && String(search).trim()) {
-      const term = String(search).trim();
-      const matched = await prisma.user.findMany({
-        where: {
-          id: { in: managedIds },
-          OR: [
-            { firstName: { contains: term, mode: 'insensitive' } },
-            { lastName: { contains: term, mode: 'insensitive' } },
-            { email: { contains: term, mode: 'insensitive' } },
-          ],
-        },
-        select: { id: true },
-      });
-      filterUserIds = matched.map((u) => u.id);
-      if (filterUserIds.length === 0) {
-        res.json({
-          success: true,
-          data: [],
-          pagination: {
-            page: pageNum,
-            limit: limitNum,
-            total: 0,
-            totalPages: 0,
-          },
-        });
-        return;
-      }
-    }
-
-    const where: Record<string, unknown> = {
-      userId: { in: filterUserIds },
-    };
+    const andParts: Record<string, unknown>[] = [{ OR: orConditions }];
 
     if (status && status !== 'all') {
-      where.status = status as LeaveStatus;
+      andParts.push({ status: status as LeaveStatus });
     }
     if (type && type !== 'all') {
-      where.type = type as LeaveType;
+      andParts.push({ type: type as LeaveType });
     }
     if (dateFrom) {
       const from = new Date(dateFrom as string);
-      if (!isNaN(from.getTime())) where.startDate = { gte: from };
+      if (!isNaN(from.getTime())) andParts.push({ startDate: { gte: from } });
     }
     if (dateTo) {
       const to = new Date(dateTo as string);
-      if (!isNaN(to.getTime())) where.endDate = { lte: to };
+      if (!isNaN(to.getTime())) andParts.push({ endDate: { lte: to } });
     }
+
+    const where = andParts.length === 1 ? andParts[0] : { AND: andParts };
 
     const [leaves, total] = await Promise.all([
       prisma.leave.findMany({
         where,
         skip,
         take: limitNum,
-        orderBy: { createdAt: 'desc' },
+        orderBy: { updatedAt: 'desc' },
         include: leaveIncludeStandard,
       }),
       prisma.leave.count({ where }),
@@ -503,6 +614,11 @@ export const listTeamLeaves = async (req: AuthRequest, res: Response): Promise<v
     res.json({
       success: true,
       data: leaves,
+      meta: {
+        isFinanceOfficer,
+        isLineManager: isManager,
+        managedTeamCount: managedIds.length,
+      },
       pagination: {
         page: pageNum,
         limit: limitNum,
@@ -528,20 +644,26 @@ export const managerApproveLeave = async (req: AuthRequest, res: Response): Prom
       res.status(401).json({ success: false, message: 'Unauthorized' });
       return;
     }
-    if (!isManagerLeaveRole(role)) {
-      res.status(403).json({ success: false, message: 'Only line managers can approve at this step' });
-      return;
-    }
 
     const leave = await prisma.leave.findUnique({
       where: { id },
-      include: { user: { select: { managerId: true, firstName: true, lastName: true } } },
+      include: { user: { select: { managerId: true, secondLineManagerId: true, firstName: true, lastName: true } } },
     });
     if (!leave) {
       res.status(404).json({ success: false, message: 'Leave request not found' });
       return;
     }
-    const canAct = await employeeIsManagedByLineManager(leave.userId, userId);
+
+    const isPrimary = leave.assignedLineManagerId === userId;
+    const isSecondary = leave.assignedSecondLineManagerId === userId;
+    const canAct =
+      isPrimary ||
+      isSecondary ||
+      (await employeeIsManagedByLineManager(leave.userId, userId));
+    if (!canAct && !isManagerLeaveRole(role)) {
+      res.status(403).json({ success: false, message: 'Only line managers can approve at this step' });
+      return;
+    }
     if (!canAct) {
       res.status(403).json({ success: false, message: 'You can only act on your direct reports leave' });
       return;
@@ -558,33 +680,117 @@ export const managerApproveLeave = async (req: AuthRequest, res: Response): Prom
       return;
     }
 
-    const resolvedManager = await resolveLineManagerUserId(leave.userId);
-    const repairMisrouted =
-      leave.managerApprovalStatus === LeaveManagerApprovalStatus.NOT_REQUIRED &&
-      resolvedManager === userId;
-    if (leave.managerApprovalStatus === LeaveManagerApprovalStatus.PENDING) {
-      // ok
-    } else if (repairMisrouted) {
-      // Annual/unpaid that skipped manager routing (e.g. before hierarchy fix): allow line manager to forward to HR
-    } else {
-      res.status(400).json({ success: false, message: 'No pending manager approval for this request' });
+    const isAnnualEnterprise = usesAnnualEnterpriseWorkflow(leave.type);
+    if (isAnnualEnterprise && leave.workflowStage && leave.workflowStage !== 'PENDING_LINE_MANAGER') {
+      res.status(400).json({ success: false, message: 'Leave is not awaiting line manager approval' });
       return;
+    }
+
+    const actingAsSecondary =
+      isSecondary ||
+      (leave.assignedSecondLineManagerId === userId && leave.managerApprovalStatus === 'APPROVED');
+    const actingAsPrimary = isPrimary && leave.managerApprovalStatus === 'PENDING';
+
+    if (actingAsSecondary) {
+      if (leave.managerApprovalStatus !== 'APPROVED') {
+        res.status(400).json({
+          success: false,
+          message: 'Primary line manager must approve before the second line manager',
+        });
+        return;
+      }
+      if (leave.secondManagerApprovalStatus !== 'PENDING') {
+        res.status(400).json({ success: false, message: 'No pending second line manager approval' });
+        return;
+      }
+    } else if (actingAsPrimary) {
+      if (leave.managerApprovalStatus !== 'PENDING') {
+        res.status(400).json({ success: false, message: 'Primary line manager already acted on this request' });
+        return;
+      }
+    } else {
+      const resolved = await resolveLineManagers(leave.userId);
+      const repairMisrouted =
+        leave.managerApprovalStatus === LeaveManagerApprovalStatus.NOT_REQUIRED &&
+        (resolved.primaryId === userId || resolved.secondaryId === userId);
+      if (!repairMisrouted) {
+        res.status(400).json({ success: false, message: 'No pending manager approval for this request' });
+        return;
+      }
+    }
+
+    const updateData: Record<string, unknown> = {};
+    if (actingAsSecondary) {
+      updateData.secondManagerApprovalStatus = LeaveManagerApprovalStatus.APPROVED;
+      updateData.secondManagerActionById = userId;
+      updateData.secondManagerActionAt = new Date();
+      updateData.secondManagerRejectionReason = null;
+    } else {
+      updateData.managerApprovalStatus = LeaveManagerApprovalStatus.APPROVED;
+      updateData.managerActionById = userId;
+      updateData.managerActionAt = new Date();
+      updateData.managerRejectionReason = null;
+    }
+
+    const afterPrimaryApproved =
+      actingAsPrimary || leave.managerApprovalStatus === 'APPROVED' || updateData.managerApprovalStatus === 'APPROVED';
+    const afterSecondApproved =
+      actingAsSecondary ||
+      !requiresSecondManagerApproval(leave) ||
+      leave.secondManagerApprovalStatus === 'APPROVED' ||
+      updateData.secondManagerApprovalStatus === 'APPROVED';
+
+    const forwardToHr = afterPrimaryApproved && afterSecondApproved;
+
+    if (isAnnualEnterprise && forwardToHr) {
+      updateData.workflowStage = 'PENDING_HR_REVIEW';
     }
 
     const updated = await prisma.leave.update({
       where: { id },
-      data: {
-        managerApprovalStatus: LeaveManagerApprovalStatus.APPROVED,
-        managerActionById: userId,
-        managerActionAt: new Date(),
-        managerRejectionReason: null,
-      },
+      data: updateData,
       include: leaveIncludeStandard,
     });
 
+    if (isAnnualEnterprise) {
+      if (forwardToHr) {
+        await appendWorkflowLog({
+          leaveId: id,
+          actorId: userId,
+          action: actingAsSecondary ? 'SECOND_MANAGER_APPROVE' : 'MANAGER_APPROVE',
+          previousStage: 'PENDING_LINE_MANAGER',
+          newStage: 'PENDING_HR_REVIEW',
+        });
+        await notifyLeaveWorkflow({
+          leaveId: id,
+          event: 'manager_approved',
+          employeeUserId: leave.userId,
+          lineManagerId: userId,
+        });
+      } else {
+        await appendWorkflowLog({
+          leaveId: id,
+          actorId: userId,
+          action: 'PRIMARY_MANAGER_APPROVE',
+          previousStage: 'PENDING_LINE_MANAGER',
+          newStage: 'PENDING_LINE_MANAGER',
+          comment: 'Awaiting second line manager approval',
+        });
+        await notifyLeaveWorkflow({
+          leaveId: id,
+          event: 'second_manager_approval_needed',
+          employeeUserId: leave.userId,
+          lineManagerId: leave.assignedLineManagerId,
+          secondLineManagerId: leave.assignedSecondLineManagerId,
+        });
+      }
+    }
+
     res.json({
       success: true,
-      message: 'Leave approved and forwarded to HR',
+      message: forwardToHr
+        ? 'Leave approved and forwarded to HR'
+        : 'Approved — awaiting second line manager approval',
       data: updated,
     });
   } catch (error) {
@@ -606,8 +812,21 @@ export const managerRejectLeave = async (req: AuthRequest, res: Response): Promi
       res.status(401).json({ success: false, message: 'Unauthorized' });
       return;
     }
-    if (!isManagerLeaveRole(role)) {
-      res.status(403).json({ success: false, message: 'Only line managers can reject at this step' });
+    const leave = await prisma.leave.findUnique({
+      where: { id },
+      include: { user: { select: { managerId: true } } },
+    });
+    if (!leave) {
+      res.status(404).json({ success: false, message: 'Leave request not found' });
+      return;
+    }
+
+    const canReject =
+      leave.assignedLineManagerId === userId ||
+      leave.assignedSecondLineManagerId === userId ||
+      (await employeeIsManagedByLineManager(leave.userId, userId));
+    if (!canReject) {
+      res.status(403).json({ success: false, message: 'You can only act on your direct reports leave' });
       return;
     }
 
@@ -617,19 +836,6 @@ export const managerRejectLeave = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    const leave = await prisma.leave.findUnique({
-      where: { id },
-      include: { user: { select: { managerId: true } } },
-    });
-    if (!leave) {
-      res.status(404).json({ success: false, message: 'Leave request not found' });
-      return;
-    }
-    const canReject = await employeeIsManagedByLineManager(leave.userId, userId);
-    if (!canReject) {
-      res.status(403).json({ success: false, message: 'You can only act on your direct reports leave' });
-      return;
-    }
     if (!leaveTypeRequiresManagerFirst(leave.type)) {
       res.status(400).json({
         success: false,
@@ -642,11 +848,15 @@ export const managerRejectLeave = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    const resolvedManager = await resolveLineManagerUserId(leave.userId);
+    const isPrimaryPending = leave.managerApprovalStatus === LeaveManagerApprovalStatus.PENDING;
+    const isSecondaryPending =
+      leave.secondManagerApprovalStatus === LeaveManagerApprovalStatus.PENDING &&
+      leave.managerApprovalStatus === LeaveManagerApprovalStatus.APPROVED;
+    const resolved = await resolveLineManagers(leave.userId);
     const repairMisrouted =
       leave.managerApprovalStatus === LeaveManagerApprovalStatus.NOT_REQUIRED &&
-      resolvedManager === userId;
-    if (leave.managerApprovalStatus === LeaveManagerApprovalStatus.PENDING) {
+      (resolved.primaryId === userId || resolved.secondaryId === userId);
+    if (isPrimaryPending || isSecondaryPending) {
       // ok
     } else if (repairMisrouted) {
       // same as approve repair path
@@ -655,22 +865,48 @@ export const managerRejectLeave = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
+    const isAnnualEnterprise = usesAnnualEnterpriseWorkflow(leave.type);
+
     const updated = await prisma.leave.update({
       where: { id },
       data: {
         status: 'REJECTED',
         managerApprovalStatus: LeaveManagerApprovalStatus.REJECTED,
+        secondManagerApprovalStatus:
+          leave.secondManagerApprovalStatus === LeaveManagerApprovalStatus.PENDING
+            ? LeaveManagerApprovalStatus.REJECTED
+            : leave.secondManagerApprovalStatus,
         managerActionById: userId,
         managerActionAt: new Date(),
         managerRejectionReason: trimmed,
+        secondManagerRejectionReason:
+          leave.assignedSecondLineManagerId === userId ? trimmed : leave.secondManagerRejectionReason,
         rejectedById: userId,
         rejectedAt: new Date(),
         rejectionReason: trimmed,
         approvedById: null,
         approvedAt: null,
+        ...(isAnnualEnterprise ? { workflowStage: 'REJECTED_BY_MANAGER' as LeaveWorkflowStage } : {}),
       },
       include: leaveIncludeStandard,
     });
+
+    if (isAnnualEnterprise) {
+      await appendWorkflowLog({
+        leaveId: id,
+        actorId: userId,
+        action: 'MANAGER_REJECT',
+        previousStage: 'PENDING_LINE_MANAGER',
+        newStage: 'REJECTED_BY_MANAGER',
+        comment: trimmed,
+      });
+      await notifyLeaveWorkflow({
+        leaveId: id,
+        event: 'manager_rejected',
+        employeeUserId: leave.userId,
+        lineManagerId: userId,
+      });
+    }
 
     res.json({
       success: true,
@@ -782,7 +1018,18 @@ export const getLeaveById = async (req: AuthRequest, res: Response): Promise<voi
 
     const isTeamMember =
       isManagerLeaveRole(role) && (await employeeIsManagedByLineManager(leave.userId, userId));
-    const canSee = leave.userId === userId || isHrLeaveRole(role) || isTeamMember;
+    const isAssignedLineManager =
+      leave.assignedLineManagerId === userId || leave.assignedSecondLineManagerId === userId;
+    const isFinanceOfficer = await isFinanceClearanceUser(userId);
+    const isFinanceHistoryLeave =
+      leave.type === 'ANNUAL' && leave.workflowStage != null;
+    const canSee =
+      leave.userId === userId ||
+      isHrLeaveRole(role) ||
+      isTeamMember ||
+      isAssignedLineManager ||
+      (isFinanceOfficer && isFinanceHistoryLeave) ||
+      leave.financeActionById === userId;
     if (!canSee) {
       res.status(403).json({ success: false, message: 'Forbidden' });
       return;
@@ -823,10 +1070,38 @@ export const approveLeave = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
-    if (leave.managerApprovalStatus === 'PENDING') {
+    if (managersApprovalStillPending(leave)) {
       res.status(400).json({
         success: false,
         message: 'This request is still awaiting line manager approval',
+      });
+      return;
+    }
+
+    // Annual enterprise workflow: route to dedicated final approval endpoint
+    if (usesAnnualEnterpriseWorkflow(leave.type) && leave.workflowStage) {
+      if (leave.workflowStage === 'PENDING_HR_FINAL' || leave.workflowStage === 'FINANCE_CLEARED') {
+        res.status(400).json({
+          success: false,
+          message: 'Use POST /leaves/:id/hr-final-approve for final HR approval on annual leave',
+        });
+        return;
+      }
+      if (
+        leave.workflowStage !== 'PENDING_HR_REVIEW' &&
+        leave.workflowStage !== 'PROJECT_CONFLICT_REPORTED' &&
+        leave.workflowStage !== 'FINANCE_ISSUE_FOUND' &&
+        leave.workflowStage !== 'ON_HOLD'
+      ) {
+        res.status(400).json({
+          success: false,
+          message: `Annual leave is at stage "${leave.workflowStage}". Complete project confirmation and finance clearance first.`,
+        });
+        return;
+      }
+      res.status(400).json({
+        success: false,
+        message: 'Annual leave requires project confirmation and finance clearance before final approval. Use workflow endpoints.',
       });
       return;
     }
@@ -897,7 +1172,7 @@ export const rejectLeave = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    if (leave.managerApprovalStatus === 'PENDING') {
+    if (managersApprovalStillPending(leave)) {
       res.status(400).json({
         success: false,
         message: 'This request is still awaiting line manager approval',

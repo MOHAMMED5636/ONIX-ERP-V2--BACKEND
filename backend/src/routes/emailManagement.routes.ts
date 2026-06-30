@@ -11,11 +11,15 @@ import {
   deleteEmailTrigger,
   listEmailLogs,
   listEmailQueue,
+  listEmailCatalog,
   retryQueueItem,
 } from '../controllers/emailManagement.controller';
 
 const router = Router();
 router.use(authenticate);
+
+// Automation catalog (spec + wiring status)
+router.get('/catalog', listEmailCatalog);
 
 // Templates
 router.get('/templates', listEmailTemplates);

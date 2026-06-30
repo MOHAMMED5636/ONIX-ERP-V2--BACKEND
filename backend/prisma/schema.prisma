@@ -23,13 +23,20 @@ model User {
   position            String?
   jobTitle            String? // Job title/designation (e.g., "Senior Engineer", "Project Manager")
   photo               String? // Photo URL or file path
+  faceDescriptor      Json?   // Cached face embedding for attendance verification
   employeeId          String?  @unique // Employee ID/Number
+  /// Gamification: cumulative XP from completed weighted tasks
+  totalXp             Int      @default(0)
+  /// Stars earned (1 star per 100 XP); kept in sync on task completion
+  starCount           Int      @default(0)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
   createdBy           String? // ID of admin who created this user
 
   // Employee Directory - Personal Info
   employeeType String? // Employee type (Full-time, Part-time, Contract, etc.)
+  /// Smart site attendance: OFFICE (office geofence), SITE (PM/supervisor self), LABOR (supervisor punches only)
+  attendanceCategory AttendanceCategory @default(OFFICE)
   status       String? // Employee status (Active, Inactive, Pending, etc.)
   userAccount  Boolean @default(false) // Whether user account should be created
 
@@ -51,6 +58,9 @@ model User {
   managerId         String? // Line manager ID (references User)
   manager           User?     @relation("LineManager", fields: [managerId], references: [id])
   managedEmployees  User[]    @relation("LineManager") // Employees managed by this user
+  secondLineManagerId String? // Second sub-department line manager when employee spans two sub-depts
+  secondLineManager   User?   @relation("SecondLineManager", fields: [secondLineManagerId], references: [id])
+  secondLineManagedEmployees User[] @relation("SecondLineManager")
   attendanceProgram String? // Attendance program name
   joiningDate       DateTime? // Date of joining
   exitDate          DateTime? // Date of exit/termination
@@ -83,6 +93,9 @@ model User {
   labourIdExpiryDate DateTime?
   labourIdAttachment String? // File path/URL for labour ID document
 
+  educationalQualification  String? @db.Text // Degrees, certifications, institutions
+  curriculumVitaeAttachment String? // CV / resume document file path
+
   remarks String? @db.Text // Additional remarks/notes
 
   // Relations
@@ -112,17 +125,36 @@ model User {
 
   // Chat Relations
   sentMessages ProjectMessage[] @relation("MessageSender")
+  deletedProjectMessages ProjectMessage[] @relation("MessageDeletedBy")
+  hiddenProjectMessages ProjectMessageHide[]
+  projectMessageReads ProjectMessageRead[] @relation("ProjectMessageReads")
+  projectChatParticipants ProjectChatParticipant[] @relation("ProjectChatParticipantUser")
+  projectChatParticipantsAdded ProjectChatParticipant[] @relation("ProjectChatParticipantAddedBy")
+  teamChatParticipants TeamChatParticipant[]
+  teamChatSentMessages TeamChatMessage[] @relation("TeamChatSender")
+  deletedTeamChatMessages TeamChatMessage[] @relation("TeamChatMessageDeletedBy")
+  hiddenTeamChatMessages TeamChatMessageHide[]
 
   // Contract Relations
   createdContracts  Contract[] @relation("ContractCreator")
   approvedContracts Contract[] @relation("ContractApprover")
   assignedContracts Contract[] @relation("AssignedContractManager")
 
+  projectManagerTransfersOut     ProjectManagerTransfer[] @relation("PmTransferOld")
+  projectManagerTransfersIn      ProjectManagerTransfer[] @relation("PmTransferNew")
+  projectManagerTransfersCreated ProjectManagerTransfer[] @relation("PmTransferBy")
+  projectTaskFocusSelections     UserProjectTaskFocus[]
+  pmAssignmentNotices            ProjectPmAssignmentNotice[]
+
   // Dashboard preferences
   dashboardWidgetPreference DashboardWidgetPreference?
 
   // Attendance Relations
   attendances Attendance[] @relation("UserAttendances")
+  projectAttendanceLogsAsEmployee   ProjectAttendanceLog[] @relation("ProjectAttendanceEmployee")
+  projectAttendanceLogsAsSupervisor ProjectAttendanceLog[] @relation("ProjectAttendanceSupervisor")
+  engineeringDailyReports EngineeringDailyReport[] @relation("UserEngineeringDailyReports")
+  checkoutSessions        CheckoutSession[] @relation("UserCheckoutSessions")
 
   // Leave balance (annual leave days per year; used for balance tracking)
   annualLeaveBalance Int? @default(25)
@@ -132,6 +164,22 @@ model User {
   approvedLeaves          Leave[] @relation("LeaveApprover")
   rejectedLeaves          Leave[] @relation("LeaveRejector")
   leaveManagerActions     Leave[] @relation("LeaveManagerAction")
+  leaveAssignedAsLineManager Leave[] @relation("LeaveAssignedLineManager")
+  leaveAssignedAsSecondLineManager Leave[] @relation("LeaveAssignedSecondLineManager")
+  leaveSecondManagerActions Leave[] @relation("LeaveSecondManagerAction")
+  leaveProjectConfirmations Leave[] @relation("LeaveProjectConfirmedBy")
+  leaveFinanceActions     Leave[] @relation("LeaveFinanceActionBy")
+  leaveWorkflowLogEntries LeaveWorkflowLog[] @relation("LeaveWorkflowLogActor")
+
+  // Resignation workflow
+  resignationRequests           ResignationRequest[] @relation("ResignationRequester")
+  resignationAssignedAsPm       ResignationRequest[] @relation("ResignationAssignedPM")
+  resignationPmActions            ResignationRequest[] @relation("ResignationPmAction")
+  resignationGmActions            ResignationRequest[] @relation("ResignationGmAction")
+  resignationHrReviewActions      ResignationRequest[] @relation("ResignationHrReview")
+  resignationFinanceActions       ResignationRequest[] @relation("ResignationFinanceAction")
+  resignationHrFinalActions       ResignationRequest[] @relation("ResignationHrFinal")
+  resignationWorkflowLogEntries   ResignationWorkflowLog[] @relation("ResignationWorkflowLogActor")
 
   // Labour employee flag - when true, LabourDetails record exists
   isLabour         Boolean  @default(false)
@@ -139,12 +187,20 @@ model User {
 
   companyPoliciesCreated           CompanyPolicy[]                 @relation("CompanyPolicyCreator")
   companyPolicyAcknowledgements    CompanyPolicyAcknowledgement[]
+  companyPolicyAssignments         CompanyPolicyAssignment[]
+  companyPolicyAuditLogsAsSubject  CompanyPolicyAuditLog[]         @relation("CompanyPolicyAuditSubject")
+  companyPolicyAuditLogsAsActor    CompanyPolicyAuditLog[]         @relation("CompanyPolicyAuditActor")
 
   activityLogs UserActivityLog[]
+
+  browserPushSubscriptions BrowserPushSubscription[]
+  documentExpiryNotificationLogs DocumentExpiryNotificationLog[]
 
   // Salary relations
   salaryStructures SalaryStructure[]
   salaryAuditLogs SalaryAuditLog[] @relation("SalaryAuditor")
+  salaryMonthlyLines SalaryMonthlyLine[]
+  salaryPayslipRequests SalaryPayslipRequest[]
 
   // Payroll relations
   payrollLines PayrollLine[] @relation("PayrollEmployee")
@@ -161,6 +217,35 @@ model User {
   /// System feedback tickets (visible to Admin only).
   systemFeedbacksSubmitted SystemFeedback[] @relation("SystemFeedbackSubmitter")
   systemFeedbacksReviewed  SystemFeedback[] @relation("SystemFeedbackReviewer")
+
+  companyAttachmentsUploaded CompanyAttachment[] @relation("CompanyAttachmentUploader")
+
+  /// Admin/HR: explicit multi-company access grants (Super Admin manages assignments).
+  companyAccessGrants UserCompanyAccess[] @relation("UserCompanyAccessUser")
+  companyAccessGranted UserCompanyAccess[] @relation("UserCompanyAccessGranter")
+
+  projectActivityLogs ProjectActivityLog[] @relation("ProjectActivityActor")
+  projectDeletionOtpRequests ProjectDeletionOtpRequest[] @relation("ProjectDeletionRequester")
+  projectDeletionApprovals   ProjectDeletionOtpRequest[] @relation("ProjectDeletionApprover")
+  projectDeletionRejections  ProjectDeletionOtpRequest[] @relation("ProjectDeletionRejecter")
+
+  // Enterprise Asset Management
+  assignedAssets              Asset[]              @relation("AssetCustodian")
+  assetLogsPerformed          AssetLog[]           @relation("AssetLogPerformer")
+  maintenanceTicketsReported  MaintenanceTicket[]  @relation("MaintenanceReporter")
+  maintenanceTicketsAssigned  MaintenanceTicket[]  @relation("MaintenanceTechnician")
+  goodsReceiptsReceived       GoodsReceiptNote[]   @relation("GrnReceiver")
+  purchaseOrdersCreated       PurchaseOrder[]      @relation("PoCreator")
+  purchaseRequisitionsCreated PurchaseRequisition[] @relation("PrCreator")
+
+  assetRequestsSubmitted      AssetRequest[]              @relation("AssetRequestEmployee")
+  assetRequestsAsPm           AssetRequest[]              @relation("AssetRequestPm")
+  assetRequestApprovals       AssetRequestApproval[]      @relation("AssetRequestApprover")
+  assetRequestAssignments     AssetRequestAssignment[]    @relation("AssetAssignmentEmployee")
+  assetReturnsAsCustodian     AssetReturn[]               @relation("AssetReturnCustodian")
+  assetReturnsProcessed       AssetReturn[]               @relation("AssetReturnProcessor")
+  assetRequestAuditLogs       AssetRequestAuditLog[]      @relation("AssetRequestAuditActor")
+  assetClearanceRecords       AssetClearanceRecord[]      @relation("AssetClearanceEmployee")
 
   @@map("users")
 }
@@ -250,6 +335,8 @@ model LabourDetails {
   molNumber                   String?
   contractTotalSalary         Decimal?  @db.Decimal(12, 2)
   basicSalary                 Decimal?  @db.Decimal(12, 2)
+  /// Hourly rate for field labor cost (AED/hour). Used by project site attendance punch-out.
+  hourlyRate                  Decimal?  @db.Decimal(10, 2)
   allowance1                  Decimal?  @db.Decimal(12, 2)
   allowance2                  Decimal?  @db.Decimal(12, 2)
   healthInsuranceExpiryDate   DateTime?
@@ -276,6 +363,7 @@ enum SalaryAllowanceType {
   HRA
   TRAVEL
   BONUS
+  MOBILE_CONNECTIVITY
   OTHER
 }
 
@@ -413,6 +501,65 @@ model SalaryAuditLog {
 
   @@index([createdAt])
   @@map("salary_audit_logs")
+}
+
+/// HR monthly salary worksheet — manual OT, adjustments, and paid amount per employee/month.
+model SalaryMonthlyLine {
+  id              String   @id @default(uuid())
+  year            Int
+  month           Int
+  employeeId      String
+  employee        User     @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  normalOtHours   Decimal? @db.Decimal(10, 2)
+  specialOtHours  Decimal? @db.Decimal(10, 2)
+  totalSalary     Decimal? @db.Decimal(12, 2)
+  realWorkingDays Int?
+  unexcusedAbsenceDays Int?
+  lateHours       Decimal? @db.Decimal(10, 2)
+  otherDeductions Decimal? @db.Decimal(12, 2)
+  adjustments     Decimal? @db.Decimal(12, 2)
+  otherExpenses   Decimal? @db.Decimal(12, 2)
+  paidSalary      Decimal? @db.Decimal(12, 2)
+  adminComments   String?  @db.Text
+  hrComments      String?  @db.Text
+  worksheetData   Json?
+  notes           String?  @db.Text
+  publishedAt     DateTime?
+  publishedById   String?
+  updatedById     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([year, month, employeeId])
+  @@index([year, month])
+  @@map("salary_monthly_lines")
+}
+
+enum SalaryPayslipRequestStatus {
+  OPEN
+  RESOLVED
+  REJECTED
+}
+
+/// Employee dispute / correction request on a published monthly payslip.
+model SalaryPayslipRequest {
+  id            String                     @id @default(uuid())
+  year          Int
+  month         Int
+  employeeId    String
+  employee      User                       @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  message       String                     @db.Text
+  status        SalaryPayslipRequestStatus @default(OPEN)
+  hrResponse    String?                    @db.Text
+  respondedById String?
+  respondedAt   DateTime?
+  createdAt     DateTime                   @default(now())
+  updatedAt     DateTime                   @updatedAt
+
+  @@index([year, month])
+  @@index([employeeId])
+  @@index([status])
+  @@map("salary_payslip_requests")
 }
 
 // ============================================================
@@ -574,6 +721,7 @@ model PayrollAuditLog {
 }
 
 enum UserRole {
+  SUPER_ADMIN
   ADMIN
   TENDER_ENGINEER
   PROJECT_MANAGER
@@ -581,6 +729,21 @@ enum UserRole {
   EMPLOYEE
   HR
   MANAGER
+  ACCOUNTANT
+}
+
+/// DB-driven abilities per role (managed via Role Builder).
+model RoleAbility {
+  id        String   @id @default(uuid())
+  role      UserRole
+  ability   String
+  enabled   Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([role, ability])
+  @@index([role])
+  @@map("role_abilities")
 }
 
 model Client {
@@ -598,6 +761,15 @@ model Client {
   idExpiryDate    DateTime? // ID expiry date
   passportNumber  String?
   birthDate       DateTime?
+
+  // Client company info (when isCorporate === "Company")
+  corporateName      String?
+  website            String?
+  licenseNumber      String?
+  corporateAddress   String? @db.Text
+  companyDescription String? @db.Text
+  trnNumber          String?
+  ibanNumber         String?
 
   // Client representative (optional)
   representativeName        String?
@@ -634,6 +806,10 @@ model Client {
   undertakingLetterPath String?
   undertakingLetterOriginalName String?
 
+  // Branch (Dubai / Abu Dhabi / Syria) this client belongs to
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -642,6 +818,7 @@ model Client {
   tenders   Tender[]
   contracts Contract[]
 
+  @@index([companyId])
   @@map("clients")
 }
 
@@ -680,9 +857,15 @@ model Project {
   projectType      String? // Project type (e.g., "Residential", "Commercial", "Industrial")
   projectFloor     String? // Number of floors (stored as string for flexibility)
   developerProject String? // Developer name/project
+
+  /// GPS center for site geofencing (smart attendance)
+  siteLatitude     Float?
+  siteLongitude    Float?
+  geofenceRadiusM  Float?        @default(100)
   
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
+  deletedAt        DateTime?
 
   // Relations
   createdBy         String?
@@ -694,20 +877,126 @@ model Project {
   checklists        ProjectChecklist[]
   attachments       ProjectAttachment[]
   chats             ProjectChat[]
+  chatParticipants  ProjectChatParticipant[]
   contracts         Contract[]
   questionnaireQuestions QuestionnaireQuestion[]
   questionnaireAssignments QuestionnaireAssignment[]
+  activityLogs      ProjectActivityLog[]
+  deletionOtpRequests ProjectDeletionOtpRequest[]
+  assetRequests     AssetRequest[]
+  projectManagerTransfers ProjectManagerTransfer[]
+  taskFocusSelections     UserProjectTaskFocus[]
+  projectAttendanceLogs   ProjectAttendanceLog[]
+  pmAssignmentNotices     ProjectPmAssignmentNotice[]
 
   @@map("projects")
+}
+
+/// Internal ERP workflow for PM/Manager project deletion (no email).
+/// Status: PENDING_APPROVAL | OTP_GENERATED | OTP_VERIFIED | DELETED | REJECTED | EXPIRED | LOCKED
+model ProjectDeletionOtpRequest {
+  id             String    @id @default(uuid())
+  projectId      String
+  project        Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectName    String    @db.VarChar(255)
+  projectRef     String?   @db.VarChar(64)
+  requestedById  String
+  requestedBy    User      @relation("ProjectDeletionRequester", fields: [requestedById], references: [id], onDelete: Cascade)
+  approvedById   String?
+  approvedBy     User?     @relation("ProjectDeletionApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt     DateTime?
+  rejectedById   String?
+  rejectedBy     User?     @relation("ProjectDeletionRejecter", fields: [rejectedById], references: [id], onDelete: SetNull)
+  rejectedAt     DateTime?
+  otpHash        String?   @db.VarChar(128)
+  expiresAt      DateTime?
+  failedAttempts Int       @default(0)
+  status         String    @default("PENDING_APPROVAL") @db.VarChar(24)
+  usedAt         DateTime?
+  otpVerifiedAt  DateTime?
+  deletedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([projectId, requestedById, status])
+  @@index([status, createdAt])
+  @@map("project_deletion_otp_requests")
+}
+
+enum ProjectManagerTransferStatus {
+  ACTIVE
+  COMPLETED
+}
+
+/// Temporary reassignment of project ownership while a PM is on leave / unavailable.
+model ProjectManagerTransfer {
+  id                    String                       @id @default(uuid())
+  projectId             String
+  project               Project                      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  oldProjectManagerId   String
+  oldProjectManager     User                         @relation("PmTransferOld", fields: [oldProjectManagerId], references: [id], onDelete: Restrict)
+  newProjectManagerId   String
+  newProjectManager     User                         @relation("PmTransferNew", fields: [newProjectManagerId], references: [id], onDelete: Restrict)
+  transferReason        String?                      @db.Text
+  startDate             DateTime                     @db.Date
+  endDate               DateTime?                    @db.Date
+  transferredById       String
+  transferredBy         User                         @relation("PmTransferBy", fields: [transferredById], references: [id], onDelete: Restrict)
+  status                ProjectManagerTransferStatus @default(ACTIVE)
+  previousManagerId     String?
+  previousManagerEmail  String?
+  previousProjectManagerText String?                 @db.VarChar(100)
+  completedAt           DateTime?
+  createdAt             DateTime                     @default(now())
+  updatedAt             DateTime                     @updatedAt
+
+  @@index([projectId, status])
+  @@index([oldProjectManagerId, status])
+  @@index([newProjectManagerId, status])
+  @@index([status, endDate])
+  @@map("project_manager_transfers")
+}
+
+/// Unseen project assignments for PMs (contract assignment, transfer, new project linked to their contract).
+model ProjectPmAssignmentNotice {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId  String
+  project    Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  source     String    @default("ASSIGNMENT") @db.VarChar(24) // ASSIGNMENT | TRANSFER
+  notifiedAt DateTime  @default(now())
+  seenAt     DateTime?
+
+  @@unique([userId, projectId])
+  @@index([userId, seenAt])
+  @@map("project_pm_assignment_notices")
 }
 
 enum ProjectStatus {
   OPEN
   IN_PROGRESS
+  SUBMITTED_IN_PROGRESS
   ON_HOLD
   COMPLETED
   CANCELLED
   CLOSED
+}
+
+/// Audit-style feed for the project drawer (History / All): subtasks, assignments, comments, etc.
+model ProjectActivityLog {
+  id        String   @id @default(uuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  actorId   String?
+  actor     User?    @relation("ProjectActivityActor", fields: [actorId], references: [id], onDelete: SetNull)
+  action    String   @db.VarChar(64)
+  taskId    String?
+  summary   String   @db.VarChar(600)
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([projectId, createdAt])
+  @@map("project_activity_logs")
 }
 
 model Tender {
@@ -814,7 +1103,12 @@ model Document {
 
   uploadedBy String?
   uploadedAt DateTime @default(now())
+  /// Optional expiry date for licenses, approvals, etc.
+  expiresAt  DateTime?
+  /// SHA-256 of file bytes (used to block duplicate uploads for the same module + entity)
+  contentSha256 String?
 
+  @@index([module, entityCode, contentSha256])
   @@map("documents")
 }
 
@@ -852,6 +1146,12 @@ model Task {
   completedAt    DateTime?
   estimatedHours Decimal?     @db.Decimal(10, 2)
   actualHours    Decimal?     @db.Decimal(10, 2)
+  /// Full-focus vs monitoring — drives workload score coefficient
+  effortType     TaskEffortType @default(FULL_FOCUS)
+  /// Technical weight / complexity (1 = very light … 5 = heavy)
+  taskWeight     Int            @default(3)
+  /// PM/manager rating for completed tasks (0..5). 0 means "not rated".
+  rating         Int            @default(0)
   tags           String[] // Array of tags
   // Additional fields for subtasks/child tasks
   category       String?      // Task category (Design, Development, etc.)
@@ -859,6 +1159,7 @@ model Task {
   planDays       Int?         // Plan days for subtask
   remarks        String?      @db.Text // Remarks
   assigneeNotes  String?      @db.Text // Assignee notes
+  link           String?      @db.VarChar(2048) // External URL / document link
   assignedEmployeeId String?  // Assigned employee ID for subtasks/child tasks
   assignedEmployee User?      @relation("AssignedTaskEmployee", fields: [assignedEmployeeId], references: [id])
   location       String?      // Location
@@ -875,9 +1176,15 @@ model Task {
   dependents     Task[]       @relation("TaskPredecessor")
   // Simple execution order for project management (ascending per project/parent)
   taskOrder      Int?         @map("task_order")
+  // Permanent display slot per (projectId, parentTaskId): set on create only; gaps allowed after deletes.
+  stableWorkSeq  Int?         @map("stable_work_seq")
+  // Insert-between display: e.g. anchor 2 + suffix "A" → user sees 4-2A (projectNumber 4). Internal stableWorkSeq stays hidden.
+  displayAnchorSeq Int?       @map("display_anchor_seq")
+  displaySuffix    String?    @db.VarChar(8) @map("display_suffix")
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
   createdBy      String?
+  deletedAt      DateTime?
 
   // Relations
   assignments   TaskAssignment[]
@@ -887,8 +1194,95 @@ model Task {
   delegations   TaskDelegation[]   // Audit trail of task delegations
   questionnaireQuestions QuestionnaireQuestion[]
   questionnaireAssignments QuestionnaireAssignment[]
+  reminder      TaskReminder?
+  focusSelections UserProjectTaskFocus[]
 
   @@map("tasks")
+}
+
+/// Per-user "current task" highlight within a project (persists across tabs/sessions).
+model UserProjectTaskFocus {
+  id             String   @id @default(uuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  projectId      String
+  project        Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  selectedTaskId String
+  selectedTask   Task     @relation(fields: [selectedTaskId], references: [id], onDelete: Cascade)
+  selectedAt     DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([userId, projectId])
+  @@index([userId])
+  @@index([projectId])
+  @@map("user_project_task_focus")
+}
+
+model TaskReminder {
+  id            String    @id @default(uuid())
+  taskId        String    @unique
+  task          Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  triggerType   String    @default("DUE_DATE") // DUE_DATE | SPECIFIC_DATE
+  specificDate  DateTime?
+  frequency     String    @default("DAILY") // ONCE | DAILY | WEEKLY
+  hour          Int       @default(8)
+  minute        Int       @default(0)
+  notifyUserIds String[]
+  description   String?   @db.Text
+  lastSentAt    DateTime?
+  isActive      Boolean   @default(true)
+  createdBy     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  alerts        TaskReminderAlert[]
+
+  @@map("task_reminders")
+}
+
+/// One critical-alarm instance fired to one user. Drives the on-top alarm popup
+/// and tracks acknowledgement / snooze / completion / escalation state.
+model TaskReminderAlert {
+  id                String       @id @default(uuid())
+  reminderId        String
+  reminder          TaskReminder @relation(fields: [reminderId], references: [id], onDelete: Cascade)
+  taskId            String
+  userId            String
+  status            String       @default("PENDING") // PENDING | SNOOZED | ACKNOWLEDGED | COMPLETED
+  priority          String       @default("NORMAL")  // NORMAL | HIGH | CRITICAL
+  dueAt             DateTime     @default(now())     // when the reminder became due
+  firedAt           DateTime     @default(now())     // first alarm fire
+  lastFiredAt       DateTime     @default(now())     // latest (re)fire — escalation timers anchor here
+  snoozeCount       Int          @default(0)
+  snoozedUntil      DateTime?
+  acknowledgedById  String?
+  acknowledgedAt    DateTime?
+  completedAt       DateTime?
+  escalatedAt       DateTime?    // 5-minute priority escalation timestamp
+  managerNotifiedAt DateTime?    // 15-minute manager escalation timestamp
+  ignoredLoggedAt   DateTime?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([userId, status])
+  @@index([status, lastFiredAt])
+  @@index([reminderId])
+  @@map("task_reminder_alerts")
+}
+
+/// Immutable audit trail for every reminder/alarm action (system + user).
+model TaskReminderActionLog {
+  id         String   @id @default(uuid())
+  alertId    String?
+  reminderId String?
+  taskId     String?
+  actorId    String?  // null = system action
+  action     String   // FIRED | REFIRED | ACKNOWLEDGED | SNOOZED | COMPLETED | PRIORITY_ESCALATED | MANAGER_NOTIFIED | IGNORED_LOGGED
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([alertId, createdAt])
+  @@index([reminderId, createdAt])
+  @@map("task_reminder_action_logs")
 }
 
 enum TaskWorkflowStatus {
@@ -902,6 +1296,8 @@ enum TaskWorkflowStatus {
 enum TaskStatus {
   PENDING
   IN_PROGRESS
+  SUBMITTED_IN_PROGRESS
+  NOT_REQUIRED
   COMPLETED
   CANCELLED
   ON_HOLD
@@ -912,6 +1308,11 @@ enum TaskPriority {
   MEDIUM
   HIGH
   URGENT
+}
+
+enum TaskEffortType {
+  FULL_FOCUS
+  MONITORING
 }
 
 // Task Assignment - Links employees to tasks
@@ -1371,24 +1772,103 @@ model EmailQueueItem {
 }
 
 // Workplace company policies (acknowledgements per user)
+enum CompanyPolicyStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+  EXPIRED
+}
+
+enum PolicyAssignmentStatus {
+  ASSIGNED
+  NOT_VIEWED
+  VIEWED
+  DOWNLOADED
+  ACKNOWLEDGED
+  OVERDUE
+  EXPIRED
+}
+
 model CompanyPolicy {
   id          String   @id @default(uuid())
   title       String
   description String   @db.Text
   department  String   @default("General")
+  /// When set, only employees linked to this company/branch see the policy.
+  companyId   String?
+  company     Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
   fileName    String?
   filePath    String?  // stored filename under uploads/policies
   fileType    String   @default("PDF")
   fileSize    String   @default("—")
   isActive    Boolean  @default(true)
+  status      CompanyPolicyStatus @default(DRAFT)
+  publishDate DateTime?
+  expiryDate  DateTime?
+  /// Days after assignment to acknowledge before marked overdue
+  dueDays     Int?
+  contentHtml String?  @db.Text
+  assignRoles String[] @default([])
+  assignUserIds String[] @default([])
   createdById String?
   createdBy   User?    @relation("CompanyPolicyCreator", fields: [createdById], references: [id])
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   acknowledgements CompanyPolicyAcknowledgement[]
+  assignments      CompanyPolicyAssignment[]
+  auditLogs        CompanyPolicyAuditLog[]
 
+  @@index([companyId])
+  @@index([status])
   @@map("company_policies")
+}
+
+model CompanyPolicyAssignment {
+  id             String                 @id @default(uuid())
+  policyId       String
+  policy         CompanyPolicy          @relation(fields: [policyId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assignedAt     DateTime               @default(now())
+  status         PolicyAssignmentStatus @default(ASSIGNED)
+  viewedAt       DateTime?
+  downloadedAt   DateTime?
+  acknowledgedAt DateTime?
+  dueAt          DateTime?
+  reminderCount  Int                    @default(0)
+  lastReminderAt DateTime?
+
+  @@unique([policyId, userId])
+  @@index([policyId])
+  @@index([userId])
+  @@index([status])
+  @@map("company_policy_assignments")
+}
+
+/// Append-only policy audit trail (no updates/deletes via application)
+model CompanyPolicyAuditLog {
+  id          String         @id @default(uuid())
+  policyId    String?
+  policy      CompanyPolicy? @relation(fields: [policyId], references: [id], onDelete: SetNull)
+  userId      String?
+  user        User?          @relation("CompanyPolicyAuditSubject", fields: [userId], references: [id], onDelete: SetNull)
+  actorId     String?
+  actor       User?          @relation("CompanyPolicyAuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  action      String
+  actorName   String?
+  employeeId  String?
+  department  String?
+  policyTitle String?
+  ipAddress   String?
+  userAgent   String?
+  metadata    Json?
+  createdAt   DateTime       @default(now())
+
+  @@index([policyId, createdAt])
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@map("company_policy_audit_logs")
 }
 
 model CompanyPolicyAcknowledgement {
@@ -1491,6 +1971,11 @@ model Company {
   industry String?
   founded  String? // Year founded
   status   CompanyStatus @default(ACTIVE)
+
+  // Branch relationship (optional)
+  parentCompanyId String?
+  parentCompany   Company? @relation("CompanyBranches", fields: [parentCompanyId], references: [id], onDelete: SetNull)
+  branches        Company[] @relation("CompanyBranches")
 
   // Contact Information
   contactName      String?
@@ -1609,9 +2094,12 @@ model Company {
   connectionType String?
 
   // Branding
-  logo   String? // Logo file path or URL
-  header String? // Header file path or URL
-  footer String? // Footer file path or URL
+  logo       String? // Logo file path or URL
+  header     String? // Header file path or URL
+  footer     String? // Footer file path or URL
+  letterhead String? // Official letterhead for HR documents & certificates
+  payslipTemplate String? // Blank payslip layout image (PNG/JPG) for PDF generation
+  stamp      String? // Official company seal/stamp image (PNG/JPG) for payslips & HR documents
 
   // Customization / Preferences (Organization-level; applied app-wide)
   // All numeric values are stored in base units (sqm, meter, m³, AED). Conversion at display/calculation only.
@@ -1626,6 +2114,9 @@ model Company {
   officeLatitude  Float? // Office latitude coordinate
   officeLongitude Float? // Office longitude coordinate
   attendanceRadius Float? @default(200) // Allowed radius in meters (default 200m)
+  requireOfficeGeofence Boolean @default(true) // Office employees must be within radius to check in/out
+  requireFacialAttendance Boolean @default(false) // Require mobile selfie + face match
+  facialMatchMinScore     Float   @default(0.55) // Minimum match score 0–1
 
   // Statistics
   employees Int @default(0)
@@ -1639,8 +2130,65 @@ model Company {
   departments        Department[]
   attendances        Attendance[]
   attendancePrograms AttendanceProgram[]
+  companyAttachments CompanyAttachment[]
+  companyPolicies    CompanyPolicy[]
+  userAccessGrants   UserCompanyAccess[]
+  clients            Client[]
 
   @@map("companies")
+}
+
+/// Admin/HR users may be assigned one or more companies they can view and manage.
+model UserCompanyAccess {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation("UserCompanyAccessUser", fields: [userId], references: [id], onDelete: Cascade)
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  grantedById String?
+  grantedBy   User?    @relation("UserCompanyAccessGranter", fields: [grantedById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, companyId])
+  @@index([userId])
+  @@index([companyId])
+  @@map("user_company_access")
+}
+
+/// Legal / compliance files per company (multiple files per category).
+model CompanyAttachment {
+  id           String                    @id @default(uuid())
+  companyId    String
+  company      Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  category     CompanyAttachmentCategory
+  fileName     String
+  filePath     String // e.g. /uploads/company-attachments/...
+  fileSize     Int
+  mimeType     String
+  label        String?
+  /// Optional expiry for licenses, certificates, etc.
+  expiresAt    DateTime?
+  uploadedById String?
+  uploadedBy   User?                     @relation("CompanyAttachmentUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
+  createdAt    DateTime                  @default(now())
+  updatedAt    DateTime                  @updatedAt
+
+  @@index([companyId])
+  @@index([companyId, category])
+  @@map("company_attachments")
+}
+
+enum CompanyAttachmentCategory {
+  TRADE_LICENSE
+  EJARI
+  MEMORANDUM_OF_ASSOCIATION
+  ESTABLISHMENT_CARD
+  BANK_DETAILS
+  TAX_REGISTRATION
+  INSURANCE
+  COMPANY_IDENTITY
+  ISO_CERTIFICATE
+  OTHER_CERTIFICATION
 }
 
 /// Per-company attendance program templates (weekly Mon–Sun schedule). User.attendanceProgram stores the program name.
@@ -1670,6 +2218,26 @@ model OrganizationPreferences {
   volumeUnit      String   @default("m3")    // m3 | ft3
   heightUnit      String   @default("meter") // meter | feet
   weightUnit      String   @default("kg")    // kg | ton
+  /// Workload algorithm: monitoring tasks counted at weight × this coefficient (default 0.3)
+  workloadMonitoringCoefficient Decimal? @db.Decimal(4, 2)
+  /// Subtask workload multiplier (default 0.5)
+  workloadSubtaskCoefficient    Decimal? @db.Decimal(4, 2)
+  /// Default planned days when task has no planDays (default 5)
+  workloadDefaultPlannedDays    Int?
+  /// Workload score at 100% employee capacity (default 10)
+  workloadEmployeeCapacity      Decimal? @db.Decimal(6, 2)
+  /// Utilization % above this = overloaded (red, default 100)
+  workloadOverloadUtilizationPercent Decimal? @db.Decimal(6, 2)
+  /// Minimum utilization % for "balanced" (green, default 50)
+  workloadBalancedUtilizationMin     Decimal? @db.Decimal(6, 2)
+  /// Maximum utilization % for "available" (blue, default 30)
+  workloadAvailableUtilizationMax    Decimal? @db.Decimal(6, 2)
+  /// Score above this = overloaded (red) — legacy fallback
+  workloadOverloadThreshold     Decimal? @db.Decimal(6, 2)
+  /// Minimum score for "balanced" (green) band lower bound — legacy fallback
+  workloadBalancedMin           Decimal? @db.Decimal(6, 2)
+  /// Maximum score for "available" (blue) band upper bound — legacy fallback
+  workloadAvailableMax          Decimal? @db.Decimal(6, 2)
   updatedAt       DateTime @updatedAt
   updatedBy       String?  // Admin who last updated
 
@@ -1782,6 +2350,11 @@ enum PositionStatus {
   INACTIVE
 }
 
+enum TeamChatRoomType {
+  GENERAL
+  DM
+}
+
 // Project Chat Model - Represents a chat conversation for a project
 model ProjectChat {
   id        String   @id @default(uuid())
@@ -1798,18 +2371,133 @@ model ProjectChat {
   @@map("project_chats")
 }
 
+/// Explicit project chat members (added from chat UI). Grants access even when not on project/task assignee lists.
+model ProjectChatParticipant {
+  id        String   @id @default(uuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation("ProjectChatParticipantUser", fields: [userId], references: [id], onDelete: Cascade)
+  addedById String?
+  addedBy   User?    @relation("ProjectChatParticipantAddedBy", fields: [addedById], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+
+  @@unique([projectId, userId])
+  @@index([userId])
+  @@map("project_chat_participants")
+}
+
 // Project Message Model - Represents individual messages in a project chat
 model ProjectMessage {
-  id        String      @id @default(uuid())
-  chatId    String
-  chat      ProjectChat @relation(fields: [chatId], references: [id], onDelete: Cascade)
-  senderId  String? // User ID who sent the message
-  sender    User?       @relation("MessageSender", fields: [senderId], references: [id])
-  content   String      @db.Text // Message content
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
+  id          String      @id @default(uuid())
+  chatId      String
+  chat        ProjectChat @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  senderId    String? // User ID who sent the message
+  sender      User?       @relation("MessageSender", fields: [senderId], references: [id])
+  content     String      @db.Text // Message content
+  replyToMessageId String?
+  replyTo     ProjectMessage?  @relation("ProjectMessageReplies", fields: [replyToMessageId], references: [id], onDelete: SetNull)
+  replies     ProjectMessage[] @relation("ProjectMessageReplies")
+  deletedAt   DateTime? // Set when deleted for everyone
+  deletedById String?
+  deletedBy   User?       @relation("MessageDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
 
+  hides ProjectMessageHide[]
+  reads ProjectMessageRead[]
+
+  @@index([chatId, createdAt])
+  @@index([replyToMessageId])
   @@map("project_messages")
+}
+
+/// WhatsApp-style read receipts: one row per (message, user) when the user has seen it.
+model ProjectMessageRead {
+  id        String         @id @default(uuid())
+  messageId String
+  message   ProjectMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User           @relation("ProjectMessageReads", fields: [userId], references: [id], onDelete: Cascade)
+  seenAt    DateTime       @default(now())
+
+  @@unique([messageId, userId])
+  @@index([userId])
+  @@map("project_message_reads")
+}
+
+/// Per-user hide (delete for me only)
+model ProjectMessageHide {
+  id        String         @id @default(uuid())
+  messageId String
+  message   ProjectMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime       @default(now())
+
+  @@unique([messageId, userId])
+  @@index([userId])
+  @@map("project_message_hides")
+}
+
+/// Embedded ERP chat (general + DMs). Rooms are keyed by `roomKey` (e.g. "general", "dm:<a>:<b>").
+model TeamChatRoom {
+  id        String           @id @default(uuid())
+  roomKey   String           @unique
+  type      TeamChatRoomType @default(DM)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  participants TeamChatParticipant[]
+  messages     TeamChatMessage[]
+
+  @@map("team_chat_rooms")
+}
+
+model TeamChatParticipant {
+  id        String       @id @default(uuid())
+  roomId    String
+  room      TeamChatRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime     @default(now())
+
+  @@unique([roomId, userId])
+  @@index([userId])
+  @@map("team_chat_participants")
+}
+
+model TeamChatMessage {
+  id          String       @id @default(uuid())
+  roomId      String
+  room        TeamChatRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  senderId    String?
+  sender      User?        @relation("TeamChatSender", fields: [senderId], references: [id], onDelete: SetNull)
+  content     String       @db.Text
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?        @relation("TeamChatMessageDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  hides TeamChatMessageHide[]
+
+  @@index([roomId, createdAt])
+  @@map("team_chat_messages")
+}
+
+/// Per-user hide (delete for me only) on team chat
+model TeamChatMessageHide {
+  id        String          @id @default(uuid())
+  messageId String
+  message   TeamChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime        @default(now())
+
+  @@unique([messageId, userId])
+  @@index([userId])
+  @@map("team_chat_message_hides")
 }
 
 // Contract Model - Represents contracts for projects
@@ -1831,6 +2519,9 @@ model Contract {
   // Project Nature - Multi-select (stored as JSON array)
   projectNature String? @db.Text // JSON array: ["Interior Project", "Exterior Project", etc.]
 
+  // Contract phases selected at creation (stored as JSON array of phase names)
+  contractPhases String? @db.Text // JSON array: ["Concept Design", "Detailed Design", ...]
+
   // Company
   companyId   String? // Reference to Company model if exists
   companyName String? // Company name if not linked
@@ -1851,7 +2542,8 @@ model Contract {
   region         String? // Region/Area
   plotNumber     String? // Plot number
   community      String? // Community name
-  numberOfFloors Int? // Number of floors
+  numberOfFloors    Int? // Number of floors
+  numberOfBasements Int? // Number of basements
 
   // Building Details
   buildingCost     Decimal? @db.Decimal(15, 2) // Building cost
@@ -1927,6 +2619,52 @@ enum ContractStatus {
   COMPLETED
 }
 
+enum AttendanceCategory {
+  OFFICE
+  SITE
+  LABOR
+}
+
+/// Field / project attendance shift log (supervisor punches labor; PM self-punch at site).
+model ProjectAttendanceLog {
+  id           String    @id @default(uuid())
+  employeeId   String
+  employee     User      @relation("ProjectAttendanceEmployee", fields: [employeeId], references: [id], onDelete: Cascade)
+  projectId    String
+  project      Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// Set when a supervisor punches in/out on behalf of a labor worker
+  supervisorId String?
+  supervisor   User?     @relation("ProjectAttendanceSupervisor", fields: [supervisorId], references: [id], onDelete: SetNull)
+
+  punchIn      DateTime  @default(now())
+  punchOut     DateTime?
+  /// Labor cost in AED — calculated on punch-out for LABOR category only
+  costAmount   Decimal   @default(0) @db.Decimal(12, 2)
+  workedHours  Float?
+
+  latitude           Float?
+  longitude          Float?
+  distanceFromSiteM  Float?
+  isWithinGeofence   Boolean?
+  punchOutLatitude   Float?
+  punchOutLongitude  Float?
+
+  facePhotoPath   String?
+  faceMatchScore  Float?
+  faceVerified    Boolean @default(false)
+  autoClosed      Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([employeeId])
+  @@index([projectId])
+  @@index([supervisorId])
+  @@index([punchIn])
+  @@index([employeeId, punchOut])
+  @@map("project_attendance_logs")
+}
+
 // Attendance model for location-based check-in/check-out
 model Attendance {
   id        String   @id @default(uuid())
@@ -1955,6 +2693,11 @@ model Attendance {
   deviceInfo   String? @db.Text // Device information (mobile, desktop, etc.)
   locationAccuracy Float? // GPS accuracy in meters
 
+  // Facial verification (mobile attendance)
+  facePhotoPath  String?
+  faceMatchScore Float?
+  faceVerified   Boolean @default(false)
+
   // Status
   status AttendanceStatus @default(PRESENT)
 
@@ -1968,6 +2711,53 @@ model Attendance {
   @@map("attendances")
 }
 
+enum EngineeringDailyReportStatus {
+  DRAFT
+  SUBMITTED
+}
+
+/// Mandatory engineering daily report before check-out (one per employee per day).
+model EngineeringDailyReport {
+  id          String                       @id @default(uuid())
+  userId      String
+  user        User                         @relation("UserEngineeringDailyReports", fields: [userId], references: [id], onDelete: Cascade)
+  reportDate  DateTime                     @db.Date
+  status      EngineeringDailyReportStatus @default(DRAFT)
+  roleSection String?
+  payload     Json
+  submittedAt DateTime?
+  createdAt   DateTime                     @default(now())
+  updatedAt   DateTime                     @updatedAt
+
+  checkoutSessions CheckoutSession[]
+
+  @@unique([userId, reportDate])
+  @@index([userId])
+  @@index([reportDate])
+  @@map("engineering_daily_reports")
+}
+
+/// Paused checkout while employee completes daily report.
+model CheckoutSession {
+  id                   String    @id @default(uuid())
+  userId               String
+  user                 User      @relation("UserCheckoutSessions", fields: [userId], references: [id], onDelete: Cascade)
+  reportDate           DateTime  @db.Date
+  token                String    @unique
+  reportId             String?
+  report               EngineeringDailyReport? @relation(fields: [reportId], references: [id], onDelete: SetNull)
+  dailyReportSubmitted Boolean   @default(false)
+  completedAt          DateTime?
+  expiresAt            DateTime
+  latitude             Float?
+  longitude            Float?
+  accuracy             Float?
+  createdAt            DateTime  @default(now())
+
+  @@index([userId, reportDate])
+  @@map("checkout_sessions")
+}
+
 enum AttendanceType {
   CHECK_IN
   CHECK_OUT
@@ -1979,6 +2769,9 @@ enum AttendanceStatus {
   ON_LEAVE
   LATE
   EARLY_DEPARTURE
+  VACATION
+  PUBLIC_HOLIDAY
+  OUT_OF_LOCATION
 }
 
 model Leave {
@@ -2019,6 +2812,35 @@ model Leave {
   rejectedAt     DateTime?
   rejectionReason String?  @db.Text
 
+  // Enterprise annual leave workflow (multi-step approvals)
+  workflowStage           LeaveWorkflowStage?
+  assignedLineManagerId   String?
+  assignedLineManager     User?     @relation("LeaveAssignedLineManager", fields: [assignedLineManagerId], references: [id])
+  assignedSecondLineManagerId String?
+  assignedSecondLineManager   User? @relation("LeaveAssignedSecondLineManager", fields: [assignedSecondLineManagerId], references: [id])
+  secondManagerApprovalStatus LeaveManagerApprovalStatus @default(NOT_REQUIRED)
+  secondManagerActionById     String?
+  secondManagerActionBy       User?   @relation("LeaveSecondManagerAction", fields: [secondManagerActionById], references: [id])
+  secondManagerActionAt       DateTime? @db.Timestamptz
+  secondManagerRejectionReason String?  @db.Text
+  projectConflict         Boolean?
+  projectConfirmationNotes String?  @db.Text
+  projectConfirmedById    String?
+  projectConfirmedBy      User?     @relation("LeaveProjectConfirmedBy", fields: [projectConfirmedById], references: [id])
+  projectConfirmedAt      DateTime? @db.Timestamptz
+  financeClearanceStatus  String?   // PENDING | CLEARED | ISSUE_FOUND
+  financeRemarks          String?   @db.Text
+  financeActionById       String?
+  financeActionBy         User?     @relation("LeaveFinanceActionBy", fields: [financeActionById], references: [id])
+  financeActionAt         DateTime? @db.Timestamptz
+  hrFinalApprovedAt       DateTime? @db.Timestamptz
+  certificateFilename     String?
+  certificateGeneratedAt  DateTime? @db.Timestamptz
+  returnToWorkDate        DateTime? @db.Date
+  onHoldReason            String?   @db.Text
+
+  workflowLogs LeaveWorkflowLog[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -2027,7 +2849,24 @@ model Leave {
   @@index([type])
   @@index([startDate])
   @@index([managerApprovalStatus])
+  @@index([workflowStage])
   @@map("leaves")
+}
+
+model LeaveWorkflowLog {
+  id            String              @id @default(uuid())
+  leaveId       String
+  leave         Leave               @relation(fields: [leaveId], references: [id], onDelete: Cascade)
+  actorId       String?
+  actor         User?               @relation("LeaveWorkflowLogActor", fields: [actorId], references: [id])
+  action        String
+  previousStage LeaveWorkflowStage?
+  newStage      LeaveWorkflowStage?
+  comment       String?             @db.Text
+  createdAt     DateTime            @default(now())
+
+  @@index([leaveId])
+  @@map("leave_workflow_logs")
 }
 
 model LeavePolicy {
@@ -2064,4 +2903,693 @@ enum LeaveManagerApprovalStatus {
   PENDING
   APPROVED
   REJECTED
+}
+
+enum LeaveWorkflowStage {
+  DRAFT
+  PENDING_LINE_MANAGER
+  PENDING_HR_REVIEW
+  PENDING_PROJECT_CONFIRMATION
+  PROJECT_CONFLICT_REPORTED
+  ON_HOLD
+  PENDING_FINANCE_CLEARANCE
+  FINANCE_CLEARED
+  FINANCE_ISSUE_FOUND
+  PENDING_HR_FINAL
+  APPROVED
+  CERTIFICATE_GENERATED
+  REJECTED_BY_MANAGER
+  REJECTED_BY_HR
+}
+
+enum ResignationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  WITHDRAWN
+  COMPLETED
+  ON_HOLD
+}
+
+enum ResignationWorkflowStage {
+  PENDING_PROJECT_MANAGER
+  DISCUSSION_REQUESTED
+  PENDING_GM_RETENTION_REVIEW
+  PENDING_EMPLOYEE_RETENTION_RESPONSE
+  REJECTED_BY_PROJECT_MANAGER
+  PENDING_HR_REVIEW
+  REJECTED_BY_HR
+  PENDING_FINANCE_CLEARANCE
+  FINANCE_CLEARANCE_REJECTED
+  FINANCE_CLEARANCE_ON_HOLD
+  PENDING_HR_FINAL_CLEARANCE
+  HR_FINAL_ON_HOLD
+  REJECTED_HR_FINAL
+  RESIGNATION_COMPLETED
+  WITHDRAWN
+}
+
+enum RetentionRecommendation {
+  NO_RETENTION
+  RETAIN_EMPLOYEE
+  SALARY_INCREMENT
+  PROMOTION
+  DEPARTMENT_TRANSFER
+  ADDITIONAL_BENEFITS
+  CRITICAL_RESOURCE_MGMT_REVIEW
+}
+
+model ResignationRequest {
+  id                      String                    @id @default(uuid())
+  userId                  String
+  user                    User                      @relation("ResignationRequester", fields: [userId], references: [id])
+  status                  ResignationStatus         @default(PENDING)
+  workflowStage           ResignationWorkflowStage  @default(PENDING_PROJECT_MANAGER)
+  intendedLastWorkingDay  DateTime                  @db.Date
+  reason                  String                    @db.Text
+  comments                String?                   @db.Text
+  employmentContractPath  String
+  supportingDocuments     String?                   @db.Text // JSON array
+
+  assignedProjectManagerId String?
+  assignedProjectManager   User?                    @relation("ResignationAssignedPM", fields: [assignedProjectManagerId], references: [id])
+
+  retentionRecommendation RetentionRecommendation?
+  performanceAssessment   String?                   @db.Text
+  businessImpactAssessment String?                  @db.Text
+  retentionNotes          String?                   @db.Text
+
+  pmActionById            String?
+  pmActionBy                User?                   @relation("ResignationPmAction", fields: [pmActionById], references: [id])
+  pmActionAt                DateTime?
+  pmComments                String?                 @db.Text
+
+  gmActionById              String?
+  gmActionBy                User?                   @relation("ResignationGmAction", fields: [gmActionById], references: [id])
+  gmActionAt                DateTime?
+  gmComments                String?                 @db.Text
+  retentionOffer            Json?
+  retentionOfferAccepted    Boolean?
+  retentionResponseAt       DateTime?
+
+  hrReviewById              String?
+  hrReviewBy                User?                   @relation("ResignationHrReview", fields: [hrReviewById], references: [id])
+  hrReviewAt                DateTime?
+  hrReviewComments          String?                 @db.Text
+
+  financeClearanceStatus    String?                 // APPROVED | REJECTED | ON_HOLD
+  financeRemarks            String?                 @db.Text
+  financeChecklist          Json?
+  financeActionById         String?
+  financeActionBy           User?                   @relation("ResignationFinanceAction", fields: [financeActionById], references: [id])
+  financeActionAt           DateTime?
+
+  assetChecklist            Json?
+  exitChecklist             Json?
+  hrFinalById               String?
+  hrFinalBy                 User?                   @relation("ResignationHrFinal", fields: [hrFinalById], references: [id])
+  hrFinalAt                 DateTime?
+  hrFinalComments           String?                 @db.Text
+
+  finalExitDate             DateTime?               @db.Date
+  relievingLetterPath       String?
+  experienceCertificatePath String?
+  settlementRequestRef      String?
+
+  workflowLogs              ResignationWorkflowLog[]
+
+  createdAt                 DateTime                @default(now())
+  updatedAt                 DateTime                @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([workflowStage])
+  @@index([assignedProjectManagerId])
+  @@map("resignation_requests")
+}
+
+model ResignationWorkflowLog {
+  id            String                    @id @default(uuid())
+  resignationId String
+  resignation   ResignationRequest        @relation(fields: [resignationId], references: [id], onDelete: Cascade)
+  actorId       String?
+  actor         User?                     @relation("ResignationWorkflowLogActor", fields: [actorId], references: [id])
+  action        String
+  previousStage ResignationWorkflowStage?
+  newStage      ResignationWorkflowStage?
+  comment       String?                   @db.Text
+  metadata      Json?
+  createdAt     DateTime                  @default(now())
+
+  @@index([resignationId])
+  @@map("resignation_workflow_logs")
+}
+
+/// Web Push (browser notifications) — one row per browser/device subscription.
+model BrowserPushSubscription {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  userAgent String?  @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("browser_push_subscriptions")
+}
+
+/// Tracks document-expiry reminder notifications already sent (dedupe by threshold).
+model DocumentExpiryNotificationLog {
+  id              String   @id @default(uuid())
+  recipientUserId String
+  recipient       User     @relation(fields: [recipientUserId], references: [id], onDelete: Cascade)
+  sourceKey       String
+  thresholdDays   Int
+  sentAt          DateTime @default(now())
+
+  @@unique([recipientUserId, sourceKey, thresholdDays])
+  @@index([recipientUserId])
+  @@index([sourceKey])
+  @@map("document_expiry_notification_logs")
+}
+
+// ============================================================
+// Enterprise Asset Management (EAM)
+// ============================================================
+
+enum AssetStatus {
+  AVAILABLE
+  ASSIGNED
+  IN_REPAIR
+  DISPOSED
+}
+
+enum AssetLocationType {
+  WAREHOUSE
+  OFFICE_ROOM
+  REMOTE
+  IT_REPAIR_LAB
+}
+
+enum MaintenanceIssueType {
+  HARDWARE_FAILURE
+  SOFTWARE_ISSUE
+  ROUTINE_MAINTENANCE
+}
+
+enum MaintenancePriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum MaintenanceTicketStatus {
+  OPEN
+  ASSIGNED_TO_TECH
+  IN_REPAIR
+  RESOLVED
+  CLOSED
+}
+
+enum AssetLogAction {
+  PROVISIONED
+  ASSIGNED
+  TRANSFERRED
+  RETURNED_TO_STOCK
+  SENT_TO_REPAIR
+  REPAIR_COMPLETED
+  SCRAPPED
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  APPROVED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+enum GoodsReceiptStatus {
+  PENDING_SERIALS
+  COMPLETE
+}
+
+enum PurchaseRequisitionStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  FULFILLED
+}
+
+model AssetCategory {
+  id                       String   @id @default(uuid())
+  name                     String   @unique
+  minThreshold             Int      @default(0)
+  depreciationLifespanYears Decimal @db.Decimal(5, 2)
+  salvageValuePercentage   Decimal  @default(10) @db.Decimal(5, 2)
+  assets                   Asset[]
+  purchaseOrderLines       PurchaseOrderLine[]
+  purchaseRequisitions     PurchaseRequisition[]
+  assetRequests            AssetRequest[]
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  @@map("asset_categories")
+}
+
+model AssetTagSequence {
+  year       Int @id
+  lastNumber Int @default(0)
+
+  @@map("asset_tag_sequences")
+}
+
+model Asset {
+  id            String            @id @default(uuid())
+  assetTag      String            @unique
+  qrToken       String            @unique @default(uuid())
+  categoryId    String
+  category      AssetCategory     @relation(fields: [categoryId], references: [id])
+  serialNumber  String?           @unique
+  purchaseCost  Decimal           @db.Decimal(12, 2)
+  purchaseDate  DateTime          @db.Date
+  status        AssetStatus       @default(AVAILABLE)
+  assignedToId  String?
+  assignedTo    User?             @relation("AssetCustodian", fields: [assignedToId], references: [id], onDelete: SetNull)
+  locationType  AssetLocationType @default(WAREHOUSE)
+  locationId    String?
+  isQrPrinted   Boolean           @default(false)
+  disposedAt    DateTime?
+  grnId         String?
+  grn           GoodsReceiptNote? @relation(fields: [grnId], references: [id], onDelete: SetNull)
+  logs          AssetLog[]
+  tickets       MaintenanceTicket[]
+  requestAssignments AssetRequestAssignment[]
+  returns       AssetReturn[]
+  damageCases   AssetDamageCase[]
+  lossCases     AssetLossCase[]
+  clearanceRecords AssetClearanceRecord[]
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@index([status])
+  @@index([categoryId])
+  @@index([assignedToId])
+  @@index([isQrPrinted])
+  @@index([qrToken])
+  @@map("assets")
+}
+
+model AssetLog {
+  id              String         @id @default(uuid())
+  assetId         String
+  asset           Asset          @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  action          AssetLogAction
+  performedById   String?
+  performedBy     User?          @relation("AssetLogPerformer", fields: [performedById], references: [id], onDelete: SetNull)
+  oldCustodianId  String?
+  newCustodianId  String?
+  notes           String?        @db.Text
+  metadata        Json?
+  createdAt       DateTime       @default(now())
+
+  @@index([assetId, createdAt])
+  @@map("asset_logs")
+}
+
+model MaintenanceTicket {
+  id            String                  @id @default(uuid())
+  assetId       String
+  asset         Asset                   @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  reporterId    String
+  reporter      User                    @relation("MaintenanceReporter", fields: [reporterId], references: [id])
+  technicianId  String?
+  technician    User?                   @relation("MaintenanceTechnician", fields: [technicianId], references: [id], onDelete: SetNull)
+  issueType     MaintenanceIssueType
+  priority      MaintenancePriority     @default(MEDIUM)
+  status        MaintenanceTicketStatus @default(OPEN)
+  repairCost    Decimal?                @db.Decimal(12, 2)
+  notes         String?                 @db.Text
+  resolution    String?                 @db.Text
+  createdAt     DateTime                @default(now())
+  updatedAt     DateTime                @updatedAt
+  closedAt      DateTime?
+
+  @@index([assetId])
+  @@index([reporterId])
+  @@index([technicianId])
+  @@index([status])
+  @@map("maintenance_tickets")
+}
+
+model PurchaseOrder {
+  id          String              @id @default(uuid())
+  poNumber    String              @unique
+  status      PurchaseOrderStatus @default(DRAFT)
+  vendorName  String?
+  notes       String?             @db.Text
+  createdById String?
+  createdBy   User?               @relation("PoCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  lines       PurchaseOrderLine[]
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderLine {
+  id               String         @id @default(uuid())
+  purchaseOrderId  String
+  purchaseOrder    PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  categoryId       String
+  category         AssetCategory  @relation(fields: [categoryId], references: [id])
+  description      String?
+  quantity         Int
+  unitCost         Decimal        @db.Decimal(12, 2)
+  receivedQuantity Int            @default(0)
+  grns             GoodsReceiptNote[]
+
+  @@index([purchaseOrderId])
+  @@map("purchase_order_lines")
+}
+
+model GoodsReceiptNote {
+  id                  String             @id @default(uuid())
+  grnNumber           String             @unique
+  purchaseOrderLineId String
+  purchaseOrderLine   PurchaseOrderLine  @relation(fields: [purchaseOrderLineId], references: [id])
+  quantityReceived    Int
+  receivedById        String?
+  receivedBy          User?              @relation("GrnReceiver", fields: [receivedById], references: [id], onDelete: SetNull)
+  receivedAt          DateTime           @default(now())
+  status              GoodsReceiptStatus @default(PENDING_SERIALS)
+  assets              Asset[]
+  createdAt           DateTime           @default(now())
+
+  @@index([purchaseOrderLineId])
+  @@map("goods_receipt_notes")
+}
+
+model PurchaseRequisition {
+  id                 String                    @id @default(uuid())
+  categoryId         String
+  category           AssetCategory             @relation(fields: [categoryId], references: [id])
+  suggestedQuantity  Int
+  reason             String                    @db.Text
+  status             PurchaseRequisitionStatus @default(DRAFT)
+  createdById        String?
+  createdBy          User?                     @relation("PrCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  assetRequests      AssetRequest[]
+  createdAt          DateTime                  @default(now())
+  updatedAt          DateTime                  @updatedAt
+
+  @@index([categoryId])
+  @@index([status])
+  @@map("purchase_requisitions")
+}
+
+// ============================================================
+// Asset Request, Approval, Custody & Clearance Workflow
+// ============================================================
+
+enum AssetRequestStatus {
+  DRAFT
+  SUBMITTED
+  PENDING_PM_APPROVAL
+  PENDING_HR_VERIFICATION
+  PENDING_FINANCE_APPROVAL
+  PENDING_FINAL_HR_APPROVAL
+  PENDING_ASSET_ASSIGNMENT
+  PENDING_PROCUREMENT
+  ASSET_ISSUED
+  REJECTED
+  CLOSED
+  CANCELLED
+}
+
+enum AssetRequestUrgency {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum AssetRequestApprovalStep {
+  PROJECT_MANAGER
+  HR_VERIFICATION
+  FINANCE
+  HR_FINAL
+  ASSET_MANAGER
+  ASSET_DIRECTOR
+}
+
+enum AssetRequestApprovalDecision {
+  APPROVED
+  REJECTED
+  CLARIFICATION
+  RETURNED
+}
+
+enum AssetReturnOutcome {
+  RETURNED_GOOD
+  RETURNED_DAMAGED
+  LOST
+  STOLEN
+  REPAIR_REQUIRED
+}
+
+enum AssetDamageCaseStatus {
+  OPEN
+  UNDER_REVIEW
+  REPAIR
+  RECOVER_COST
+  WRITTEN_OFF
+  INSURANCE
+  CLOSED
+}
+
+enum AssetLossCaseStatus {
+  OPEN
+  UNDER_REVIEW
+  RECOVERED
+  PARTIAL_RECOVERY
+  INSURANCE
+  WRITTEN_OFF
+  CLOSED
+}
+
+enum AssetClearanceItemStatus {
+  PENDING
+  RETURNED
+  DAMAGED
+  LOST
+  WAIVED
+}
+
+model AssetRequestSequence {
+  year       Int @id
+  lastNumber Int @default(0)
+
+  @@map("asset_request_sequences")
+}
+
+model AssetRequest {
+  id                      String              @id @default(uuid())
+  requestNumber           String              @unique
+  employeeId              String
+  employee                User                @relation("AssetRequestEmployee", fields: [employeeId], references: [id])
+  department              String?
+  subDepartment           String?
+  projectId               String?
+  project                 Project?            @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  designation             String?
+  requestDate             DateTime            @default(now())
+  categoryId              String
+  category                AssetCategory       @relation(fields: [categoryId], references: [id])
+  assetType               String?
+  assetDescription        String?             @db.Text
+  brandPreference         String?
+  modelPreference         String?
+  quantity                Int                 @default(1)
+  businessJustification   String              @db.Text
+  urgency                 AssetRequestUrgency @default(MEDIUM)
+  requiredByDate          DateTime?           @db.Date
+  expectedUsageDuration   String?
+  additionalNotes         String?             @db.Text
+  attachmentPath          String?
+  status                  AssetRequestStatus  @default(DRAFT)
+  assignedProjectManagerId String?
+  assignedProjectManager  User?               @relation("AssetRequestPm", fields: [assignedProjectManagerId], references: [id], onDelete: SetNull)
+  purchaseRequisitionId   String?
+  purchaseRequisition     PurchaseRequisition? @relation(fields: [purchaseRequisitionId], references: [id], onDelete: SetNull)
+  custodyDocumentPath     String?
+  submittedAt             DateTime?
+  closedAt                DateTime?
+  createdAt               DateTime            @default(now())
+  updatedAt               DateTime            @updatedAt
+
+  approvals    AssetRequestApproval[]
+  assignments  AssetRequestAssignment[]
+  returns      AssetReturn[]
+  auditLogs    AssetRequestAuditLog[]
+  damageCases  AssetDamageCase[]
+  lossCases    AssetLossCase[]
+
+  @@index([employeeId])
+  @@index([status])
+  @@index([assignedProjectManagerId])
+  @@index([projectId])
+  @@map("asset_requests")
+}
+
+model AssetRequestApproval {
+  id          String                       @id @default(uuid())
+  requestId   String
+  request     AssetRequest                 @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  step        AssetRequestApprovalStep
+  decision    AssetRequestApprovalDecision
+  comments    String?                      @db.Text
+  approvalNotes String?                    @db.Text
+  approverId  String?
+  approver    User?                        @relation("AssetRequestApprover", fields: [approverId], references: [id], onDelete: SetNull)
+  decidedAt   DateTime                     @default(now())
+  metadata    Json?
+
+  @@index([requestId])
+  @@index([step])
+  @@map("asset_request_approvals")
+}
+
+model AssetRequestAssignment {
+  id              String       @id @default(uuid())
+  requestId       String
+  request         AssetRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  assetId         String
+  asset           Asset        @relation(fields: [assetId], references: [id])
+  employeeId      String
+  employee        User         @relation("AssetAssignmentEmployee", fields: [employeeId], references: [id])
+  issueDate       DateTime     @default(now())
+  conditionNotes  String?
+  warrantyInfo    String?
+  locationType    AssetLocationType?
+  locationId      String?
+  department      String?
+  projectId       String?
+  assignedById    String?
+  custodyDocPath  String?
+  previousCustodianId String?
+  transferReason  String?
+  createdAt       DateTime     @default(now())
+
+  @@index([requestId])
+  @@index([assetId])
+  @@index([employeeId])
+  @@map("asset_request_assignments")
+}
+
+model AssetReturn {
+  id                  String             @id @default(uuid())
+  requestId           String?
+  request             AssetRequest?      @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  assetId             String
+  asset               Asset              @relation(fields: [assetId], references: [id])
+  custodianId         String
+  custodian           User               @relation("AssetReturnCustodian", fields: [custodianId], references: [id])
+  processedById       String?
+  processedBy         User?              @relation("AssetReturnProcessor", fields: [processedById], references: [id], onDelete: SetNull)
+  returnDate          DateTime           @default(now())
+  outcome           AssetReturnOutcome
+  conditionNotes    String?            @db.Text
+  accessoriesReturned String?          @db.Text
+  damageDetails     String?            @db.Text
+  missingComponents String?            @db.Text
+  photoPaths        Json?
+  remarks           String?            @db.Text
+  createdAt         DateTime           @default(now())
+
+  damageCase AssetDamageCase?
+  lossCase   AssetLossCase?
+
+  @@index([assetId])
+  @@index([custodianId])
+  @@map("asset_returns")
+}
+
+model AssetDamageCase {
+  id           String                @id @default(uuid())
+  returnId     String                @unique
+  assetReturn  AssetReturn           @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  requestId    String?
+  request      AssetRequest?         @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  assetId      String
+  asset        Asset                 @relation(fields: [assetId], references: [id])
+  status       AssetDamageCaseStatus @default(OPEN)
+  description  String                @db.Text
+  estimatedCost Decimal?             @db.Decimal(12, 2)
+  resolution   String?               @db.Text
+  createdAt    DateTime              @default(now())
+  updatedAt    DateTime              @updatedAt
+
+  @@index([assetId])
+  @@map("asset_damage_cases")
+}
+
+model AssetLossCase {
+  id              String            @id @default(uuid())
+  returnId        String            @unique
+  assetReturn     AssetReturn       @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  requestId       String?
+  request         AssetRequest?     @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  assetId         String
+  asset           Asset             @relation(fields: [assetId], references: [id])
+  status          AssetLossCaseStatus @default(OPEN)
+  employeeExplanation String?       @db.Text
+  recoveryAmount  Decimal?          @db.Decimal(12, 2)
+  resolution      String?           @db.Text
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@index([assetId])
+  @@map("asset_loss_cases")
+}
+
+model AssetClearanceRecord {
+  id           String                   @id @default(uuid())
+  userId       String
+  user         User                     @relation("AssetClearanceEmployee", fields: [userId], references: [id], onDelete: Cascade)
+  resignationId String?
+  assetId      String?
+  asset        Asset?                   @relation(fields: [assetId], references: [id], onDelete: SetNull)
+  assetLabel   String
+  status       AssetClearanceItemStatus @default(PENDING)
+  notes        String?                  @db.Text
+  resolvedAt   DateTime?
+  createdAt    DateTime                 @default(now())
+  updatedAt    DateTime                 @updatedAt
+
+  @@index([userId])
+  @@index([resignationId])
+  @@map("asset_clearance_records")
+}
+
+model AssetRequestAuditLog {
+  id          String       @id @default(uuid())
+  requestId   String
+  request     AssetRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  actorId     String?
+  actor       User?        @relation("AssetRequestAuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  action      String
+  previousStatus AssetRequestStatus?
+  newStatus   AssetRequestStatus?
+  comment     String?      @db.Text
+  metadata    Json?
+  createdAt   DateTime     @default(now())
+
+  @@index([requestId, createdAt])
+  @@map("asset_request_audit_logs")
 }

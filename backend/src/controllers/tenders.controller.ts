@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import prisma from '../config/database';
 import { generateInvitationToken } from '../utils/token';
 import { sendTenderInvitationEmail } from '../services/email.service';
+import { notifyTenderAssignedEmail } from '../services/emailDispatch.service';
 import { AuthRequest } from '../middleware/auth.middleware';
 
 export const assignTenderToEngineer = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -31,15 +32,34 @@ export const assignTenderToEngineer = async (req: AuthRequest, res: Response): P
       },
     });
     
-    // Send invitation email
+    // Send invitation email (template trigger first, then legacy HTML fallback)
     try {
-      await sendTenderInvitationEmail(
-        engineer.email,
-        `${engineer.firstName} ${engineer.lastName}`,
-        tender,
+      const templateResult = await notifyTenderAssignedEmail({
+        engineer: {
+          id: engineer.id,
+          email: engineer.email,
+          firstName: engineer.firstName,
+          lastName: engineer.lastName,
+        },
+        tender: {
+          name: tender.name,
+          referenceNumber: tender.referenceNumber,
+          client: null,
+        },
         invitationLink,
-        tender.attachmentFile || undefined
-      );
+        assignedBy: req.user
+          ? { firstName: (req.user as any).firstName, lastName: (req.user as any).lastName }
+          : null,
+      });
+      if (!templateResult.sent) {
+        await sendTenderInvitationEmail(
+          engineer.email,
+          `${engineer.firstName} ${engineer.lastName}`,
+          tender,
+          invitationLink,
+          tender.attachmentFile || undefined,
+        );
+      }
     } catch (emailError) {
       console.error('Email sending failed:', emailError);
       // Continue even if email fails

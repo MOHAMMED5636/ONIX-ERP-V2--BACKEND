@@ -4,7 +4,17 @@ import { AuthRequest } from '../middleware/auth.middleware';
 import ExcelJS from 'exceljs';
 import * as XLSX from 'xlsx';
 import { CLIENT_IMPORT_SCHEMA } from '../config/clientImportSchema';
-import { buildXlsxBuffer, safeCellString } from '../utils/excel';
+import { buildXlsxBuffer, expandSheetRangeToUsedGrid, importCellString, safeCellString } from '../utils/excel';
+import {
+  applyManagerClientFilter,
+  resolveManagerClientScope,
+} from '../utils/managerScope';
+import {
+  getClientIdsForCompanyBranch,
+  mergeClientBranchFilter,
+} from '../utils/contractBranchFilter';
+import { resolveCompanyAccessScope } from '../services/companyAccess.service';
+import { CompanyStatus } from '@prisma/client';
 
 // Generate client reference number: O-CL-YYYY/NNNN (serial resets per year)
 // Requirement: no gaps — if a number is missing (e.g., deleted), reuse it before advancing.
@@ -48,6 +58,19 @@ async function generateReferenceNumber(): Promise<string> {
   return generateNextClientReferenceNumber(prisma, year);
 }
 
+async function parseOptionalCompanyId(raw: unknown): Promise<string | null> {
+  if (raw == null || String(raw).trim() === '') return null;
+  const id = String(raw).trim();
+  const company = await prisma.company.findFirst({
+    where: { id, status: CompanyStatus.ACTIVE },
+    select: { id: true },
+  });
+  if (!company) {
+    throw Object.assign(new Error('Invalid branch selected'), { statusCode: 400 });
+  }
+  return id;
+}
+
 // Get all clients with filters
 export const getAllClients = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -61,6 +84,7 @@ export const getAllClients = async (req: AuthRequest, res: Response): Promise<vo
       limit = '50',
       sortBy = 'createdAt',
       sortOrder = 'desc',
+      companyId: companyIdQuery,
     } = req.query;
 
     const pageNum = Math.max(1, parseInt(page as string, 10) || 1);
@@ -93,6 +117,37 @@ export const getAllClients = async (req: AuthRequest, res: Response): Promise<vo
       where.rank = rank as string;
     }
 
+    const managerScope = await resolveManagerClientScope(req);
+    if (managerScope.denied) {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: Manager email or ID not found in session',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+    if (managerScope.clientIds !== null) {
+      applyManagerClientFilter(where, managerScope.clientIds);
+      console.log(
+        `🔒 Client list scoped to ${managerScope.clientIds.length} client(s) from assigned contracts`,
+      );
+    }
+
+    const companyIdParam =
+      typeof companyIdQuery === 'string' && companyIdQuery.trim() ? companyIdQuery.trim() : '';
+    if (companyIdParam) {
+      const accessScope = await resolveCompanyAccessScope(req.user!.id, req.user?.role);
+      if (!accessScope.unrestricted && !accessScope.companyIds.includes(companyIdParam)) {
+        res.status(403).json({
+          success: false,
+          message: 'Forbidden: you do not have access to clients for this branch',
+        });
+        return;
+      }
+      const branchClientIds = await getClientIdsForCompanyBranch(companyIdParam);
+      mergeClientBranchFilter(where, companyIdParam, branchClientIds);
+    }
+
     const [clients, total] = await Promise.all([
       prisma.client.findMany({
         where,
@@ -102,6 +157,7 @@ export const getAllClients = async (req: AuthRequest, res: Response): Promise<vo
           [sortBy as string]: sortOrder as 'asc' | 'desc',
         },
         include: {
+          company: { select: { id: true, name: true } },
           _count: {
             select: {
               projects: true,
@@ -138,34 +194,66 @@ export const getAllClients = async (req: AuthRequest, res: Response): Promise<vo
 // Get client statistics
 export const getClientStats = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const companyIdQuery = req.query.companyId;
+    const managerScope = await resolveManagerClientScope(req);
+    if (managerScope.denied) {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: Manager email or ID not found in session',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
+    const scopeWhere: Record<string, unknown> =
+      managerScope.clientIds !== null ? { id: { in: managerScope.clientIds } } : {};
+
+    const companyIdParam =
+      typeof companyIdQuery === 'string' && companyIdQuery.trim() ? companyIdQuery.trim() : '';
+    if (companyIdParam) {
+      const accessScope = await resolveCompanyAccessScope(req.user!.id, req.user?.role);
+      if (!accessScope.unrestricted && !accessScope.companyIds.includes(companyIdParam)) {
+        res.status(403).json({
+          success: false,
+          message: 'Forbidden: you do not have access to clients for this branch',
+        });
+        return;
+      }
+      const branchClientIds = await getClientIdsForCompanyBranch(companyIdParam);
+      mergeClientBranchFilter(scopeWhere, companyIdParam, branchClientIds);
+    }
+
     const [totalClients, clientsByType, clientsBySource, clientsByRank] = await Promise.all([
-      prisma.client.count(),
+      prisma.client.count({ where: scopeWhere }),
       prisma.client.groupBy({
         by: ['isCorporate'],
+        where: scopeWhere,
         _count: {
           id: true,
         },
       }),
       prisma.client.groupBy({
         by: ['leadSource'],
-        _count: {
-          id: true,
-        },
         where: {
+          ...scopeWhere,
           leadSource: {
             not: null,
           },
         },
-      }),
-      prisma.client.groupBy({
-        by: ['rank'],
         _count: {
           id: true,
         },
+      }),
+      prisma.client.groupBy({
+        by: ['rank'],
         where: {
+          ...scopeWhere,
           rank: {
             not: null,
           },
+        },
+        _count: {
+          id: true,
         },
       }),
     ]);
@@ -216,6 +304,7 @@ export const getClientById = async (req: AuthRequest, res: Response): Promise<vo
     const client = await prisma.client.findUnique({
       where: { id },
       include: {
+        company: { select: { id: true, name: true } },
         projects: {
           select: {
             id: true,
@@ -259,6 +348,24 @@ export const getClientById = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
+    const managerScope = await resolveManagerClientScope(req);
+    if (managerScope.denied) {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: Manager email or ID not found in session',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+    if (managerScope.clientIds !== null && !managerScope.clientIds.includes(client.id)) {
+      res.status(403).json({
+        success: false,
+        message: 'Access Denied: You can only view clients linked to your assigned contracts',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
     res.json({
       success: true,
       data: client,
@@ -289,6 +396,13 @@ export const createClient = async (req: AuthRequest, res: Response): Promise<voi
       idExpiryDate,
       passportNumber,
       birthDate,
+      corporateName,
+      website,
+      licenseNumber,
+      corporateAddress,
+      companyDescription,
+      trnNumber,
+      ibanNumber,
       documentType,
       representativeName,
       representativeEmail,
@@ -309,6 +423,7 @@ export const createClient = async (req: AuthRequest, res: Response): Promise<voi
       representativeCompanyDescription,
       representativeTrnNumber,
       representativeIbanNumber,
+      companyId,
     } = req.body;
 
     // Validation
@@ -328,39 +443,20 @@ export const createClient = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
-    // Prevent duplicates by email/phone (if provided).
+    // Validate email format (duplicates allowed).
     const emailNorm = email ? normalizeEmail(String(email)) : '';
     const phoneNorm = phone ? String(phone).trim() : '';
     if (emailNorm && !isValidEmail(emailNorm)) {
       res.status(400).json({ success: false, message: 'Invalid email format' });
       return;
     }
-    if (emailNorm || phoneNorm) {
-      const exists = await prisma.client.findFirst({
-        where: {
-          OR: [
-            ...(emailNorm ? [{ email: { equals: emailNorm, mode: 'insensitive' as any } }] : []),
-            ...(phoneNorm ? [{ phone: { equals: phoneNorm } }] : []),
-          ],
-        },
-        select: { id: true, referenceNumber: true, name: true, email: true, phone: true },
-      });
-      if (exists) {
-        res.status(409).json({
-          success: false,
-          message: 'Duplicate client: email or phone already exists',
-          data: {
-            existingClient: {
-              id: exists.id,
-              referenceNumber: exists.referenceNumber,
-              name: exists.name,
-              email: exists.email,
-              phone: exists.phone,
-            },
-          },
-        });
-        return;
-      }
+
+    let parsedCompanyId: string | null = null;
+    try {
+      parsedCompanyId = await parseOptionalCompanyId(companyId);
+    } catch (e: any) {
+      res.status(e?.statusCode || 400).json({ success: false, message: e?.message || 'Invalid branch' });
+      return;
     }
 
     // Generate reference number (gapless). Use transaction + retry to avoid race conditions.
@@ -482,6 +578,13 @@ export const createClient = async (req: AuthRequest, res: Response): Promise<voi
               idExpiryDate: parsedIdExpiryDate,
               passportNumber: passportNumber?.trim() || null,
               birthDate: parsedBirthDate,
+              corporateName: corporateName?.trim() || null,
+              website: website?.trim() || null,
+              licenseNumber: licenseNumber?.trim() || null,
+              corporateAddress: corporateAddress?.trim() || null,
+              companyDescription: companyDescription?.trim() || null,
+              trnNumber: trnNumber?.trim() || null,
+              ibanNumber: ibanNumber?.trim() || null,
               representativeName: representativeName?.trim() || null,
               representativeEmail: representativeEmail?.trim() || null,
               representativePhone: representativePhone?.trim() || null,
@@ -508,8 +611,10 @@ export const createClient = async (req: AuthRequest, res: Response): Promise<voi
               documentType: documentType || null,
               documentAttachment,
               documentAttachments,
+              companyId: parsedCompanyId,
             },
             include: {
+              company: { select: { id: true, name: true } },
               _count: {
                 select: {
                   projects: true,
@@ -632,10 +737,11 @@ export const downloadClientTemplate = async (req: AuthRequest, res: Response): P
     instr.addRow(['Client Import Instructions']);
     instr.getRow(1).font = { bold: true, size: 14 };
     instr.addRow([]);
-    instr.addRow(['1) Fill rows starting from row 3 (row 2 is hidden keys).']);
-    instr.addRow(['2) Required columns are marked with * in the header.']);
-    instr.addRow(['3) Dates must be in YYYY-MM-DD format.']);
-    instr.addRow(['4) Do not change header row names or order.']);
+    instr.addRow(['1) Official template: row 1 = headers, row 2 = internal keys (hidden), data from row 3.']);
+    instr.addRow(['2) If you re-import an Excel export (single header row), put clients starting at row 2 — all rows are read.']);
+    instr.addRow(['3) Required columns are marked with * in the header.']);
+    instr.addRow(['4) Dates: YYYY-MM-DD or DD/MM/YYYY; Excel date cells are accepted.']);
+    instr.addRow(['5) Do not change header row names or order.']);
     instr.addRow([]);
     instr.addRow(['Field notes']);
     instr.getRow(instr.lastRow!.number).font = { bold: true };
@@ -667,9 +773,64 @@ function parseDateOrNull(v: string): Date | null {
   const s = v.trim();
   if (!s) return null;
   const d = new Date(s);
-  if (isNaN(d.getTime())) return null;
+  if (!isNaN(d.getTime())) return d;
+  // Common non-ISO cells: DD/MM/YYYY or DD-MM-YYYY
+  const m = s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+  if (m) {
+    const day = parseInt(m[1], 10);
+    const month = parseInt(m[2], 10) - 1;
+    let year = parseInt(m[3], 10);
+    if (year < 100) year += 2000;
+    const d2 = new Date(year, month, day);
+    if (d2.getFullYear() === year && d2.getMonth() === month && d2.getDate() === day) return d2;
+  }
+  return null;
+}
+
+/** Digits only for matching +971... vs 971... vs local formats. */
+function phoneDigitsOnly(phone: string): string {
+  return phone.replace(/\D/g, '');
+}
+
+/**
+ * Single canonical form for duplicate detection (UAE: +97150… vs 050… in sheet vs DB).
+ */
+function normalizePhoneDigitsForDedupe(allDigits: string): string {
+  let d = allDigits.replace(/\D/g, '');
+  if (!d) return '';
+  while (d.startsWith('00')) d = d.slice(2);
+  if (d.startsWith('971')) return d;
+  if (d.startsWith('0') && d.length >= 10 && d[1] === '5') {
+    return `971${d.slice(1)}`;
+  }
   return d;
 }
+
+/**
+ * Map raw cell to a canonical option; optional fields become null when unknown (avoid failing whole row on typos).
+ */
+function normalizeImportSelect(
+  raw: string,
+  options: string[] | undefined,
+  required: boolean
+): { value: string | null; error?: string } {
+  const t = raw.trim();
+  if (!t) return { value: required ? null : null };
+  if (!options?.length) return { value: t };
+  if (options.includes(t)) return { value: t };
+  const lower = t.toLowerCase();
+  const canon = options.find((o) => o.toLowerCase() === lower);
+  if (canon) return { value: canon };
+  if (required) {
+    return {
+      value: null,
+      error: `Invalid value. Allowed: ${options.join(', ')}`,
+    };
+  }
+  return { value: null };
+}
+
+// Note: duplicates by email/phone are allowed. Imports update only by referenceNumber.
 
 export const importClientsExcel = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -686,21 +847,31 @@ export const importClientsExcel = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
+    expandSheetRangeToUsedGrid(sheet);
     const rows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: '' }) as any;
     if (!rows.length || rows.length < 2) {
       res.status(400).json({ success: false, message: 'Template is empty' });
       return;
     }
 
-    const headerLabels = (rows[0] || []).map((x) => safeCellString(x));
-    const headerKeys = (rows[1] || []).map((x) => safeCellString(x));
     const expectedKeys = CLIENT_IMPORT_SCHEMA.map((f) => f.key);
+    const headerLabels = (rows[0] || []).map((x) => safeCellString(x));
+    const row1Cells = (rows[1] || []).map((x) => importCellString(x));
 
-    const keysToUse = headerKeys.every((k) => k) ? headerKeys : headerLabels.map((l) => {
-      const cleaned = l.replace(/\s*\*$/, '').trim().toLowerCase();
-      const match = CLIENT_IMPORT_SCHEMA.find((f) => f.label.toLowerCase() === cleaned);
-      return match?.key || '';
-    });
+    const isSchemaKeysRow = (cells: string[]) =>
+      expectedKeys.length > 0 &&
+      expectedKeys.every((key, i) => safeCellString(cells[i] ?? '') === key);
+
+    /** Official template: row1 = labels, row2 = API keys (hidden), row3+ = data. */
+    const hasKeysRow = isSchemaKeysRow(row1Cells);
+
+    const keysToUse = hasKeysRow
+      ? expectedKeys
+      : headerLabels.map((l) => {
+          const cleaned = l.replace(/\s*\*$/, '').trim().toLowerCase();
+          const match = CLIENT_IMPORT_SCHEMA.find((f) => f.label.toLowerCase() === cleaned);
+          return match?.key || '';
+        });
 
     if (keysToUse.join('|') !== expectedKeys.join('|')) {
       res.status(400).json({
@@ -710,29 +881,48 @@ export const importClientsExcel = async (req: AuthRequest, res: Response): Promi
       return;
     }
 
-    const dataRows = rows.slice(2); // start at row 3 in Excel
+    /**
+     * Re-importing an **export** (or any single-header file) has only one header row; the first
+     * client is on row 2. The old `slice(2)` path dropped that entire row, so "many" clients
+     * were missing when users round-tripped export → edit → import.
+     */
+    const dataRows = hasKeysRow ? rows.slice(2) : rows.slice(1);
+    /** 1-based Excel row of the first data row (row 3 with keys row, row 2 for export-style sheets). */
+    const firstDataRowExcel = hasKeysRow ? 3 : 2;
     const errors: Array<{ rowNumber: number; field: string; message: string }> = [];
     let processed = 0;
-    let successCount = 0;
+    let createdCount = 0;
+    let updatedCount = 0;
     let failedCount = 0;
+    const batchRefToId = new Map<string, string>();
 
     for (let i = 0; i < dataRows.length; i++) {
-      const excelRowNumber = i + 3;
+      const excelRowNumber = i + firstDataRowExcel;
       const values = dataRows[i] || [];
       // Skip empty rows
-      const isEmpty = values.every((v) => !safeCellString(v));
+      const isEmpty = values.every((v) => !importCellString(v));
       if (isEmpty) continue;
       processed += 1;
 
       const payload: any = {};
       CLIENT_IMPORT_SCHEMA.forEach((f, idx) => {
-        payload[f.key] = safeCellString(values[idx]);
+        payload[f.key] = importCellString(values[idx]);
       });
 
-      // Validate required
+      // If the hidden keys row was not recognized (e.g. file damaged), do not import it as a person
+      if (CLIENT_IMPORT_SCHEMA.every((f) => payload[f.key] === f.key)) {
+        continue;
+      }
+
+      // Canonicalize select values (case/spacing/typos in optional fields)
       for (const f of CLIENT_IMPORT_SCHEMA) {
-        if (f.required && !payload[f.key]) {
-          errors.push({ rowNumber: excelRowNumber, field: f.label, message: 'Required field is missing' });
+        if (f.type === 'select') {
+          const { value, error } = normalizeImportSelect(payload[f.key], f.options, !!f.required);
+          if (error) {
+            errors.push({ rowNumber: excelRowNumber, field: f.label, message: error });
+          } else {
+            payload[f.key] = value;
+          }
         }
       }
 
@@ -741,41 +931,38 @@ export const importClientsExcel = async (req: AuthRequest, res: Response): Promi
         errors.push({ rowNumber: excelRowNumber, field: 'Email', message: 'Invalid email format' });
       }
 
-      // Validate selects
-      for (const f of CLIENT_IMPORT_SCHEMA) {
-        if (f.type === 'select' && payload[f.key]) {
-          const ok = (f.options || []).includes(payload[f.key]);
-          if (!ok) {
-            errors.push({ rowNumber: excelRowNumber, field: f.label, message: `Invalid value. Allowed: ${(f.options || []).join(', ')}` });
-          }
-        }
-      }
-
       // Validate dates
       const parsedIdExpiryDate = payload.idExpiryDate ? parseDateOrNull(payload.idExpiryDate) : null;
       if (payload.idExpiryDate && !parsedIdExpiryDate) {
-        errors.push({ rowNumber: excelRowNumber, field: 'ID Expiry Date', message: 'Invalid date (use YYYY-MM-DD)' });
+        errors.push({ rowNumber: excelRowNumber, field: 'ID Expiry Date', message: 'Invalid date (use YYYY-MM-DD or DD/MM/YYYY)' });
       }
       const parsedBirthDate = payload.birthDate ? parseDateOrNull(payload.birthDate) : null;
       if (payload.birthDate && !parsedBirthDate) {
-        errors.push({ rowNumber: excelRowNumber, field: 'Birth Date', message: 'Invalid date (use YYYY-MM-DD)' });
+        errors.push({ rowNumber: excelRowNumber, field: 'Birth Date', message: 'Invalid date (use YYYY-MM-DD or DD/MM/YYYY)' });
       }
 
-      // Dedupe (email/phone) if provided
       const emailNorm = payload.email ? normalizeEmail(payload.email) : '';
-      const phoneNorm = payload.phone ? payload.phone.trim() : '';
-      if (emailNorm || phoneNorm) {
-        const exists = await prisma.client.findFirst({
-          where: {
-            OR: [
-              ...(emailNorm ? [{ email: { equals: emailNorm, mode: 'insensitive' as any } }] : []),
-              ...(phoneNorm ? [{ phone: { equals: phoneNorm } }] : []),
-            ],
-          },
-          select: { id: true },
-        });
-        if (exists) {
-          errors.push({ rowNumber: excelRowNumber, field: 'Email/Phone', message: 'Duplicate client (email/phone already exists)' });
+      const phoneForStore = payload.phone ? payload.phone.replace(/\s+/g, ' ').trim() : '';
+
+      // Determine update target only by referenceNumber (email/phone duplicates allowed).
+      const ref = payload.referenceNumber ? String(payload.referenceNumber).trim() : '';
+      const existingIdFromBatch = ref ? batchRefToId.get(ref) ?? null : null;
+      const existingIdFromDb = existingIdFromBatch
+        ? null
+        : ref
+          ? (await prisma.client.findUnique({ where: { referenceNumber: ref }, select: { id: true } }))?.id ?? null
+          : null;
+      const targetClientId = existingIdFromBatch || existingIdFromDb;
+
+      // Validate required only when creating a new client (updates can be partial)
+      if (!targetClientId) {
+        for (const f of CLIENT_IMPORT_SCHEMA) {
+          if (f.required && !payload[f.key]) {
+            const already = errors.some((e) => e.rowNumber === excelRowNumber && e.field === f.label);
+            if (!already) {
+              errors.push({ rowNumber: excelRowNumber, field: f.label, message: 'Required field is missing' });
+            }
+          }
         }
       }
 
@@ -786,32 +973,59 @@ export const importClientsExcel = async (req: AuthRequest, res: Response): Promi
       }
 
       try {
-        const year = new Date().getFullYear();
-        const created = await prisma.$transaction(async (tx) => {
-          const referenceNumber = await generateNextClientReferenceNumber(tx as any, year);
-          return tx.client.create({
-            data: {
-              referenceNumber,
-              name: payload.name,
-              isCorporate: payload.isCorporate,
-              leadSource: payload.leadSource || null,
-              rank: payload.rank || null,
-              email: payload.email ? payload.email.trim() : null,
-              phone: payload.phone ? payload.phone.trim() : null,
-              address: payload.address || null,
-              nationality: payload.nationality || null,
-              idNumber: payload.idNumber || null,
-              idExpiryDate: parsedIdExpiryDate,
-              passportNumber: payload.passportNumber || null,
-              birthDate: parsedBirthDate,
-            },
+        if (targetClientId) {
+          const updateData: any = {};
+          if (payload.name) updateData.name = payload.name;
+          if (payload.isCorporate) updateData.isCorporate = payload.isCorporate;
+          if (payload.leadSource !== undefined) updateData.leadSource = payload.leadSource || null;
+          if (payload.rank !== undefined) updateData.rank = payload.rank || null;
+          if (payload.email) updateData.email = payload.email.trim();
+          if (phoneForStore) updateData.phone = phoneForStore;
+          if (payload.address) updateData.address = payload.address;
+          if (payload.nationality) updateData.nationality = payload.nationality;
+          if (payload.idNumber) updateData.idNumber = payload.idNumber;
+          if (payload.passportNumber) updateData.passportNumber = payload.passportNumber;
+          if (parsedIdExpiryDate) updateData.idExpiryDate = parsedIdExpiryDate;
+          if (parsedBirthDate) updateData.birthDate = parsedBirthDate;
+
+          await prisma.client.update({
+            where: { id: targetClientId },
+            data: updateData,
           });
-        });
-        void created;
-        successCount += 1;
+          if (ref) batchRefToId.set(ref, targetClientId);
+          updatedCount += 1;
+        } else {
+          const year = new Date().getFullYear();
+          const created = await prisma.$transaction(async (tx) => {
+            const referenceNumber = await generateNextClientReferenceNumber(tx as any, year);
+            return tx.client.create({
+              data: {
+                referenceNumber,
+                name: payload.name,
+                isCorporate: payload.isCorporate,
+                leadSource: payload.leadSource || null,
+                rank: payload.rank || null,
+                email: payload.email ? payload.email.trim() : null,
+                phone: phoneForStore || null,
+                address: payload.address || null,
+                nationality: payload.nationality || null,
+                idNumber: payload.idNumber || null,
+                idExpiryDate: parsedIdExpiryDate,
+                passportNumber: payload.passportNumber || null,
+                birthDate: parsedBirthDate,
+              },
+            });
+          });
+          if (ref) batchRefToId.set(ref, created.id);
+          createdCount += 1;
+        }
       } catch (e: any) {
         failedCount += 1;
-        errors.push({ rowNumber: excelRowNumber, field: 'Row', message: e?.message ? String(e.message) : 'Failed to create client' });
+        errors.push({
+          rowNumber: excelRowNumber,
+          field: 'Row',
+          message: e?.message ? String(e.message) : 'Failed to import client (create/update)',
+        });
       }
     }
 
@@ -828,14 +1042,25 @@ export const importClientsExcel = async (req: AuthRequest, res: Response): Promi
       errorReportBase64 = buf.toString('base64');
     }
 
+    const errorSummary: Record<string, number> = {};
+    for (const e of errors) {
+      const k = `${e.field}: ${e.message}`;
+      errorSummary[k] = (errorSummary[k] || 0) + 1;
+    }
+
     res.json({
       success: true,
       data: {
         processed,
-        imported: successCount,
+        imported: createdCount + updatedCount,
+        created: createdCount,
+        updated: updatedCount,
         failed: failedCount,
         errorCount: errors.length,
         errorReportBase64,
+        /** Counts per error message — use with `errorReportBase64` to see which rows failed */
+        errorSummary:
+          Object.keys(errorSummary).length > 0 ? errorSummary : undefined,
       },
     });
   } catch (e: any) {
@@ -894,6 +1119,13 @@ export const updateClient = async (req: AuthRequest, res: Response): Promise<voi
       idExpiryDate,
       passportNumber,
       birthDate,
+      corporateName,
+      website,
+      licenseNumber,
+      corporateAddress,
+      companyDescription,
+      trnNumber,
+      ibanNumber,
       documentType,
       representativeName,
       representativeEmail,
@@ -914,6 +1146,7 @@ export const updateClient = async (req: AuthRequest, res: Response): Promise<voi
       representativeCompanyDescription,
       representativeTrnNumber,
       representativeIbanNumber,
+      companyId,
     } = req.body;
 
     // Check if client exists
@@ -1052,6 +1285,13 @@ export const updateClient = async (req: AuthRequest, res: Response): Promise<voi
     if (parsedIdExpiryDate !== undefined) updateData.idExpiryDate = parsedIdExpiryDate;
     if (passportNumber !== undefined) updateData.passportNumber = passportNumber?.trim() || null;
     if (parsedBirthDate !== undefined) updateData.birthDate = parsedBirthDate;
+    if (corporateName !== undefined) updateData.corporateName = corporateName?.trim() || null;
+    if (website !== undefined) updateData.website = website?.trim() || null;
+    if (licenseNumber !== undefined) updateData.licenseNumber = licenseNumber?.trim() || null;
+    if (corporateAddress !== undefined) updateData.corporateAddress = corporateAddress?.trim() || null;
+    if (companyDescription !== undefined) updateData.companyDescription = companyDescription?.trim() || null;
+    if (trnNumber !== undefined) updateData.trnNumber = trnNumber?.trim() || null;
+    if (ibanNumber !== undefined) updateData.ibanNumber = ibanNumber?.trim() || null;
     if (representativeName !== undefined) updateData.representativeName = representativeName?.trim() || null;
     if (representativeEmail !== undefined) updateData.representativeEmail = representativeEmail?.trim() || null;
     if (representativePhone !== undefined) updateData.representativePhone = representativePhone?.trim() || null;
@@ -1071,6 +1311,15 @@ export const updateClient = async (req: AuthRequest, res: Response): Promise<voi
     if (representativeCompanyDescription !== undefined) updateData.representativeCompanyDescription = representativeCompanyDescription?.trim() || null;
     if (representativeTrnNumber !== undefined) updateData.representativeTrnNumber = representativeTrnNumber?.trim() || null;
     if (representativeIbanNumber !== undefined) updateData.representativeIbanNumber = representativeIbanNumber?.trim() || null;
+
+    if (companyId !== undefined) {
+      try {
+        updateData.companyId = await parseOptionalCompanyId(companyId);
+      } catch (e: any) {
+        res.status(e?.statusCode || 400).json({ success: false, message: e?.message || 'Invalid branch' });
+        return;
+      }
+    }
 
     if (filesObj?.representativePowerOfAttorney?.length) {
       const f = filesObj.representativePowerOfAttorney[0];
@@ -1094,6 +1343,7 @@ export const updateClient = async (req: AuthRequest, res: Response): Promise<voi
       where: { id },
       data: updateData,
       include: {
+        company: { select: { id: true, name: true } },
         _count: {
           select: {
             projects: true,

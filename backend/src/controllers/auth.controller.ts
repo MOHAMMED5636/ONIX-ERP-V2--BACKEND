@@ -7,8 +7,41 @@ import { AuthRequest } from '../middleware/auth.middleware';
 import { getPhotoUrl } from '../utils/photo.utils';
 import { labourDetailsToSelfServicePayroll } from '../utils/payroll.utils';
 import { shapeEmployeeForClient } from '../utils/employee-response';
+import { resolveCompanyAccessScope, resolveEmployeeCompanyRecords } from '../services/companyAccess.service';
 import { sendLoginOtpEmail } from '../services/email.service';
 import { logUserActivity } from '../services/userActivityLog.service';
+
+function getPublicRequestLocation(req: Request): { protocol: string; host: string } {
+  const protocol = req.protocol || 'http';
+  const host = req.get('host') || 'localhost:3001';
+  const forwardedHost = req.get('x-forwarded-host');
+  const forwardedProto = req.get('x-forwarded-proto');
+  const origin = req.get('origin');
+
+  if (origin) {
+    try {
+      const u = new URL(origin);
+      if (u.host) {
+        return {
+          protocol: u.protocol.replace(/:$/, '') || protocol,
+          host: u.host,
+        };
+      }
+    } catch {
+      // Ignore invalid origin header and continue with fallback logic.
+    }
+  }
+
+  const hostIsLocalOnly = /^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host);
+  if (hostIsLocalOnly && forwardedHost) {
+    return {
+      protocol: forwardedProto?.split(',')[0]?.trim() || protocol,
+      host: forwardedHost.split(',')[0]?.trim() || forwardedHost,
+    };
+  }
+
+  return { protocol, host };
+}
 
 /** Permissions per role for unified login / role-based access */
 function getPermissionsForRole(role: string): string[] {
@@ -102,6 +135,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             isActive: true,
             forcePasswordChange: true,
             employeeId: true,
+            totalXp: true,
+            starCount: true,
             labourDetails: {
               select: {
                 basicSalary: true,
@@ -134,6 +169,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
             isActive: true,
             forcePasswordChange: true,
             employeeId: true,
+            totalXp: true,
+            starCount: true,
             labourDetails: {
               select: {
                 basicSalary: true,
@@ -175,7 +212,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     console.log(`✅ Login successful for user: ${user.email} (${user.role})`);
     
     // Get photo URL - verify file exists before returning URL
-    const photoUrl = getPhotoUrl(user.photo, req.protocol, req.get('host') || 'localhost:3001');
+    const publicRequest = getPublicRequestLocation(req);
+    const photoUrl = getPhotoUrl(user.photo, publicRequest.protocol, publicRequest.host);
     
     if (user.photo && !photoUrl) {
       console.log(`⚠️  Photo file not found for user ${user.email}: ${user.photo}`);
@@ -194,6 +232,8 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       photo: photoUrl,
       forcePasswordChange: user.forcePasswordChange ?? false,
       employeeId: user.employeeId ?? null,
+      totalXp: user.totalXp ?? 0,
+      starCount: user.starCount ?? 0,
       permissions,
       payroll: labourDetailsToSelfServicePayroll(user.labourDetails),
     };
@@ -263,6 +303,8 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
         isActive: true,
         forcePasswordChange: true,
         employeeId: true,
+        totalXp: true,
+        starCount: true,
         nationalIdNumber: true,
         nationalIdExpiryDate: true,
         employeeType: true,
@@ -322,9 +364,8 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
     
-    const protocol = req.protocol || 'http';
-    const host = req.get('host') || 'localhost:3001';
-    const photoUrl = getPhotoUrl(user.photo, protocol, host);
+    const publicRequest = getPublicRequestLocation(req);
+    const photoUrl = getPhotoUrl(user.photo, publicRequest.protocol, publicRequest.host);
     if (user.photo && !photoUrl) {
       console.log(`⚠️  Photo file not found for user ${user.email}: ${user.photo}`);
     }
@@ -337,15 +378,34 @@ export const getCurrentUser = async (req: AuthRequest, res: Response): Promise<v
         : null;
 
     const permissions = getPermissionsForRole(user.role);
+    const companyAccess = await resolveCompanyAccessScope(user.id, user.role);
+    const scopedCompanies = companyAccess.unrestricted
+      ? []
+      : companyAccess.companies.length > 0
+        ? companyAccess.companies
+        : await resolveEmployeeCompanyRecords(user.id);
+    const accessibleCompanies = scopedCompanies.map((c) => ({
+      id: c.id,
+      name: c.name,
+      tag: c.tag,
+      branchName: c.branchName,
+      address: c.address,
+      logo: c.logo ?? null,
+    }));
+
     res.json({
       success: true,
       data: {
         ...shaped,
         photo: photoUrl,
         employeeId: user.employeeId ?? null,
+        totalXp: user.totalXp ?? 0,
+        starCount: user.starCount ?? 0,
         managerName,
         payroll: labourDetailsToSelfServicePayroll(labourDetails),
         permissions,
+        accessibleCompanies,
+        companyAccessUnrestricted: companyAccess.unrestricted,
       },
     });
   } catch (error) {
@@ -563,6 +623,8 @@ export const verifyLoginOtp = async (req: Request, res: Response): Promise<void>
         isActive: true,
         forcePasswordChange: true,
         employeeId: true,
+        totalXp: true,
+        starCount: true,
         loginOtp: true,
         loginOtpExpiry: true,
         labourDetails: {
@@ -637,7 +699,8 @@ export const verifyLoginOtp = async (req: Request, res: Response): Promise<void>
     });
     
     // Get photo URL
-    const photoUrl = getPhotoUrl(user.photo, req.protocol, req.get('host') || 'localhost:3001');
+    const publicRequest = getPublicRequestLocation(req);
+    const photoUrl = getPhotoUrl(user.photo, publicRequest.protocol, publicRequest.host);
     
     if (user.photo && !photoUrl) {
       console.log(`⚠️  Photo file not found for user ${user.email}: ${user.photo}`);
@@ -656,6 +719,8 @@ export const verifyLoginOtp = async (req: Request, res: Response): Promise<void>
       photo: photoUrl,
       forcePasswordChange: user.forcePasswordChange ?? false,
       employeeId: user.employeeId ?? null,
+      totalXp: user.totalXp ?? 0,
+      starCount: user.starCount ?? 0,
       permissions,
       payroll: labourDetailsToSelfServicePayroll(user.labourDetails),
     };

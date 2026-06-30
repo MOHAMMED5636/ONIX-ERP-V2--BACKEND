@@ -1,5 +1,37 @@
 import { Prisma, PrismaClient } from '@prisma/client';
 
+/**
+ * Next internal stableWorkSeq slot (append-only). Main-row display stays 1..n via compact on load.
+ */
+export async function computeNextStableWorkSeq(
+  db: any,
+  projectId: string,
+  parentTaskId: string | null,
+): Promise<number> {
+  const agg = await db.task.aggregate({
+    where: { projectId, parentTaskId, deletedAt: null },
+    _max: { stableWorkSeq: true },
+  } as any);
+  return ((agg as { _max: { stableWorkSeq: number | null } })._max.stableWorkSeq ?? 0) + 1;
+}
+
+/** Next main-row display number when appending at end (excludes insert-between suffix rows). */
+export async function computeNextMainDisplaySeq(
+  db: any,
+  projectId: string,
+  parentTaskId: string | null,
+): Promise<number> {
+  const rows = await db.task.findMany({
+    where: { projectId, parentTaskId, deletedAt: null },
+    select: { stableWorkSeq: true, displaySuffix: true },
+  });
+  const mainSeqs = rows
+    .filter((r: { displaySuffix?: string | null }) => !r.displaySuffix)
+    .map((r: { stableWorkSeq?: number | null }) => Number(r.stableWorkSeq) || 0);
+  const maxMain = mainSeqs.reduce((m: number, s: number) => Math.max(m, s), 0);
+  return maxMain + 1;
+}
+
 export type ProjectNumberTx = Pick<
   Prisma.TransactionClient,
   '$executeRaw' | '$queryRaw' | 'project'

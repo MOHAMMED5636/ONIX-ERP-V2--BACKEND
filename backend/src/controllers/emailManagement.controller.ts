@@ -2,10 +2,11 @@ import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { sendEmail } from '../services/email.service';
+import { ERP_EMAIL_CATALOG, getEmailCatalogSummary } from '../config/erpEmailCatalog';
 
 function requireAdminOrHr(req: AuthRequest, res: Response): boolean {
   const role = req.user?.role;
-  if (!role || !['ADMIN', 'HR'].includes(role)) {
+  if (!role || !['ADMIN', 'HR', 'SUPER_ADMIN'].includes(role)) {
     res.status(403).json({ success: false, message: 'Forbidden' });
     return false;
   }
@@ -22,6 +23,22 @@ function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
 }
 
 // -------- Templates --------
+export const listEmailCatalog = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (!requireAdminOrHr(req, res)) return;
+    res.json({
+      success: true,
+      data: {
+        summary: getEmailCatalogSummary(),
+        entries: ERP_EMAIL_CATALOG,
+      },
+    });
+  } catch (e) {
+    console.error('listEmailCatalog error:', e);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
 export const listEmailTemplates = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     if (!requireAdminOrHr(req, res)) return;

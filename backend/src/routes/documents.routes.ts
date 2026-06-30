@@ -1,6 +1,5 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.middleware';
-import { requirePermission, ResourceType, PermissionAction } from '../middleware/permissions.middleware';
 import * as documentsController from '../controllers/documents.controller';
 import { upload } from '../middleware/upload.middleware';
 
@@ -40,11 +39,17 @@ router.post('/', uploadMiddleware, documentsController.uploadDocument);
 // List all documents - Employees can VIEW documents
 router.get('/', documentsController.listDocuments);
 
+// Download a document file
+router.get('/:id/download', documentsController.downloadDocument);
+
 // Get a single document by ID - Employees can VIEW documents
 router.get('/:id', documentsController.getDocument);
 
-// Delete a document - Employees CANNOT delete documents
-router.delete('/:id', requirePermission(ResourceType.DOCUMENT, PermissionAction.DELETE), documentsController.deleteDocument);
+// Update document metadata (expiry, etc.)
+router.patch('/:id', documentsController.patchDocument);
+
+// Delete: authorization is enforced in the controller (privileged roles vs own-upload only)
+router.delete('/:id', documentsController.deleteDocument);
 
 export default router;
 

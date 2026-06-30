@@ -1,7 +1,23 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
-import { calculateDistance, checkProximity, isValidCoordinates } from '../utils/location.utils';
+import { startCheckoutHandler, completeCheckoutHandler } from '../services/attendanceCheckout.service';
+import {
+  applyFacialAttendance,
+  buildProfilePhotoUrl,
+  companyRequiresFacial,
+  detectDeviceInfo,
+  isFacialAttendanceExempt,
+  isMobileUserAgent,
+  resolveFacialMinScore,
+} from '../services/faceAttendance.service';
+import { config } from '../config/env';
+import { UserRole } from '@prisma/client';
+import {
+  resolveCompanyForAttendanceUser,
+  userRequiresOfficeGeofence,
+  validateOfficeGeofence,
+} from '../services/officeGeofence.service';
 
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -53,24 +69,10 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // Location is now optional - validate only if provided
-    let isValidLocation = false;
-    let distance = null;
-    let isWithinRadius = null;
-    
-    if (latitude !== undefined && longitude !== undefined) {
-      // Validate coordinates if provided
-      if (!isValidCoordinates(latitude, longitude)) {
-        res.status(400).json({
-          success: false,
-          message: 'Invalid coordinates provided',
-        });
-        return;
-      }
-      isValidLocation = true;
-    }
+    // Location / office geofence
+    let distance: number | null = null;
+    let isWithinRadius: boolean | null = null;
 
-    // Get user
     const user = await prisma.user.findUnique({
       where: { id: userId },
     });
@@ -80,18 +82,7 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // Get company (try from user's company field or from assigned projects)
-    let company = null;
-    if (user.company) {
-      company = await prisma.company.findFirst({
-        where: { name: user.company },
-      });
-    }
-
-    // If no company found, get the first company (for single-company setups)
-    if (!company) {
-      company = await prisma.company.findFirst();
-    }
+    const company = await resolveCompanyForAttendanceUser(user);
 
     if (!company) {
       res.status(500).json({
@@ -101,35 +92,37 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // Location validation is now optional - only validate if location is provided
-    if (isValidLocation && company.officeLatitude && company.officeLongitude) {
-      const officeLat = company.officeLatitude;
-      const officeLon = company.officeLongitude;
-      const allowedRadius = company.attendanceRadius || 200; // Default 200 meters
+    const geofence = validateOfficeGeofence(user, company, latitude, longitude);
+    if (!geofence.ok) {
+      res.status(geofence.status).json({
+        success: false,
+        code: geofence.code,
+        message: geofence.message,
+        distance: geofence.distance,
+        allowedRadius: geofence.allowedRadius,
+      });
+      return;
+    }
+    distance = geofence.distance;
+    isWithinRadius = geofence.isWithinRadius;
 
-      // Calculate distance and check proximity
-      const proximityResult = checkProximity(
-        latitude,
-        longitude,
-        officeLat,
-        officeLon,
-        allowedRadius
-      );
-      
-      isWithinRadius = proximityResult.isWithinRadius;
-      distance = proximityResult.distance;
-
-      // Server-side validation: reject if outside radius (only if location is provided)
-      if (!isWithinRadius) {
-        res.status(403).json({
-          success: false,
-          message: `You must be within ${allowedRadius} meters of the office to mark attendance. Your current distance is ${distance.toFixed(2)} meters.`,
-          distance: distance,
-          allowedRadius: allowedRadius,
-          isWithinRadius: false,
-        });
-        return;
-      }
+    // Facial attendance (mobile selfie verification)
+    const facial = applyFacialAttendance(
+      userId,
+      req.get('user-agent'),
+      user.role as UserRole,
+      company,
+      user,
+      type as 'CHECK_IN' | 'CHECK_OUT',
+      { faceImage: req.body.faceImage, faceMatchScore: req.body.faceMatchScore },
+    );
+    if (!facial.ok) {
+      res.status(facial.status).json({
+        success: false,
+        code: facial.code,
+        message: facial.message,
+      });
+      return;
     }
 
     // Calendar day for this mark (client local YYYY-MM-DD when sent — fixes Check Out not showing when server TZ ≠ user)
@@ -218,7 +211,11 @@ export const markAttendance = async (req: AuthRequest, res: Response): Promise<v
       locationAccuracy: accuracy || null,
       ipAddress: req.ip || req.socket.remoteAddress || null,
       userAgent: req.get('user-agent') || null,
+      deviceInfo: detectDeviceInfo(req.get('user-agent')),
       status: 'PRESENT' as const,
+      facePhotoPath: facial.facePhotoPath,
+      faceMatchScore: facial.faceMatchScore,
+      faceVerified: facial.faceVerified,
     };
 
     if (type === 'CHECK_IN') {
@@ -631,6 +628,8 @@ export const getOfficeLocation = async (req: AuthRequest, res: Response): Promis
       return;
     }
 
+    const requireGeofence = userRequiresOfficeGeofence(user, company);
+
     res.json({
       success: true,
       data: {
@@ -638,10 +637,69 @@ export const getOfficeLocation = async (req: AuthRequest, res: Response): Promis
         longitude: company.officeLongitude,
         radius: company.attendanceRadius || 200,
         address: company.address || null,
+        companyName: company.name,
+        requireGeofence,
       },
     });
   } catch (error) {
     console.error('Get office location error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+export const startCheckout = startCheckoutHandler;
+export const completeCheckout = completeCheckoutHandler;
+
+/** Face attendance settings for the current user (mobile check-in/out) */
+export const getFaceAttendanceConfig = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      res.status(401).json({ success: false, message: 'Unauthorized' });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { role: true, photo: true, company: true },
+    });
+    if (!user) {
+      res.status(404).json({ success: false, message: 'User not found' });
+      return;
+    }
+
+    let company = null;
+    if (user.company) {
+      company = await prisma.company.findFirst({ where: { name: user.company } });
+    }
+    if (!company) {
+      company = await prisma.company.findFirst({
+        select: {
+          requireFacialAttendance: true,
+          facialMatchMinScore: true,
+        },
+      });
+    }
+
+    const role = user.role as UserRole;
+    const exempt = isFacialAttendanceExempt(role);
+    const required = !exempt && companyRequiresFacial(company);
+    const ua = req.get('user-agent');
+
+    res.json({
+      success: true,
+      data: {
+        required,
+        exempt,
+        hasProfilePhoto: !!user.photo,
+        profilePhotoUrl: buildProfilePhotoUrl(config.apiPublicUrl, user.photo),
+        minMatchScore: resolveFacialMinScore(company),
+        isMobileClient: isMobileUserAgent(ua),
+        requiresFacialOnThisDevice: required && isMobileUserAgent(ua),
+      },
+    });
+  } catch (error) {
+    console.error('getFaceAttendanceConfig error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };

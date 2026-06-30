@@ -1,20 +1,140 @@
 import { Request, Response } from 'express';
 import prisma from '../config/database';
 import {
-  mainTaskVisibleToEmployeeInProject,
-  taskRowInvolvesEmployee,
+  mainTaskVisibleToAssignedEmployeeInProject,
+  taskRowAssignedToEmployee,
+  isTaskNodeAssignedToEmployee,
 } from '../utils/employee-task-involvement';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { ProjectStatus, TaskStatus, TaskPriority } from '@prisma/client';
 import {
   computeTaskPermissions,
+  mapTaskTreeWithPermissions,
+  MESSAGE_NO_PERMISSION_DELETE_TASK,
 } from '../utils/task-permissions';
-import { unlockDependentsWaitingOnFinishedPredecessor } from '../utils/task-predecessor-unlock';
-import { computeNextProjectNumber } from '../utils/project-number';
+import { resolveUserManagesProject } from '../utils/project-pm-ownership';
+import {
+  unlockDependentsWaitingOnFinishedPredecessor,
+  workflowStatusFromPredecessorChain,
+  clampTaskStatusAgainstIncompletePredecessor,
+  isPredecessorRowCompleted,
+  buildPredecessorResolveIndex,
+  resolvePredecessorIdFromDisplayKey,
+  syncProjectPredecessorLinksFromDisplayKeys,
+  resolveEffectivePredecessorForTaskRow,
+  mapProjectTasksForMainTableClient,
+  shouldPreserveCompletedTaskStatusOnSave,
+  workflowStatusForSavedTaskStatus,
+} from '../utils/task-predecessor-unlock';
+import { applyEffortFieldsFromPayload, applyRatingFromPayload } from '../utils/task-effort-fields';
+import { loadReferencePlanDaysData, ReferencePlanDays, resolvePlanDaysForTaskTitle, resolveCategoryForTaskTitle, resolvePriorityForTaskTitle, resolveAssigneeIdForTaskTitle, applyReferenceTemplateToTaskRow, applyReferenceTemplateToTaskTree, isReferenceProjectRef, REFERENCE_PROJECT_REF } from '../utils/default-plan-days';
+import {
+  listRecoverableDeletions,
+  purgeExpiredSoftDeletions,
+  permanentlyDeleteProjectFromTrash,
+  permanentlyDeleteTasksFromTrash,
+  restoreProject,
+  restoreTask,
+  softDeleteProject,
+  softDeleteTasks,
+} from '../services/deletion-recovery.service';
+import { DELETION_RECOVERY_HOURS } from '../utils/deletion-recovery';
+import { maybeAwardXpForStatusTransition } from '../services/gamification.service';
+import { mapFrontendTaskStatusToEnum } from '../utils/taskStatusMap';
+import {
+  extractStatusReversionReason,
+  isTaskStatusChanged,
+  processPmTaskStatusChangeNotification,
+} from '../services/taskStatusReversion.service';
+import { maybeNotifyTaskNotesFromSave } from '../services/taskNotesNotify.service';
+import {
+  notifyProjectManagerAssignedEmail,
+  resolveProjectManagerUser,
+} from '../services/emailDispatch.service';
+import { userCanUnlockCompletedTask } from '../utils/task-permissions';
+import { notifyPmProjectAssignment } from '../services/projectPmAssignmentNotice.service';
+
+/** Assignee auto-save must not return stale project/task payloads from browser cache. */
+function setNoCacheJson(res: Response): void {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+}
+import { computeNextProjectNumber, computeNextStableWorkSeq, computeNextMainDisplaySeq } from '../utils/project-number';
+import {
+  isProjectSuspendedStatus,
+  PROJECT_SUSPENDED_MESSAGE,
+  userCanReactivateSuspendedProject,
+} from '../utils/project-suspension';
+import {
+  requiresProjectDeletionOtp,
+  managerCanAccessProjectForDeletion,
+  requestProjectDeletion as createProjectDeletionRequest,
+  validateAndConsumeDeletionOtp as consumeDeletionOtp,
+  markDeletionRequestDeleted,
+  executeProjectDeletionInTransaction,
+} from '../services/projectDeletionApproval.service';
+import {
+  logProjectActivity,
+  collectTaskChanges,
+  collectTaskChangesAfterPersist,
+  userShortLabel,
+  hydrateProjectActivityItems,
+  collectTaskSubtreeTaskIds,
+  formatActivityChangeLines,
+  resolveTaskDisplayIdForTaskId,
+} from '../services/projectActivity.service';
+import { formatWorkItemRef } from '../utils/task-display-id';
+import {
+  resolveCompanyAccessScope,
+  roleUsesCompanyAccessScope,
+} from '../services/companyAccess.service';
+import {
+  buildProjectWhereForCompanyScope,
+  mergeProjectScopeIntoWhere,
+  projectMatchesCompanyScope,
+} from '../utils/contractBranchFilter';
+import { getManagerTransferScope } from '../services/projectManagerTransfer.service';
+import { repairInsertedTaskDisplayKeys, compactMainRowStableWorkSeq } from '../utils/task-display-key';
+import {
+  insertTaskAfter,
+  assertTaskManagementRole,
+  type InsertDependencyMode,
+} from '../services/taskInsert.service';
+
+const projectDebugLog = (...args: unknown[]) => {
+  if (process.env.DEBUG_PROJECTS === 'true') console.log(...args);
+};
+
+/** Main Table row order: execution order first, then permanent display slot, then creation time. */
+const TASK_ORDER_THEN_CREATED_AT = [
+  { taskOrder: 'asc' as const },
+  { stableWorkSeq: 'asc' as const },
+  { createdAt: 'asc' as const },
+] as const;
+
+/** User fields for avatar display in Main Table / project chat. */
+const USER_AVATAR_SELECT = {
+  id: true,
+  firstName: true,
+  lastName: true,
+  email: true,
+  photo: true,
+} as const;
 
 function looksLikeUuid(v: unknown): v is string {
   if (typeof v !== 'string') return false;
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
+}
+
+/** Align JWT / legacy role strings with UserRole-style comparisons (mirrors frontend normalizeErpRole). */
+function normalizeErpRole(role: unknown): string {
+  if (role == null || role === '') return '';
+  const collapsed = String(role).trim().toUpperCase().replace(/[\s-]+/g, '_');
+  if (collapsed === 'SUPERADMIN') return 'SUPER_ADMIN';
+  // In this ERP, PROJECT_MANAGER should behave like MANAGER for scoping rules.
+  if (collapsed === 'PROJECT_MANAGER') return 'MANAGER';
+  return collapsed;
 }
 
 async function resolveAssigneeUserId(raw: any): Promise<string | null> {
@@ -49,32 +169,234 @@ async function resolveAssigneeUserId(raw: any): Promise<string | null> {
   return null;
 }
 
-// Helper function to map frontend status to TaskStatus enum
-function mapStatusToTaskStatus(status: string): TaskStatus {
-  if (status == null || typeof status !== 'string') {
-    return TaskStatus.PENDING;
-  }
-  const s = status.trim().toLowerCase();
-  const statusMap: Record<string, TaskStatus> = {
-    'not started': TaskStatus.PENDING,
-    pending: TaskStatus.PENDING,
-    working: TaskStatus.IN_PROGRESS,
-    'in progress': TaskStatus.IN_PROGRESS,
-    done: TaskStatus.COMPLETED,
-    completed: TaskStatus.COMPLETED,
-    stuck: TaskStatus.ON_HOLD,
-    cancelled: TaskStatus.CANCELLED,
-    suspended: TaskStatus.ON_HOLD,
+// Main Table sends "on hold" for Suspended; keep mapping in sync with taskStatusMap.ts
+function mapStatusToTaskStatus(status: unknown): TaskStatus {
+  return mapFrontendTaskStatusToEnum(status);
+}
+
+function normalizeProjectStatusValue(status: unknown): ProjectStatus | undefined {
+  if (status == null) return undefined;
+  const raw = String(status).trim();
+  if (!raw) return undefined;
+  const s = raw.toUpperCase().replace(/[\s-]+/g, '_');
+  const statusMap: Record<string, ProjectStatus> = {
+    OPEN: ProjectStatus.OPEN,
+    IN_PROGRESS: ProjectStatus.IN_PROGRESS,
+    SUBMITTED_IN_PROGRESS: ProjectStatus.SUBMITTED_IN_PROGRESS,
+    COMPLETED: ProjectStatus.COMPLETED,
+    CANCELLED: ProjectStatus.CANCELLED,
+    ON_HOLD: ProjectStatus.ON_HOLD,
+    SUSPENDED: ProjectStatus.ON_HOLD,
   };
-  if (statusMap[s]) {
-    return statusMap[s];
+  return statusMap[s] ?? undefined;
+}
+
+function isTaskNodeDirectlyVisibleToEmployee(task: any, employeeId: string): boolean {
+  return isTaskNodeAssignedToEmployee(task, employeeId);
+}
+
+function employeeHasVisibleWorkInProject(project: any, employeeId: string): boolean {
+  const projectAssigned =
+    Array.isArray(project?.assignedEmployees) &&
+    project.assignedEmployees.some(
+      (a: any) => a?.employeeId === employeeId || a?.employee?.id === employeeId,
+    );
+  if (projectAssigned) return true;
+  const tasks = Array.isArray(project?.tasks) ? project.tasks : [];
+  return tasks.some((task: any) => isTaskNodeDirectlyVisibleToEmployee(task, employeeId));
+}
+
+function pruneTaskTreeForEmployee(tasks: any[], employeeId: string): any[] {
+  if (!employeeId || !Array.isArray(tasks)) return Array.isArray(tasks) ? tasks : [];
+
+  return tasks
+    .map((task: any) => {
+      const visibleSubtasks = (Array.isArray(task?.subtasks) ? task.subtasks : [])
+        .map((subtask: any) => {
+          const visibleChildTasks = (Array.isArray(subtask?.subtasks) ? subtask.subtasks : []).filter(
+            (child: any) => isTaskNodeDirectlyVisibleToEmployee(child, employeeId),
+          );
+
+          const keepSubtask =
+            isTaskNodeDirectlyVisibleToEmployee(subtask, employeeId) || visibleChildTasks.length > 0;
+
+          if (!keepSubtask) return null;
+
+          return {
+            ...subtask,
+            subtasks: visibleChildTasks,
+          };
+        })
+        .filter(Boolean);
+
+      const keepTask =
+        isTaskNodeDirectlyVisibleToEmployee(task, employeeId) || visibleSubtasks.length > 0;
+
+      if (!keepTask) return null;
+
+      return {
+        ...task,
+        subtasks: visibleSubtasks,
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildUserNameVariations(firstName: unknown, lastName: unknown): string[] {
+  const first = String(firstName || '').trim().toLowerCase();
+  const last = String(lastName || '').trim().toLowerCase();
+  const out = new Set<string>();
+  if (first && last) {
+    out.add(`${first} ${last}`.trim());
+    out.add(`${first} ${last.charAt(0)}`.trim());
+  } else if (first) {
+    out.add(first);
+  } else if (last) {
+    out.add(last);
   }
-  // UI pills like "Done - Open Next Phase", "Done - Spec Next Phase" must count as completed
-  // so dependents unlock (previously fell through to PENDING and never triggered unlock).
-  if (s.startsWith('done')) {
-    return TaskStatus.COMPLETED;
+  return Array.from(out).filter(Boolean);
+}
+
+function projectHasContractAssignedManager(project: { contracts?: unknown[] } | null | undefined): boolean {
+  if (!Array.isArray(project?.contracts)) return false;
+  return project.contracts.some((contract: any) => {
+    return Boolean(contract?.assignedManagerId || contract?.assignedManagerEmail);
+  });
+}
+
+function managerOwnsProjectAsPm(
+  project: any,
+  manager: { id?: string | null; email?: string | null; nameVariations?: string[] },
+): boolean {
+  if (!project || !manager?.id) return false;
+
+  const contractMatch = Array.isArray(project.contracts)
+    ? project.contracts.some((contract: any) => {
+        return (
+          contract?.assignedManagerId === manager.id ||
+          contract?.assignedManager?.id === manager.id ||
+          (manager.email &&
+            contract?.assignedManagerEmail &&
+            String(contract.assignedManagerEmail).toLowerCase() === String(manager.email).toLowerCase())
+        );
+      })
+    : false;
+  if (contractMatch) return true;
+
+  // When a contract assigns a PM, that assignment is the source of truth (matches UI column).
+  if (projectHasContractAssignedManager(project)) return false;
+
+  return projectManagerTextMatches(project.projectManager, manager.nameVariations || []);
+}
+
+function buildManagerProjectListWhere(
+  userId: string,
+  email: string | null | undefined,
+  managerNameVariations: string[],
+): Record<string, unknown>[] {
+  const orConditions: Record<string, unknown>[] = [];
+
+  orConditions.push({ contracts: { some: { assignedManagerId: userId } } });
+  if (email) {
+    orConditions.push({ contracts: { some: { assignedManagerEmail: email } } });
   }
-  return TaskStatus.PENDING;
+
+  if (managerNameVariations.length > 0) {
+    orConditions.push({
+      AND: [
+        {
+          NOT: {
+            contracts: {
+              some: {
+                OR: [
+                  { assignedManagerId: { not: null } },
+                  { assignedManagerEmail: { not: null } },
+                ],
+              },
+            },
+          },
+        },
+        {
+          OR: managerNameVariations.map((name) => ({
+            projectManager: { contains: name, mode: 'insensitive' as const },
+          })),
+        },
+      ],
+    });
+  }
+
+  return orConditions;
+}
+
+function projectManagerTextMatches(projectManager: unknown, nameVariations: string[]): boolean {
+  const pm = String(projectManager || '').trim().toLowerCase();
+  if (!pm || !Array.isArray(nameVariations) || nameVariations.length === 0) return false;
+  return nameVariations.some((name) => name && pm.includes(name));
+}
+
+function managerOwnsProjectForVisibility(
+  project: any,
+  manager: { id?: string | null; email?: string | null; nameVariations?: string[] },
+): boolean {
+  return managerOwnsProjectAsPm(project, manager);
+}
+
+async function loadManagerTransferScope(managerId: string) {
+  try {
+    return await getManagerTransferScope(managerId);
+  } catch (e) {
+    console.error('[projects] loadManagerTransferScope failed:', e);
+    return { excludedProjectIds: [] as string[], includedProjectIds: [] as string[] };
+  }
+}
+
+function mergeManagerTransferScopeIntoListWhere(
+  baseWhere: Record<string, unknown>,
+  transferScope: { excludedProjectIds: string[]; includedProjectIds: string[] },
+  orConditions: Record<string, unknown>[],
+): void {
+  if (transferScope.includedProjectIds.length > 0) {
+    orConditions.push({ id: { in: transferScope.includedProjectIds } });
+  }
+
+  const managerFilter: Record<string, unknown> =
+    transferScope.excludedProjectIds.length > 0
+      ? {
+          AND: [
+            { OR: orConditions },
+            { id: { notIn: transferScope.excludedProjectIds } },
+          ],
+        }
+      : { OR: orConditions };
+
+  if (baseWhere.AND) {
+    const existing = baseWhere.AND;
+    baseWhere.AND = Array.isArray(existing) ? [...existing, managerFilter] : [existing, managerFilter];
+  } else if (baseWhere.OR) {
+    baseWhere.AND = [managerFilter];
+    delete baseWhere.OR;
+  } else {
+    Object.assign(baseWhere, managerFilter);
+  }
+}
+
+async function managerMayAccessProjectWithTransfers(
+  projectId: string,
+  managerId: string,
+  ownsViaAssignment: boolean,
+): Promise<boolean> {
+  const scope = await loadManagerTransferScope(managerId);
+  if (scope.excludedProjectIds.includes(projectId)) return false;
+  if (scope.includedProjectIds.includes(projectId)) return true;
+  if (ownsViaAssignment) return true;
+
+  const involvedViaTask = await prisma.task.findFirst({
+    where: {
+      AND: [{ projectId }, taskRowAssignedToEmployee(managerId)],
+    },
+    select: { id: true },
+  });
+  return !!involvedViaTask;
 }
 
 // Helper function to map frontend priority to TaskPriority enum
@@ -108,10 +430,25 @@ async function saveChildSubtasks(
   projectDefaults?: ProjectLocationDefaults | null,
   currentUserId?: string | null,
   currentUserRole?: string | null,
+  projectCreatedById?: string | null,
+  projectStatus?: string | null,
+  referencePlanDaysMap?: ReferencePlanDays | Record<string, number> | null,
+  syncFromReference = false,
+  userManagesProject?: boolean,
 ): Promise<void> {
-  if (!childSubtasks || !Array.isArray(childSubtasks) || childSubtasks.length === 0) {
+  if (!childSubtasks || !Array.isArray(childSubtasks)) {
     return;
   }
+
+  if (childSubtasks.length === 0) {
+    const existingCount = await prisma.task.count({
+      where: { parentTaskId, projectId, deletedAt: null },
+    });
+    if (existingCount === 0) return;
+  }
+
+  const refPlanDays =
+    referencePlanDaysMap ?? (await loadReferencePlanDaysData(prisma));
 
   console.log(`📝 saveChildSubtasks: Saving ${childSubtasks.length} child tasks under parent ${parentTaskId}`);
 
@@ -123,12 +460,44 @@ async function saveChildSubtasks(
         assignments: {
           select: { employeeId: true },
         },
+        delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
       },
     }),
-    prisma.task.findUnique({ where: { id: parentTaskId }, select: { location: true, makaniNumber: true, plotNumber: true, community: true, projectType: true, projectFloor: true, developerProject: true } }),
+    prisma.task.findUnique({
+      where: { id: parentTaskId },
+      select: {
+        title: true,
+        location: true,
+        makaniNumber: true,
+        plotNumber: true,
+        community: true,
+        projectType: true,
+        projectFloor: true,
+        developerProject: true,
+      },
+    }),
   ]);
 
   console.log(`📝 Found ${existingChildSubtasks.length} existing child tasks for parent ${parentTaskId}`);
+
+  const allProjectTasksForPred = await prisma.task.findMany({
+    where: { projectId },
+    select: { id: true, stableWorkSeq: true, taskOrder: true, parentTaskId: true, displayAnchorSeq: true, displaySuffix: true },
+  });
+  const predResolveIndex = buildPredecessorResolveIndex(allProjectTasksForPred);
+  const projectMetaForPred = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { projectNumber: true },
+  });
+  const predProjectNumber = projectMetaForPred?.projectNumber ?? 1;
+  const resolvePredKey = (key: string) =>
+    resolvePredecessorIdFromDisplayKey(key, predResolveIndex, {
+      allRows: allProjectTasksForPred,
+      projectNumber: predProjectNumber,
+    });
+
+  const activityActorId = currentUserId ?? createdById ?? null;
+  const parentWorkTitle = parentTask?.title ? String(parentTask.title) : 'Work item';
 
   const existingChildIds = new Set(existingChildSubtasks.map(cst => cst.id));
   // Filter out null/undefined IDs and create set of incoming IDs
@@ -141,16 +510,25 @@ async function saveChildSubtasks(
   console.log(`📝 Incoming child task IDs:`, Array.from(incomingChildIds));
   console.log(`📝 Existing child task IDs:`, Array.from(existingChildIds));
 
-  // Delete child subtasks that are no longer in the incoming list
+  // Delete child subtasks that are no longer in the incoming list.
+  // If incoming list is empty, this means "delete all children" (subject to EMPLOYEE creator rule below).
   // IMPORTANT: Only delete if the child task ID is explicitly missing from incoming list
   // This prevents deletion when frontend sends child tasks without IDs due to assignment changes
-  const childSubtasksToDelete = existingChildSubtasks.filter(cst => {
+  const childSubtasksToDelete = existingChildSubtasks.filter((cst) => {
     let shouldDelete = !incomingChildIds.has(cst.id);
 
-    // EMPLOYEE rule: Only the creator of a child task can delete it via this helper.
-    if (shouldDelete && currentUserRole === 'EMPLOYEE' && currentUserId) {
-      if (cst.createdBy !== currentUserId) {
-        console.log(`⛔ Skipping delete of child task ${cst.id} by non-creator employee ${currentUserId}`);
+    if (shouldDelete && currentUserId && currentUserRole) {
+      const delPerms = computeTaskPermissions({
+        user: { id: currentUserId, role: currentUserRole as any },
+        task: cst as any,
+        projectCreatedById: projectCreatedById ?? null,
+        projectStatus: projectStatus ?? null,
+        userManagesProject,
+      });
+      if (!delPerms.canDelete) {
+        console.log(
+          `⛔ Skipping delete of child task ${cst.id}: user ${currentUserId} cannot delete (not task/project creator or admin)`,
+        );
         shouldDelete = false;
       }
     }
@@ -163,17 +541,23 @@ async function saveChildSubtasks(
   
   if (childSubtasksToDelete.length > 0) {
     console.log(`🗑️ Deleting ${childSubtasksToDelete.length} removed child tasks:`, childSubtasksToDelete.map(c => c.id));
-    await prisma.task.deleteMany({
-      where: {
-        id: { in: childSubtasksToDelete.map(cst => cst.id) },
-      },
-    });
+    for (const cst of childSubtasksToDelete) {
+      await logProjectActivity({
+        projectId,
+        actorId: activityActorId,
+        action: 'CHILD_TASK_DELETED',
+        taskId: cst.id,
+        summary: `Removed child task "${cst.title}" under "${parentWorkTitle}"`,
+        metadata: { parentTaskId, parentTitle: parentWorkTitle, taskTitle: cst.title },
+      });
+    }
+    await softDeleteTasks(childSubtasksToDelete.map((cst) => cst.id));
   }
 
   // Create or update child subtasks
   let childCreatedCount = 0;
   let childUpdatedCount = 0;
-  for (const childSubtask of childSubtasks) {
+  for (const [childIndex, childSubtask] of childSubtasks.entries()) {
     // Allow child tasks even without explicit title - use default if needed
     // This ensures employees can save child tasks even if title is not provided initially
     let childTitle = (childSubtask.name || childSubtask.title || '').trim();
@@ -194,7 +578,15 @@ async function saveChildSubtasks(
       ?? childSubtask.assignedEmployee 
       ?? childSubtask.assignedTo
       ?? null;
-    const assignedEmpId = await resolveAssigneeUserId(assignedEmpRaw);
+    const referenceChildAssigneeId = resolveAssigneeIdForTaskTitle(
+      childTitle,
+      assignedEmpRaw,
+      refPlanDays,
+      childIndex,
+    );
+    const assignedEmpId = await resolveAssigneeUserId(
+      assignedEmpRaw || referenceChildAssigneeId,
+    );
     
     console.log(`📝 Processing child task: id=${childTaskId || 'NEW'}, title=${childTitle}, assignedEmployeeId=${assignedEmpId || 'NONE'}`);
     
@@ -204,12 +596,24 @@ async function saveChildSubtasks(
       projectId: projectId,
       parentTaskId: parentTaskId,
       status: mapStatusToTaskStatus(childSubtask.status),
-      priority: mapPriorityToTaskPriority(childSubtask.priority),
-      category: childSubtask.category || null,
+      priority: mapPriorityToTaskPriority(
+        resolvePriorityForTaskTitle(childTitle, childSubtask.priority, refPlanDays, childIndex) ||
+          childSubtask.priority,
+      ),
+      category: resolveCategoryForTaskTitle(
+        childTitle,
+        childSubtask.category,
+        refPlanDays,
+        childIndex,
+      ),
       referenceNumber: childSubtask.referenceNumber || null,
-      planDays: childSubtask.planDays ? parseInt(String(childSubtask.planDays), 10) : null,
+      planDays: resolvePlanDaysForTaskTitle(childTitle, childSubtask.planDays, refPlanDays, childIndex),
       remarks: childSubtask.remarks || null,
       assigneeNotes: childSubtask.assigneeNotes || null,
+      link:
+        childSubtask.link != null && String(childSubtask.link).trim() !== ''
+          ? String(childSubtask.link).trim()
+          : null,
       assignedEmployeeId: assignedEmpId,
       createdBy: createdById ?? null,
       location: childSubtask.location ?? parentTask?.location ?? projectDefaults?.location ?? null,
@@ -222,6 +626,38 @@ async function saveChildSubtasks(
       description: childSubtask.description || childSubtask.remarks || null,
       tags: Array.isArray(childSubtask.tags) ? childSubtask.tags : [],
     };
+    applyEffortFieldsFromPayload(childSubtaskData, childSubtask);
+    applyRatingFromPayload(childSubtaskData, childSubtask);
+    if (syncFromReference) {
+      const refAligned = applyReferenceTemplateToTaskRow(
+        {
+          title: childTitle,
+          planDays: childSubtaskData.planDays,
+          category: childSubtaskData.category,
+          priority: childSubtask.priority,
+          assignedEmployeeId: assignedEmpId,
+        },
+        refPlanDays as ReferencePlanDays,
+        childIndex,
+      );
+      if (refAligned.category) childSubtaskData.category = refAligned.category;
+      if (refAligned.planDays != null && refAligned.planDays > 0) {
+        childSubtaskData.planDays = refAligned.planDays;
+      }
+      if (refAligned.priority) {
+        childSubtaskData.priority = mapPriorityToTaskPriority(String(refAligned.priority));
+      }
+      if (refAligned.assignedEmployeeId) {
+        childSubtaskData.assignedEmployeeId = await resolveAssigneeUserId(
+          refAligned.assignedEmployeeId,
+        );
+      }
+    }
+    const parsedChildTaskOrder =
+      childSubtask.taskOrder != null ? parseInt(String(childSubtask.taskOrder), 10) : NaN;
+    if (Number.isFinite(parsedChildTaskOrder)) {
+      childSubtaskData.taskOrder = parsedChildTaskOrder;
+    }
     if (childSubtask.predecessors !== undefined) {
       childSubtaskData.predecessors = (childSubtask.predecessors != null && String(childSubtask.predecessors).trim() !== '') ? String(childSubtask.predecessors).trim() : null;
     }
@@ -229,11 +665,6 @@ async function saveChildSubtasks(
     if (childSubtask.predecessorId !== undefined) {
       childSubtaskData.predecessorId = childSubtask.predecessorId || null;
     }
-    // Keep workflowStatus aligned with predecessor lock state
-    childSubtaskData.workflowStatus =
-      childSubtaskData.status === TaskStatus.COMPLETED
-        ? 'COMPLETED'
-        : (childSubtaskData.predecessorId ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED');
 
     // Handle timeline/dates
     if (childSubtask.timeline && Array.isArray(childSubtask.timeline) && childSubtask.timeline.length >= 2) {
@@ -262,9 +693,41 @@ async function saveChildSubtasks(
       }
     }
     
+    const existingOneForPred =
+      childTaskExists && childTaskId
+        ? existingChildSubtasks.find((c: any) => c.id === childTaskId)
+        : undefined;
+    const effectiveChildPredId = resolveEffectivePredecessorForTaskRow(
+      childSubtask,
+      existingOneForPred,
+      resolvePredKey,
+    );
+    if (childSubtask.predecessors !== undefined || childSubtask.predecessorId !== undefined) {
+      childSubtaskData.predecessorId = effectiveChildPredId;
+    }
+    let childPredDone = true;
+    if (effectiveChildPredId) {
+      const predRow = await prisma.task.findUnique({
+        where: { id: effectiveChildPredId },
+        select: { status: true, workflowStatus: true },
+      });
+      childPredDone = isPredecessorRowCompleted(predRow);
+    }
+    const childLockedByPred = !!effectiveChildPredId && !childPredDone;
+    childSubtaskData.status = clampTaskStatusAgainstIncompletePredecessor(
+      childSubtaskData.status,
+      effectiveChildPredId,
+      childPredDone,
+    );
+    childSubtaskData.workflowStatus = workflowStatusFromPredecessorChain(
+      childSubtaskData.status,
+      effectiveChildPredId,
+      childPredDone,
+    );
+
     if (childTaskExists && childTaskId) {
       // Update existing child subtask - preserve ID and createdBy (never overwrite creator)
-      const existingOne = existingChildSubtasks.find((c: any) => c.id === childTaskId);
+      const existingOne = existingOneForPred;
 
       // Permission model: use central helper so assignees (e.g. Khalid) can only
       // change remarks / assignee notes / attachments on child tasks created
@@ -275,6 +738,9 @@ async function saveChildSubtasks(
         const perms = computeTaskPermissions({
           user: { id: currentUserId, role: currentUserRole as any },
           task: existingOne as any,
+          projectCreatedById: projectCreatedById ?? null,
+          projectStatus: projectStatus ?? null,
+          userManagesProject,
         });
 
         // No permission at all → skip silently
@@ -289,22 +755,32 @@ async function saveChildSubtasks(
           // Creator / manager / admin / HR – full update
           updateData = {
             ...childSubtaskData,
-            createdBy: existingOne?.createdBy ?? childSubtaskData.createdBy,
+            createdBy: existingOne?.createdBy ?? null,
           };
         } else if (perms.canEditAssigneeFields) {
-          // Pure assignee – may only change status, remarks and assigneeNotes
-          updateData = {
-            status: childSubtaskData.status,
-            workflowStatus: childSubtaskData.workflowStatus,
-            remarks: childSubtaskData.remarks,
-            assigneeNotes: childSubtaskData.assigneeNotes,
-          };
+          if (childLockedByPred) {
+            updateData = {
+              workflowStatus: 'WAITING_FOR_PREDECESSOR',
+              status: TaskStatus.PENDING,
+              remarks: childSubtaskData.remarks,
+              assigneeNotes: childSubtaskData.assigneeNotes,
+              link: childSubtaskData.link,
+            };
+          } else {
+            updateData = {
+              status: childSubtaskData.status,
+              workflowStatus: childSubtaskData.workflowStatus,
+              remarks: childSubtaskData.remarks,
+              assigneeNotes: childSubtaskData.assigneeNotes,
+              link: childSubtaskData.link,
+            };
+          }
         }
       } else {
         // Fallback (no current user context) – preserve previous behaviour
         updateData = {
           ...childSubtaskData,
-          createdBy: existingOne?.createdBy ?? childSubtaskData.createdBy,
+          createdBy: existingOne?.createdBy ?? null,
         };
       }
 
@@ -314,8 +790,110 @@ async function saveChildSubtasks(
           where: { id: childTaskId },
           data: updateData,
         });
-        await unlockDependentsWaitingOnFinishedPredecessor(prisma, childTaskId);
+        if (currentUserId && existingOneForPred) {
+          void maybeNotifyTaskNotesFromSave({
+            projectId,
+            taskId: childTaskId,
+            taskTitle: String(existingOneForPred.title ?? childSubtaskData.title ?? ''),
+            actorId: currentUserId,
+            existing: {
+              remarks: existingOneForPred.remarks,
+              assigneeNotes: existingOneForPred.assigneeNotes,
+            },
+            incoming: {
+              remarks: childSubtask.remarks,
+              assigneeNotes: childSubtask.assigneeNotes,
+            },
+          });
+        }
+        const childAssigneeId =
+          (updateData.assignedEmployeeId as string | null | undefined) ??
+          existingOneForPred?.assignedEmployeeId ??
+          null;
+        await maybeAwardXpForStatusTransition(
+          childTaskId,
+          existingOneForPred?.status,
+          (updateData.status as TaskStatus | undefined) ?? childSubtaskData.status,
+          childAssigneeId,
+        );
+        const childPersistedStatus =
+          (updateData.status as TaskStatus | undefined) ?? childSubtaskData.status;
+        if (
+          existingOneForPred &&
+          currentUserId &&
+          currentUserRole &&
+          isTaskStatusChanged(existingOneForPred.status as TaskStatus, childPersistedStatus)
+        ) {
+          await processPmTaskStatusChangeNotification({
+            projectId,
+            taskId: childTaskId,
+            taskTitle: String(existingOneForPred.title ?? childSubtaskData.title ?? ''),
+            actor: { id: currentUserId, role: currentUserRole as any },
+            projectCreatedById: projectCreatedById ?? null,
+            previousStatus: existingOneForPred.status as TaskStatus,
+            newStatus: childPersistedStatus,
+            assigneeUserId: childAssigneeId,
+            reason: extractStatusReversionReason(childSubtask),
+          });
+        }
+        const unlockedChild = await unlockDependentsWaitingOnFinishedPredecessor(
+          prisma,
+          childTaskId,
+        );
+        for (const d of unlockedChild) {
+          const { displayId } = await resolveTaskDisplayIdForTaskId(projectId, d.id);
+          await logProjectActivity({
+            projectId: d.projectId,
+            actorId: activityActorId,
+            action: 'SUCCESSOR_UNBLOCKED_AFTER_PREDECESSOR',
+            taskId: d.id,
+            summary: `Unblocked ${formatWorkItemRef(d.title, displayId)} — predecessor finished`,
+            metadata: {
+              taskTitle: d.title,
+              taskDisplayId: displayId ?? undefined,
+              predecessorTaskId: childTaskId,
+            },
+          });
+        }
         childUpdatedCount++;
+        const refreshedChild = await prisma.task.findUnique({
+          where: { id: childTaskId },
+        });
+        const changes = refreshedChild
+          ? collectTaskChangesAfterPersist(
+              existingOne as Record<string, unknown>,
+              updateData as Record<string, unknown>,
+              refreshedChild as Record<string, unknown>,
+            )
+          : collectTaskChanges(
+              existingOne as Record<string, unknown>,
+              updateData as Record<string, unknown>,
+            );
+        if (changes.length > 0) {
+          const { displayId: childDisplayId } = await resolveTaskDisplayIdForTaskId(
+            projectId,
+            childTaskId,
+          );
+          const { displayId: parentDisplayId } = await resolveTaskDisplayIdForTaskId(
+            projectId,
+            parentTaskId,
+          );
+          await logProjectActivity({
+            projectId,
+            actorId: activityActorId,
+            action: 'CHILD_TASK_UPDATED',
+            taskId: childTaskId,
+            summary: `Updated child task ${formatWorkItemRef(childSubtaskData.title, childDisplayId)} under ${formatWorkItemRef(parentWorkTitle, parentDisplayId)} (${changes.length} field(s))`,
+            metadata: {
+              parentTaskId,
+              parentTitle: parentWorkTitle,
+              parentTaskDisplayId: parentDisplayId ?? undefined,
+              taskTitle: childSubtaskData.title,
+              taskDisplayId: childDisplayId ?? undefined,
+              changes,
+            },
+          });
+        }
         console.log(`✅ Successfully updated child task ${childTaskId} with new assignment`);
       } catch (updateError: any) {
         console.error(`❌ Error updating child task ${childTaskId}:`, updateError);
@@ -325,11 +903,39 @@ async function saveChildSubtasks(
       // Create new child subtask
       console.log(`➕ Creating new child task: ${childSubtaskData.title} (parent: ${parentTaskId}, project: ${projectId})`);
       try {
+        const nextChildSeq =
+          (childSubtask as any).stableWorkSeq != null
+            ? parseInt(String((childSubtask as any).stableWorkSeq), 10)
+            : NaN;
+        const resolvedChildSeq =
+          Number.isFinite(nextChildSeq) && nextChildSeq > 0
+            ? nextChildSeq
+            : await computeNextStableWorkSeq(prisma, projectId, parentTaskId);
         const newChild = await prisma.task.create({
-          data: childSubtaskData,
+          data: {
+            ...childSubtaskData,
+            stableWorkSeq: resolvedChildSeq,
+            taskOrder: childSubtaskData.taskOrder ?? resolvedChildSeq,
+          },
         });
         console.log(`✅ Created child task ${newChild.id}: ${newChild.title}`);
         childCreatedCount++;
+        const assigneeName = await userShortLabel(newChild.assignedEmployeeId);
+        const assigneePart = assigneeName ? ` · Assignee: ${assigneeName}` : '';
+        await logProjectActivity({
+          projectId,
+          actorId: activityActorId,
+          action: 'CHILD_TASK_CREATED',
+          taskId: newChild.id,
+          summary: `Added child task "${newChild.title}" under "${parentWorkTitle}"${assigneePart}`,
+          metadata: {
+            parentTaskId,
+            parentTitle: parentWorkTitle,
+            taskTitle: newChild.title,
+            assigneeId: newChild.assignedEmployeeId,
+            assigneeName: assigneeName ?? undefined,
+          },
+        });
       } catch (createError: any) {
         console.error(`❌ Error creating child task:`, {
           error: createError.message,
@@ -351,6 +957,11 @@ async function saveChildSubtasks(
 // Get all projects with filters
 export const getAllProjects = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    if (!req.user) {
+      res.status(401).json({ success: false, message: 'Unauthorized' });
+      return;
+    }
+
     const { 
       status, 
       clientId, 
@@ -369,7 +980,27 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
     const limitNum = parseInt(limit as string, 10);
     const skip = (pageNum - 1) * limitNum;
 
-    const where: any = {};
+    const companyAllRaw = req.query.companyAll;
+    const companyAllFirst = Array.isArray(companyAllRaw) ? companyAllRaw[0] : companyAllRaw;
+    const companyAllRequested =
+      companyAllFirst === 'true' ||
+      companyAllFirst === '1' ||
+      companyAllFirst === true ||
+      String(companyAllFirst ?? '').toLowerCase() === 'true';
+
+    const userRole = normalizeErpRole(req.user?.role);
+
+    /**
+     * Skip scoped project filtering when requesting the company-wide list (?companyAll=true).
+     * This powers the read-only "View company all projects" table in the UI.
+     */
+    const skipScopedEmployeeManagerProjects =
+      companyAllRequested &&
+      ['EMPLOYEE', 'MANAGER', 'PROJECT_MANAGER', 'SUPER_ADMIN'].includes(userRole);
+
+    await purgeExpiredSoftDeletions();
+
+    const where: any = { deletedAt: null };
 
     if (status) {
       where.status = status;
@@ -396,23 +1027,50 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
 
     // When ?employeeId=XXX is sent (e.g. /employees/30 page), return projects that have tasks assigned to that employee.
     // Allowed when: current user is that employee, or current user is ADMIN/HR/PROJECT_MANAGER viewing that employee.
-    const canViewOtherEmployee = req.user && ['ADMIN', 'HR', 'PROJECT_MANAGER'].includes(req.user.role);
-    const effectiveEmployeeId =
+    const elevatedForEmployeeProjectView = new Set([
+      'ADMIN',
+      'HR',
+      'PROJECT_MANAGER',
+      'SUPER_ADMIN',
+    ]);
+    const canViewOtherEmployee =
+      req.user != null && elevatedForEmployeeProjectView.has(userRole);
+    let effectiveEmployeeId =
       typeof employeeIdQuery === 'string' && employeeIdQuery.trim() &&
       (canViewOtherEmployee || req.user?.id === employeeIdQuery.trim())
         ? employeeIdQuery.trim()
         : null;
 
+    // Company-wide list must not be narrowed by ?employeeId= (e.g. stray query on tasks URL).
+    if (skipScopedEmployeeManagerProjects) {
+      effectiveEmployeeId = null;
+    }
+
     if (effectiveEmployeeId) {
-      // Task-based project list for this employee (same logic as EMPLOYEE branch)
-      const employeeTasks = await prisma.task.findMany({
-        where: taskRowInvolvesEmployee(effectiveEmployeeId),
-        select: { projectId: true },
-        distinct: ['projectId'],
-      });
-      const employeeProjectIds = employeeTasks
-        .map((t: { projectId: string | null }) => t.projectId)
-        .filter((pid): pid is string => !!pid);
+      // Project list for this employee: include both
+      // (1) direct project assignments, and (2) task/subtask involvement.
+      const [employeeTasks, assignedProjects] = await Promise.all([
+        prisma.task.findMany({
+          where: taskRowAssignedToEmployee(effectiveEmployeeId),
+          select: { projectId: true },
+          distinct: ['projectId'],
+        }),
+        prisma.projectAssignment.findMany({
+          where: { employeeId: effectiveEmployeeId },
+          select: { projectId: true },
+          distinct: ['projectId'],
+        }),
+      ]);
+      const employeeProjectIds = Array.from(
+        new Set([
+          ...employeeTasks
+            .map((t: { projectId: string | null }) => t.projectId)
+            .filter((pid): pid is string => !!pid),
+          ...assignedProjects
+            .map((a: { projectId: string | null }) => a.projectId)
+            .filter((pid): pid is string => !!pid),
+        ])
+      );
       if (employeeProjectIds.length === 0) {
         console.log('[getAllProjects] employeeId filter: no tasks for employee → no projects. employeeId=', effectiveEmployeeId);
       }
@@ -427,16 +1085,18 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
     }
     // Employee/Manager: access is scoped to projects they are actually involved in.
     // Managers use a restricted view of "their" projects, employees see projects that have tasks assigned to them.
-    else if (req.user?.role === 'EMPLOYEE' || req.user?.role === 'MANAGER') {
-      if (req.user?.role === 'MANAGER') {
-        // Manager: Can see ONLY their own projects - from their contracts, or where they are directly assigned
-        // Does NOT include team member projects (each manager sees only their projects)
+    else if (
+      !skipScopedEmployeeManagerProjects &&
+      (userRole === 'EMPLOYEE' || userRole === 'MANAGER')
+    ) {
+      if (userRole === 'MANAGER') {
+        // Manager: own PM projects + projects where they are assigned on any task/subtask row.
         
         // Fetch manager's full details to get their name for projectManager field matching
         let managerNameVariations: string[] = [];
         try {
           const managerUser = await prisma.user.findUnique({
-            where: { id: req.user.id },
+            where: { id: req.user!.id },
             select: { firstName: true, lastName: true },
           });
           
@@ -445,74 +1105,77 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
             const managerLastName = managerUser.lastName?.trim().toLowerCase() || '';
             const managerFullName = `${managerFirstName} ${managerLastName}`.trim();
             
-            // Build name variations for matching (e.g., "obada", "obada saad", "h. obada", etc.)
-            if (managerFirstName) managerNameVariations.push(managerFirstName);
-            if (managerLastName) managerNameVariations.push(managerLastName);
+            // Strict PM name match only — full name and "First L" initial (no standalone first/last)
             if (managerFullName) managerNameVariations.push(managerFullName);
-            // Add variations with first name + last name initial
             if (managerFirstName && managerLastName) {
               managerNameVariations.push(`${managerFirstName} ${managerLastName.charAt(0)}`);
-            }
-            // Also add just last name if it's meaningful (more than 1 char)
-            if (managerLastName && managerLastName.length > 1) {
-              managerNameVariations.push(managerLastName);
             }
           }
         } catch (error) {
           console.error('Error fetching manager details for project filtering:', error);
         }
         
-        const orConditions: any[] = [
-          // Projects where manager is directly assigned
-          { assignedEmployees: { some: { employeeId: req.user.id } } },
-          { tasks: { some: { assignedEmployeeId: req.user.id } } },
-          { tasks: { some: { subtasks: { some: { assignedEmployeeId: req.user.id } } } } },
-          { tasks: { some: { subtasks: { some: { subtasks: { some: { assignedEmployeeId: req.user.id } } } } } } },
-          // Projects created by this manager
-          { createdBy: req.user.id },
-        ];
-        
-        // Projects from contracts assigned to this manager (primary - load-out projects)
-        if (req.user.email) {
-          orConditions.push({ contracts: { some: { assignedManagerEmail: req.user.email } } });
-        }
-        if (req.user.id) {
-          orConditions.push({ contracts: { some: { assignedManagerId: req.user.id } } });
-        }
-        
-        // IMPORTANT: Also filter by projectManager text field matching manager's name
-        // This ensures managers only see projects where they are listed as the project manager
-        if (managerNameVariations.length > 0) {
-          const projectManagerConditions = managerNameVariations.map(name => ({
-            projectManager: { contains: name, mode: 'insensitive' as const }
-          }));
-          orConditions.push({ OR: projectManagerConditions });
+        // Manager personal list: match contract-assigned PM (same as UI column). Do not use createdBy —
+        // projects created for another PM must not appear in the creator's list.
+        const orConditions = buildManagerProjectListWhere(
+          req.user!.id,
+          req.user!.email,
+          managerNameVariations,
+        );
+
+        const [transferScope, taskAssignedRows] = await Promise.all([
+          loadManagerTransferScope(req.user!.id),
+          prisma.task.findMany({
+            where: taskRowAssignedToEmployee(req.user!.id),
+            select: { projectId: true },
+            distinct: ['projectId'],
+          }),
+        ]);
+
+        const taskAssignedProjectIds = taskAssignedRows
+          .map((t) => t.projectId)
+          .filter((pid): pid is string => !!pid);
+        if (taskAssignedProjectIds.length > 0) {
+          orConditions.push({ id: { in: taskAssignedProjectIds } });
         }
         
         // Combine manager filter with search filter if present
         if (searchFilter) {
           where.AND = [
-            { OR: orConditions },
             searchFilter,
           ];
+          mergeManagerTransferScopeIntoListWhere(where, transferScope, orConditions);
         } else {
-          where.OR = orConditions;
+          mergeManagerTransferScopeIntoListWhere(where, transferScope, orConditions);
         }
       } else {
         // EMPLOYEE:
-        // Instead of a very deep OR tree, derive the list of project IDs
-        // from tasks that are actually assigned to (or created by) this user.
-        const employeeTasks = await prisma.task.findMany({
-          where: taskRowInvolvesEmployee(req.user.id),
-          select: {
-            projectId: true,
-          },
-          distinct: ['projectId'],
-        });
+        // Include projects by direct assignment OR task/subtask involvement.
+        const [employeeTasks, assignedProjects] = await Promise.all([
+          prisma.task.findMany({
+            where: taskRowAssignedToEmployee(req.user.id),
+            select: {
+              projectId: true,
+            },
+            distinct: ['projectId'],
+          }),
+          prisma.projectAssignment.findMany({
+            where: { employeeId: req.user.id },
+            select: { projectId: true },
+            distinct: ['projectId'],
+          }),
+        ]);
 
-        const employeeProjectIds = employeeTasks
-          .map((t: { projectId: string | null }) => t.projectId)
-          .filter((pid): pid is string => !!pid);
+        const employeeProjectIds = Array.from(
+          new Set([
+            ...employeeTasks
+              .map((t: { projectId: string | null }) => t.projectId)
+              .filter((pid): pid is string => !!pid),
+            ...assignedProjects
+              .map((a: { projectId: string | null }) => a.projectId)
+              .filter((pid): pid is string => !!pid),
+          ])
+        );
 
         // Debug: log when employee sees no projects (helps verify Task 2 is assigned to Khalid's user ID in DB)
         if (employeeProjectIds.length === 0) {
@@ -542,29 +1205,58 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    // For task visibility inside projects: use effectiveEmployeeId when viewing as that employee, else EMPLOYEE's own id.
-    const taskViewerId = effectiveEmployeeId ?? (req.user?.role === 'EMPLOYEE' ? req.user.id : null);
-
-    // EMPLOYEE (or ?employeeId= view): Pre-fetch main task IDs that the user "owns" (assigned to / created by / in assignments).
-    // Child tasks under these parents must always be visible to the parent owner (Step 2 - relationship-based visibility).
-    let ownedMainTaskIds: string[] = [];
-    if (taskViewerId) {
-      const ownedTasks = await prisma.task.findMany({
-        where: {
-          parentTaskId: null,
-          OR: [
-            { assignedEmployeeId: taskViewerId },
-            { createdBy: taskViewerId },
-            { assignments: { some: { employeeId: taskViewerId } } },
-          ],
-        },
-        select: { id: true },
-      });
-      ownedMainTaskIds = ownedTasks.map((t: { id: string }) => t.id);
-      if (ownedMainTaskIds.length > 0) {
-        console.log('[getAllProjects] Task viewer owned main task IDs (parent-owner visibility):', ownedMainTaskIds.length);
+    // Admin/HR: only projects whose contracts belong to assigned branch(es).
+    if (req.user?.id && roleUsesCompanyAccessScope(userRole)) {
+      const accessScope = await resolveCompanyAccessScope(req.user.id, userRole);
+      if (!accessScope.unrestricted) {
+        mergeProjectScopeIntoWhere(
+          where,
+          await buildProjectWhereForCompanyScope(accessScope),
+        );
       }
     }
+
+    // EMPLOYEE (or ?employeeId= view): only load main tasks that have assignee-visible work.
+    const taskViewerId = skipScopedEmployeeManagerProjects
+      ? null
+      : effectiveEmployeeId ??
+        (userRole === 'EMPLOYEE' && req.user?.id ? req.user.id : null);
+
+    const mainTaskVisibilityForViewer = taskViewerId
+      ? mainTaskVisibleToAssignedEmployeeInProject(taskViewerId)
+      : null;
+
+    // Predecessor sync + display-key repair run on write paths only (not every list fetch).
+
+    const CONTRACT_MAIN_TABLE_SELECT = {
+      id: true,
+      projectId: true,
+      referenceNumber: true,
+      title: true,
+      clientContact: true,
+      clientName: true,
+      assignedManagerId: true,
+      assignedManagerEmail: true,
+      status: true,
+      contractType: true,
+      startDate: true,
+      endDate: true,
+      contractValue: true,
+      currency: true,
+      builtUpArea: true,
+      plotNumber: true,
+      community: true,
+      numberOfFloors: true,
+      makaniNumber: true,
+      latitude: true,
+      longitude: true,
+      developerName: true,
+      projectManager: true,
+      contractPhases: true,
+      createdAt: true,
+      updatedAt: true,
+      assignedManager: { select: USER_AVATAR_SELECT },
+    } as const;
 
     const [projects, total] = await Promise.all([
       prisma.project.findMany({
@@ -621,76 +1313,56 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
           },
           assignedEmployees: {
             include: {
-              employee: {
-                select: {
-                  id: true,
-                  firstName: true,
-                  lastName: true,
-                  email: true,
-                },
-              },
+              employee: { select: USER_AVATAR_SELECT },
             },
           },
           contracts: {
-            select: {
-              id: true,
-              referenceNumber: true,
-              title: true,
-              status: true,
-              contractType: true,
-              startDate: true,
-              endDate: true,
-              contractValue: true,
-              currency: true,
-              plotNumber: true,
-              community: true,
-              numberOfFloors: true,
-              makaniNumber: true,
-              developerName: true,
-              assignedManager: {
-                select: {
-                  id: true,
-                  firstName: true,
-                  lastName: true,
-                },
-              },
-            },
+            select: CONTRACT_MAIN_TABLE_SELECT,
             orderBy: {
-              createdAt: 'desc',
+              updatedAt: 'desc',
             },
           },
           tasks: {
             where: {
               parentTaskId: null, // Only parent-level tasks (main tasks)
+              deletedAt: null,
               // When taskViewerId is set (EMPLOYEE or ?employeeId=): only main tasks visible to that employee
-              ...(taskViewerId
-                ? { OR: mainTaskVisibleToEmployeeInProject(taskViewerId) }
+              ...(mainTaskVisibilityForViewer
+                ? { OR: mainTaskVisibilityForViewer }
                 : {}),
             },
+            orderBy: [...TASK_ORDER_THEN_CREATED_AT],
             select: {
               id: true,
               title: true,
+              taskOrder: true,
+              createdAt: true,
               description: true,
               status: true,
+              workflowStatus: true,
               priority: true,
               startDate: true,
               dueDate: true,
+              completedAt: true,
               category: true,
               referenceNumber: true,
               planDays: true,
               remarks: true,
               assigneeNotes: true,
+          link: true,
               assignedEmployeeId: true,
               createdBy: true,
               predecessors: true,
-              assignedEmployee: {
-                select: {
-                  id: true,
-                  firstName: true,
-                  lastName: true,
-                  email: true,
-                },
-              },
+              predecessorId: true,
+              stableWorkSeq: true,
+              displayAnchorSeq: true,
+              displaySuffix: true,
+              effortType: true,
+              taskWeight: true,
+              rating: true,
+              assignments: { select: { employeeId: true } },
+              delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+              assignedEmployee: { select: USER_AVATAR_SELECT },
               location: true,
               makaniNumber: true,
               plotNumber: true,
@@ -699,36 +1371,39 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
               projectFloor: true,
               developerProject: true,
               subtasks: {
-                // We no longer filter subtasks by employee here; employees can see
-                // all subtasks for a project, but update/delete is still enforced
-                // in the task controllers.
-                where: {},
+                where: { deletedAt: null },
                 select: {
                   id: true,
                   title: true,
                   description: true,
                   status: true,
+                  workflowStatus: true,
                   priority: true,
                   startDate: true,
                   dueDate: true,
+                  completedAt: true,
                   category: true,
                   referenceNumber: true,
                   planDays: true,
                   remarks: true,
                   assigneeNotes: true,
+          link: true,
                   assignedEmployeeId: true,
                   parentTaskId: true,
                   createdAt: true,
                   createdBy: true,
                   predecessors: true,
-                  assignedEmployee: {
-                    select: {
-                      id: true,
-                      firstName: true,
-                      lastName: true,
-                      email: true,
-                    },
-                  },
+                  predecessorId: true,
+                  stableWorkSeq: true,
+              displayAnchorSeq: true,
+              displaySuffix: true,
+                  taskOrder: true,
+                  effortType: true,
+                  taskWeight: true,
+                  rating: true,
+                  assignments: { select: { employeeId: true } },
+                  delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+                  assignedEmployee: { select: USER_AVATAR_SELECT },
                   location: true,
                   makaniNumber: true,
                   plotNumber: true,
@@ -737,35 +1412,39 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
                   projectFloor: true,
                   developerProject: true,
                   subtasks: {
-                    // Show all child tasks under subtasks the employee can see (so reassigned children don't "disappear" for the parent subtask owner)
-                    // Previously we only showed children assigned to current user or unassigned, which hid children after reassignment (e.g. Ajmal no longer saw task after assign to Khalid)
-                    where: {},
+                    where: { deletedAt: null },
                     select: {
                       id: true,
                       title: true,
                       description: true,
                       status: true,
+                      workflowStatus: true,
                       priority: true,
                       startDate: true,
                       dueDate: true,
+                      completedAt: true,
                       category: true,
                       referenceNumber: true,
                       planDays: true,
                       remarks: true,
                       assigneeNotes: true,
+          link: true,
                       assignedEmployeeId: true,
                       parentTaskId: true,
                       createdAt: true,
                       createdBy: true,
                       predecessors: true,
-                      assignedEmployee: {
-                        select: {
-                          id: true,
-                          firstName: true,
-                          lastName: true,
-                          email: true,
-                        },
-                      },
+                      predecessorId: true,
+                      stableWorkSeq: true,
+              displayAnchorSeq: true,
+              displaySuffix: true,
+                      taskOrder: true,
+                      effortType: true,
+                      taskWeight: true,
+                      rating: true,
+                      assignments: { select: { employeeId: true } },
+                      delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+                      assignedEmployee: { select: USER_AVATAR_SELECT },
                       location: true,
                       makaniNumber: true,
                       plotNumber: true,
@@ -774,14 +1453,10 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
                       projectFloor: true,
                       developerProject: true,
                     },
-                    orderBy: {
-                      createdAt: 'asc',
-                    },
+                    orderBy: [...TASK_ORDER_THEN_CREATED_AT],
                   },
                 },
-                orderBy: {
-                  createdAt: 'asc',
-                },
+                orderBy: [...TASK_ORDER_THEN_CREATED_AT],
               },
             },
           } as any,
@@ -798,40 +1473,146 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
       prisma.project.count({ where }),
     ]);
 
-    // Log task/subtask counts for debugging
-    projects.forEach((p: any) => {
-      const taskCount = p.tasks?.length || 0;
-      const subtaskCounts = p.tasks?.map((t: any) => ({
-        taskId: t.id,
-        taskTitle: t.title,
-        subtaskCount: t.subtasks?.length || 0,
-        childCounts: t.subtasks?.map((st: any) => ({
-          subtaskId: st.id,
-          subtaskTitle: st.title,
-          childCount: st.subtasks?.length || 0,
-        })) || [],
-      })) || [];
-      console.log(`📋 Project ${p.id} (${p.referenceNumber}): ${taskCount} tasks, subtask breakdown:`, JSON.stringify(subtaskCounts, null, 2));
-    });
+    // Attach contracts linked by projectId or matching reference (Load Out may not set projectId immediately)
+    const projectsWithContracts = await (async () => {
+      const projectRows = projects as any[];
+      if (!projectRows.length) return projectRows;
+      const projectIds = projectRows.map((p) => p.id as string);
+      const refs = [
+        ...new Set(
+          projectRows
+            .map((p) => p.referenceNumber as string | null | undefined)
+            .filter((r): r is string => !!r && String(r).trim() !== ''),
+        ),
+      ];
+      const extraContracts = await prisma.contract.findMany({
+        where: {
+          OR: [
+            { projectId: { in: projectIds } },
+            ...(refs.length ? [{ referenceNumber: { in: refs } }] : []),
+          ],
+        },
+        select: CONTRACT_MAIN_TABLE_SELECT,
+        orderBy: { updatedAt: 'desc' },
+      });
+      const byProjectId = new Map<string, typeof extraContracts>();
+      const byRef = new Map<string, typeof extraContracts>();
+      for (const c of extraContracts) {
+        if (c.projectId) {
+          const list = byProjectId.get(c.projectId) ?? [];
+          list.push(c);
+          byProjectId.set(c.projectId, list);
+        }
+        if (c.referenceNumber) {
+          const list = byRef.get(c.referenceNumber) ?? [];
+          list.push(c);
+          byRef.set(c.referenceNumber, list);
+        }
+      }
+      return projectRows.map((p) => {
+        const merged: any[] = [];
+        const seen = new Set<string>();
+        const addList = (list: any[] | undefined) => {
+          for (const c of list ?? []) {
+            if (seen.has(c.id)) continue;
+            seen.add(c.id);
+            merged.push(c);
+          }
+        };
+        addList(p.contracts);
+        addList(byProjectId.get(p.id));
+        if (p.referenceNumber) addList(byRef.get(p.referenceNumber));
+        merged.sort(
+          (a, b) =>
+            new Date(b.updatedAt ?? b.createdAt).getTime() -
+            new Date(a.updatedAt ?? a.createdAt).getTime(),
+        );
+        return { ...p, contracts: merged.length > 0 ? merged : p.contracts };
+      });
+    })();
+
+    let managerViewContext: { id?: string | null; email?: string | null; nameVariations?: string[] } | null = null;
+    if (userRole === 'MANAGER' && req.user?.id) {
+      try {
+        const managerUser = await prisma.user.findUnique({
+          where: { id: req.user.id },
+          select: { firstName: true, lastName: true, email: true },
+        });
+        managerViewContext = {
+          id: req.user.id,
+          email: req.user.email ?? managerUser?.email ?? null,
+          nameVariations: buildUserNameVariations(managerUser?.firstName, managerUser?.lastName),
+        };
+      } catch (error) {
+        console.error('Error building manager view context:', error);
+        managerViewContext = { id: req.user.id, email: req.user.email ?? null, nameVariations: [] };
+      }
+    }
+
+    // Load reference template once (project 2539) for aligning other projects on read
+    const referenceTaskTemplate = await loadReferencePlanDaysData(prisma);
 
     // Use assigned manager name from linked contract for display when available (so PM shows e.g. muffazzal not mohammednazar)
     // Include projectName so main table and details show saved name (e.g. "villa") after refresh, not only reference number
-    const projectsWithDisplayManager = projects.map((p: any) => {
+    const projectsWithDisplayManager = projectsWithContracts.map((p: any) => {
       const firstContractWithManager = p.contracts?.find((c: any) => c.assignedManager);
       const displayManager = firstContractWithManager?.assignedManager
         ? `${firstContractWithManager.assignedManager.firstName} ${firstContractWithManager.assignedManager.lastName}`.trim()
         : null;
+      const projectManagerUser = firstContractWithManager?.assignedManager || null;
       const displayName = (p.name != null && String(p.name).trim() !== '') ? p.name : p.referenceNumber;
+      const shouldRestrictManagerToOwnTree =
+        !skipScopedEmployeeManagerProjects &&
+        userRole === 'MANAGER' &&
+        req.user?.id &&
+        managerViewContext &&
+        !managerOwnsProjectForVisibility(p, managerViewContext);
+      const restrictedManagerViewerId = shouldRestrictManagerToOwnTree ? req.user?.id ?? null : null;
+      const tasksForClient = skipScopedEmployeeManagerProjects
+        ? p.tasks
+        : taskViewerId
+          ? pruneTaskTreeForEmployee(p.tasks, taskViewerId)
+          : restrictedManagerViewerId
+            ? pruneTaskTreeForEmployee(p.tasks, restrictedManagerViewerId)
+            : p.tasks;
+      const alignedTasks =
+        !isReferenceProjectRef(p.referenceNumber) && Array.isArray(tasksForClient)
+          ? applyReferenceTemplateToTaskTree(tasksForClient, referenceTaskTemplate)
+          : tasksForClient;
+      const userManagesProject =
+        userRole === 'MANAGER' && managerViewContext
+          ? managerOwnsProjectForVisibility(p, managerViewContext)
+          : userRole === 'ADMIN' || userRole === 'HR' || userRole === 'SUPER_ADMIN';
       return {
         ...p,
         projectManager: displayManager ?? p.projectManager,
+        projectManagerUser,
         projectName: displayName,
+        permissions: {
+          canEditProjectFields: userManagesProject === true,
+        },
+        tasks: mapProjectTasksForMainTableClient(
+          mapTaskTreeWithPermissions(
+            alignedTasks,
+            req.user ? { id: req.user.id, role: req.user.role as any } : null,
+            p.createdBy ?? null,
+            p.status,
+            userManagesProject === true,
+          ),
+        ),
       };
     });
 
+    const projectsForClient = taskViewerId
+      ? projectsWithDisplayManager.filter((p) =>
+          employeeHasVisibleWorkInProject(p, taskViewerId),
+        )
+      : projectsWithDisplayManager;
+
+    setNoCacheJson(res);
     res.json({
       success: true,
-      data: projectsWithDisplayManager,
+      data: projectsForClient,
       pagination: {
         page: pageNum,
         limit: limitNum,
@@ -844,6 +1625,87 @@ export const getAllProjects = async (req: AuthRequest, res: Response): Promise<v
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
+
+/** Same visibility as project drawer / getProjectById (manager + employee rules). */
+async function loadProjectForDrawerAccess(projectId: string) {
+  return prisma.project.findUnique({
+    where: { id: projectId },
+    select: {
+      id: true,
+      createdBy: true,
+      projectManager: true,
+      contracts: {
+        select: { assignedManagerEmail: true, assignedManagerId: true },
+      },
+      assignedEmployees: { select: { employeeId: true } },
+      tasks: {
+        select: {
+          assignedEmployeeId: true,
+          subtasks: {
+            select: {
+              assignedEmployeeId: true,
+              subtasks: { select: { assignedEmployeeId: true } },
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+async function assertDrawerProjectAccess(
+  req: AuthRequest,
+  projectId: string,
+): Promise<'ok' | '404' | '403'> {
+  const project = await loadProjectForDrawerAccess(projectId);
+  if (!project) return '404';
+
+  const userRole = normalizeErpRole(req.user?.role);
+  if (req.user?.id && roleUsesCompanyAccessScope(userRole)) {
+    const accessScope = await resolveCompanyAccessScope(req.user.id, userRole);
+    if (!accessScope.unrestricted) {
+      const allowed = await projectMatchesCompanyScope(projectId, accessScope);
+      if (!allowed) return '403';
+    }
+  }
+
+  if (userRole !== 'EMPLOYEE' && userRole !== 'MANAGER') {
+    return 'ok';
+  }
+
+  const projectWithRelations = project as any;
+  if (userRole === 'MANAGER') {
+    const managerUser = await prisma.user.findUnique({
+      where: { id: req.user!.id },
+      select: { firstName: true, lastName: true, email: true },
+    });
+    const ownsProject = managerOwnsProjectAsPm(projectWithRelations, {
+      id: req.user!.id,
+      email: managerUser?.email ?? req.user?.email ?? null,
+      nameVariations: buildUserNameVariations(managerUser?.firstName, managerUser?.lastName),
+    });
+
+    const allowed = await managerMayAccessProjectWithTransfers(projectId, req.user!.id, ownsProject);
+    if (!allowed) {
+      return '403';
+    }
+  } else {
+    const isAssigned = projectWithRelations.assignedEmployees?.some(
+      (a: { employeeId: string }) => a.employeeId === req.user!.id,
+    );
+    const involvedInProject = await prisma.task.findFirst({
+      where: {
+        AND: [{ projectId: projectId }, taskRowAssignedToEmployee(req.user!.id)],
+      },
+      select: { id: true },
+    });
+    if (!isAssigned && !involvedInProject) {
+      return '403';
+    }
+  }
+
+  return 'ok';
+}
 
 // Get single project by ID
 export const getProjectById = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -863,15 +1725,7 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
         },
         assignedEmployees: {
           include: {
-            employee: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-                email: true,
-                role: true,
-              },
-            },
+            employee: { select: { id: true, firstName: true, lastName: true, email: true, photo: true, role: true } },
           },
         },
         tasks: {
@@ -888,43 +1742,23 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
                 },
               },
             },
-            assignedEmployee: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-                email: true,
-              },
-            },
+            delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+            assignedEmployee: { select: USER_AVATAR_SELECT },
             subtasks: {
               include: {
-                assignedEmployee: {
-                  select: {
-                    id: true,
-                    firstName: true,
-                    lastName: true,
-                    email: true,
-                  },
-                },
+                assignments: { select: { employeeId: true } },
+                delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+                assignedEmployee: { select: USER_AVATAR_SELECT },
                 subtasks: {
                   include: {
-                    assignedEmployee: {
-                      select: {
-                        id: true,
-                        firstName: true,
-                        lastName: true,
-                        email: true,
-                      },
-                    },
+                    assignments: { select: { employeeId: true } },
+                    delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+                    assignedEmployee: { select: USER_AVATAR_SELECT },
                   },
-                  orderBy: {
-                    createdAt: 'asc',
-                  },
+                  orderBy: [...TASK_ORDER_THEN_CREATED_AT],
                 },
               },
-              orderBy: {
-                createdAt: 'asc',
-              },
+              orderBy: [...TASK_ORDER_THEN_CREATED_AT],
             },
             _count: {
               select: {
@@ -933,9 +1767,7 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
               },
             },
           },
-          orderBy: {
-            createdAt: 'desc',
-          },
+          orderBy: [...TASK_ORDER_THEN_CREATED_AT],
         },
         checklists: {
           orderBy: {
@@ -971,6 +1803,7 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
             endDate: true,
             contractValue: true,
             currency: true,
+            builtUpArea: true,
             developerName: true,
             plotNumber: true,
             community: true,
@@ -978,13 +1811,7 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
             makaniNumber: true,
             assignedManagerId: true as any,
             assignedManagerEmail: true as any,
-            assignedManager: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-              },
-            },
+            assignedManager: { select: USER_AVATAR_SELECT },
           },
           orderBy: {
             createdAt: 'desc',
@@ -1008,53 +1835,39 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // Employee/Manager: Check access (managers see ONLY their own projects, not team member projects)
-    if (req.user?.role === 'EMPLOYEE' || req.user?.role === 'MANAGER') {
-      const projectWithRelations = project as any;
-      if (req.user?.role === 'MANAGER') {
-        // Manager: Can see ONLY their own projects - from their contracts, or where they are directly assigned
-        const isAssigned = projectWithRelations.assignedEmployees?.some((a: { employeeId: string }) => 
-          a.employeeId === req.user!.id
-        );
-        
-        const hasTasks = projectWithRelations.tasks?.some((task: any) => 
-          task.assignedEmployeeId === req.user!.id ||
-          task.subtasks?.some((st: any) => st.assignedEmployeeId === req.user!.id) ||
-          task.subtasks?.some((st: any) => st.subtasks?.some((cst: any) => cst.assignedEmployeeId === req.user!.id))
-        );
-        
-        const hasAssignedContract = projectWithRelations.contracts?.some((contract: any) => {
-          return (req.user?.email && contract.assignedManagerEmail === req.user.email) ||
-                 (req.user?.id && contract.assignedManagerId === req.user.id);
-        });
-        
-        const wasCreatedBy = projectWithRelations.createdBy === req.user!.id;
-        
-        // Check if projectManager field matches manager's name
-        let projectManagerMatches = false;
-        try {
-          const managerUser = await prisma.user.findUnique({
-            where: { id: req.user.id },
-            select: { firstName: true, lastName: true },
+    const userRole = normalizeErpRole(req.user?.role);
+    if (req.user?.id && roleUsesCompanyAccessScope(userRole)) {
+      const accessScope = await resolveCompanyAccessScope(req.user.id, userRole);
+      if (!accessScope.unrestricted) {
+        const allowed = await projectMatchesCompanyScope(id, accessScope);
+        if (!allowed) {
+          res.status(403).json({
+            success: false,
+            message: 'Forbidden: this project belongs to a branch outside your access',
           });
-          
-          if (managerUser && projectWithRelations.projectManager) {
-            const managerFirstName = managerUser.firstName?.trim().toLowerCase() || '';
-            const managerLastName = managerUser.lastName?.trim().toLowerCase() || '';
-            const managerFullName = `${managerFirstName} ${managerLastName}`.trim();
-            const projectManagerLower = String(projectWithRelations.projectManager).toLowerCase();
-            
-            // Check if projectManager field contains manager's name variations
-            projectManagerMatches = 
-              (managerFirstName.length > 0 && projectManagerLower.includes(managerFirstName)) ||
-              (managerLastName.length > 0 && projectManagerLower.includes(managerLastName)) ||
-              (managerFullName.length > 0 && projectManagerLower.includes(managerFullName));
-          }
-        } catch (error) {
-          console.error('Error checking projectManager match:', error);
+          return;
         }
-        
-        if (!isAssigned && !hasTasks && !hasAssignedContract && !wasCreatedBy && !projectManagerMatches) {
+      }
+    }
+
+    // Employee/Manager: Check access (managers see PM-owned projects + task-assigned projects)
+    // Note: PROJECT_MANAGER is normalized to MANAGER in normalizeErpRole().
+    let managerOwnsProject = false;
+    if (normalizeErpRole(req.user?.role) === 'EMPLOYEE' || normalizeErpRole(req.user?.role) === 'MANAGER') {
+      const projectWithRelations = project as any;
+      if (normalizeErpRole(req.user?.role) === 'MANAGER') {
+        const managerUser = await prisma.user.findUnique({
+          where: { id: req.user!.id },
+          select: { firstName: true, lastName: true, email: true },
+        });
+        managerOwnsProject = managerOwnsProjectAsPm(projectWithRelations, {
+          id: req.user!.id,
+          email: managerUser?.email ?? req.user?.email ?? null,
+          nameVariations: buildUserNameVariations(managerUser?.firstName, managerUser?.lastName),
+        });
+
+        const allowed = await managerMayAccessProjectWithTransfers(id, req.user!.id, managerOwnsProject);
+        if (!allowed) {
           res.status(403).json({ success: false, message: 'You do not have access to this project' });
           return;
         }
@@ -1065,7 +1878,7 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
         );
         const involvedInProject = await prisma.task.findFirst({
           where: {
-            AND: [{ projectId: id }, taskRowInvolvesEmployee(req.user!.id)],
+            AND: [{ projectId: id }, taskRowAssignedToEmployee(req.user!.id)],
           },
           select: { id: true },
         });
@@ -1089,14 +1902,136 @@ export const getProjectById = async (req: AuthRequest, res: Response): Promise<v
       projectName: (projectWithRelationsForManager.name != null && projectWithRelationsForManager.name !== '')
         ? projectWithRelationsForManager.name
         : projectWithRelationsForManager.referenceNumber,
+      permissions: {
+        canEditProjectFields:
+          normalizeErpRole(req.user?.role) === 'ADMIN' ||
+          normalizeErpRole(req.user?.role) === 'HR' ||
+          normalizeErpRole(req.user?.role) === 'SUPER_ADMIN' ||
+          managerOwnsProject,
+      },
+      tasks: mapProjectTasksForMainTableClient(
+        mapTaskTreeWithPermissions(
+          (normalizeErpRole(req.user?.role) === 'EMPLOYEE' ||
+            (normalizeErpRole(req.user?.role) === 'MANAGER' && !managerOwnsProject)) &&
+          req.user?.id
+            ? pruneTaskTreeForEmployee(projectWithRelationsForManager.tasks, req.user.id)
+            : projectWithRelationsForManager.tasks,
+          req.user ? { id: req.user.id, role: req.user.role as any } : null,
+          projectWithRelationsForManager.createdBy ?? null,
+          projectWithRelationsForManager.status,
+          managerOwnsProject,
+        ),
+      ),
     };
 
+    setNoCacheJson(res);
     res.json({
       success: true,
       data: projectWithDisplayManager,
     });
   } catch (error) {
     console.error('Get project by ID error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Project drawer — History / All (system events): subtasks, assignees, child tasks, etc.
+ * Query: limit (default 50, max 100), offset (default 0).
+ * Optional `taskId`: restrict to that single work-item row (subtask brief).
+ * Optional `includeSubtree=true`: also include child tasks under `taskId` (default false).
+ */
+export const getProjectActivity = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? '50'), 10) || 50));
+    const offset = Math.max(0, parseInt(String(req.query.offset ?? '0'), 10) || 0);
+    const includeSubtree =
+      String(req.query.includeSubtree ?? 'false').toLowerCase() === 'true';
+    const rawTaskId = req.query.taskId;
+    const rawTaskRef = req.query.taskIdByRef ?? req.query.referenceNumber;
+    let taskIdFilter =
+      typeof rawTaskId === 'string' && rawTaskId.trim().length > 0 ? rawTaskId.trim() : null;
+    if (!taskIdFilter && typeof rawTaskRef === 'string' && rawTaskRef.trim().length > 0) {
+      const ref = rawTaskRef.trim();
+      const byRef = await prisma.task.findFirst({
+        where: { projectId: id, referenceNumber: ref },
+        select: { id: true },
+      });
+      taskIdFilter = byRef?.id ?? null;
+    }
+
+    const access = await assertDrawerProjectAccess(req, id);
+    if (access === '404') {
+      res.status(404).json({ success: false, message: 'Project not found' });
+      return;
+    }
+    if (access === '403') {
+      res.status(403).json({ success: false, message: 'You do not have access to this project' });
+      return;
+    }
+
+    let activityWhere: {
+      projectId: string;
+      taskId?: string | { in: string[] };
+    } = { projectId: id };
+    if (taskIdFilter) {
+      const root = await prisma.task.findFirst({
+        where: { id: taskIdFilter, projectId: id },
+        select: { id: true },
+      });
+      if (!root) {
+        res.status(404).json({ success: false, message: 'Task not found in this project' });
+        return;
+      }
+      if (includeSubtree) {
+        const scopeIds = await collectTaskSubtreeTaskIds(taskIdFilter, id);
+        activityWhere = { projectId: id, taskId: { in: scopeIds } };
+      } else {
+        activityWhere = { projectId: id, taskId: taskIdFilter };
+      }
+    }
+
+    const [rawItems, total] = await Promise.all([
+      prisma.projectActivityLog.findMany({
+        where: activityWhere,
+        orderBy: { createdAt: 'desc' },
+        skip: offset,
+        take: limit,
+        include: {
+          actor: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              email: true,
+              photo: true,
+            },
+          },
+        },
+      }),
+      prisma.projectActivityLog.count({ where: activityWhere }),
+    ]);
+
+    const hydrated = await hydrateProjectActivityItems(rawItems, id);
+    const items = hydrated.map((row) => {
+      const detailLines = formatActivityChangeLines(row.metadata);
+      return {
+        ...row,
+        detailLines,
+        displaySummary: row.displaySummary ?? row.summary,
+      };
+    });
+
+    res.json({
+      success: true,
+      data: {
+        items,
+        pagination: { total, limit, offset, hasMore: offset + items.length < total },
+      },
+    });
+  } catch (error) {
+    console.error('Get project activity error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
   }
 };
@@ -1204,13 +2139,9 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
           if (!finalDeveloperProject && contract.developerName) {
             finalDeveloperProject = contract.developerName;
           }
-          // Build location string from coordinates or makani number
-          if (!finalLocation) {
-            if (contract.makaniNumber) {
-              finalLocation = contract.makaniNumber;
-            } else if (contract.latitude && contract.longitude) {
-              finalLocation = `${contract.latitude}, ${contract.longitude}`;
-            }
+          // Build location string from coordinates only (not Makani)
+          if (!finalLocation && contract.latitude && contract.longitude) {
+            finalLocation = `${contract.latitude}, ${contract.longitude}`;
           }
         } else {
           console.warn(`⚠️ Contract with reference number ${contractReferenceNumber} not found`);
@@ -1266,7 +2197,7 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
     }
 
     // Determine project status - default to OPEN (which counts as active)
-    const projectStatus = status ? (status as ProjectStatus) : ProjectStatus.OPEN;
+    const projectStatus = normalizeProjectStatusValue(status) ?? ProjectStatus.OPEN;
     
     console.log(`📝 Creating project: ${finalName}`);
     console.log(`   Reference Number: ${referenceNumber}`);
@@ -1324,14 +2255,7 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
           client: true,
           assignedEmployees: {
             include: {
-              employee: {
-                select: {
-                  id: true,
-                  firstName: true,
-                  lastName: true,
-                  email: true,
-                },
-              },
+              employee: { select: USER_AVATAR_SELECT },
             },
           },
         },
@@ -1346,6 +2270,14 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
           data: { projectId: project.id },
         });
         console.log(`✅ Contract ${contractReferenceNumber} linked to project ${project.id}`);
+        if (contractData.assignedManagerId) {
+          await notifyPmProjectAssignment(
+            contractData.assignedManagerId,
+            project.id,
+            'ASSIGNMENT',
+            req.user?.id,
+          );
+        }
       } catch (linkError) {
         console.error('Error linking contract to project:', linkError);
         // Don't fail project creation if contract linking fails
@@ -1373,14 +2305,7 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
         client: true,
         assignedEmployees: {
           include: {
-            employee: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-                email: true,
-              },
-            },
+            employee: { select: USER_AVATAR_SELECT },
           },
         },
         contracts: {
@@ -1389,6 +2314,7 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
             referenceNumber: true,
             title: true,
             status: true,
+            builtUpArea: true,
           },
         },
       },
@@ -1407,20 +2333,20 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
 
 // Update project
 export const updateProject = async (req: AuthRequest, res: Response): Promise<void> => {
-  console.log('🚀 updateProject called');
-  console.log('👤 User:', req.user?.email, 'Role:', req.user?.role);
+  projectDebugLog('🚀 updateProject called');
+  projectDebugLog('👤 User:', req.user?.email, 'Role:', req.user?.role);
   const body = req.body as Record<string, unknown>;
-  console.log('📥 updateProject body keys:', body ? Object.keys(body) : []);
+  projectDebugLog('📥 updateProject body keys:', body ? Object.keys(body) : []);
   if (body && (body as any).projectNumber !== undefined) {
     console.warn('⚠️ Ignoring attempt to update projectNumber (immutable).');
   }
   if (body && (body.name !== undefined || body.projectName !== undefined || body.title !== undefined)) {
-    console.log('📥 updateProject name-related:', { name: body.name, projectName: body.projectName, title: body.title });
+    projectDebugLog('📥 updateProject name-related:', { name: body.name, projectName: body.projectName, title: body.title });
   }
 
   try {
     const { id } = req.params;
-    console.log(`📋 Updating project ${id}`);
+    projectDebugLog(`📋 Updating project ${id}`);
     
     const {
       name: nameFromBody,
@@ -1540,6 +2466,72 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
+    // Employee/Manager role: managers may update owned projects or task-assigned projects (task-only = subtasks only).
+    let managerOwnsProject = false;
+    let managerTaskOnlyAccess = false;
+    if (normalizeErpRole(req.user?.role) === 'EMPLOYEE' || normalizeErpRole(req.user?.role) === 'MANAGER') {
+      if (normalizeErpRole(req.user?.role) === 'MANAGER') {
+        const isCreator = existingProject.createdBy === req.user!.id;
+        const managerUser = await prisma.user.findUnique({
+          where: { id: req.user!.id },
+          select: { email: true, firstName: true, lastName: true },
+        });
+        managerOwnsProject = managerOwnsProjectAsPm(existingProject as any, {
+          id: req.user!.id,
+          email: managerUser?.email ?? req.user?.email ?? null,
+          nameVariations: buildUserNameVariations(managerUser?.firstName, managerUser?.lastName),
+        });
+
+        const allowed =
+          isCreator ||
+          managerOwnsProject ||
+          (await managerMayAccessProjectWithTransfers(id, req.user!.id, managerOwnsProject));
+        if (!allowed) {
+          res.status(403).json({
+            success: false,
+            message: 'Access Denied: You do not have access to this project.',
+            code: 'ACCESS_DENIED',
+          });
+          return;
+        }
+        managerTaskOnlyAccess = !managerOwnsProject && !isCreator;
+      }
+    }
+
+    let normalizedStatus = normalizeProjectStatusValue(status);
+    // Employees cannot change project-level status (UI shows it read-only).
+    // Drop the status from their payload instead of rejecting, so other edits still save.
+    if (
+      req.user?.role === 'EMPLOYEE' &&
+      normalizedStatus !== undefined &&
+      normalizedStatus !== existingProject.status
+    ) {
+      console.warn(
+        `⚠️ EMPLOYEE ${req.user.email} attempted to change project ${id} status ` +
+          `${existingProject.status} -> ${normalizedStatus} — ignored (not permitted)`,
+      );
+      normalizedStatus = undefined;
+    }
+    const nextProjectStatus = normalizedStatus ?? existingProject.status;
+    const shouldCascadeSuspension =
+      nextProjectStatus === ProjectStatus.ON_HOLD &&
+      existingProject.status !== ProjectStatus.ON_HOLD;
+    const isCurrentlySuspended = isProjectSuspendedStatus(existingProject.status);
+    const canReactivate =
+      isCurrentlySuspended &&
+      normalizedStatus !== undefined &&
+      normalizedStatus !== ProjectStatus.ON_HOLD &&
+      userCanReactivateSuspendedProject(req.user);
+
+    if (isCurrentlySuspended && !canReactivate) {
+      res.status(423).json({
+        success: false,
+        message: PROJECT_SUSPENDED_MESSAGE,
+        code: 'PROJECT_SUSPENDED',
+      });
+      return;
+    }
+
     // When frontend sends only "add child" (parentSubtaskId + childSubtaskName) without full subtasks array,
     // load existing task tree from DB, merge the new child, and set subtasksToSave so the save block runs
     if (parentSubtaskId && childSubtaskName && (!subtasksToSave || subtasksToSave.length === 0)) {
@@ -1548,11 +2540,12 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
         include: {
           tasks: {
             where: { parentTaskId: null },
+            orderBy: [...TASK_ORDER_THEN_CREATED_AT],
             include: {
               subtasks: {
-                orderBy: { createdAt: 'asc' as const },
+                orderBy: [...TASK_ORDER_THEN_CREATED_AT],
                 include: {
-                  subtasks: { orderBy: { createdAt: 'asc' as const } },
+                  subtasks: { orderBy: [...TASK_ORDER_THEN_CREATED_AT] },
                 },
               },
             },
@@ -1617,6 +2610,11 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
           const nameStr = String(childSubtaskName).trim();
           const alreadyHas = childArray.some((c: any) => (c.name || c.title || '').trim() === nameStr);
           if (!alreadyHas && nameStr) {
+            if (managerTaskOnlyAccess) {
+              console.warn(
+                `⛔ Add-child-only blocked for task-only manager ${req.user?.id} on project ${id}`,
+              );
+            } else {
             parentSubtask.childSubtasks = [...childArray, { name: nameStr, title: nameStr }];
             const projectDefaults: ProjectLocationDefaults = {
               location: projectWithTasks.location ?? null,
@@ -1636,61 +2634,20 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
               projectDefaults,
               req.user?.id ?? null,
               req.user?.role ?? null,
+              (existingProject as any).createdBy ?? null,
+              (status !== undefined && status !== null && String(status).trim() !== ''
+                ? String(status)
+                : (projectWithTasks as any).status) ?? null,
+              undefined,
+              false,
+              managerOwnsProject,
             );
             console.log(`📥 Add-child-only: saved new child "${nameStr}" under parent ${parentSubtaskId}`);
+            }
           }
         } else {
           console.warn(`⚠️ Add-child-only: parentSubtaskId ${parentSubtaskId} not found in project task tree`);
         }
-      }
-    }
-
-    // Employee/Manager role: Can update if assigned to project OR assigned to any task/subtask in the project
-    // Managers use the SAME module as employees - same update permissions
-    if (req.user?.role === 'EMPLOYEE' || req.user?.role === 'MANAGER') {
-      if (req.user?.role === 'MANAGER') {
-        // Manager: Can update ONLY their own projects - from contracts, created by them, or where they're directly assigned
-        const existingProjectWithRelations = existingProject as any;
-        const isAssignedToProject = existingProjectWithRelations.assignedEmployees?.some(
-          (a: { employeeId: string }) => a.employeeId === req.user!.id
-        );
-        const isCreator = existingProject.createdBy === req.user!.id;
-        
-        let hasAssignedContract = false;
-        if (existingProjectWithRelations.contracts && Array.isArray(existingProjectWithRelations.contracts) && existingProjectWithRelations.contracts.length > 0) {
-          const managerUser = await prisma.user.findUnique({
-            where: { id: req.user!.id },
-            select: { email: true },
-          });
-          hasAssignedContract = existingProjectWithRelations.contracts.some((c: any) => 
-            (managerUser?.email && c.assignedManagerEmail === managerUser.email) ||
-            c.assignedManagerId === req.user!.id
-          );
-        }
-        
-        if (!isAssignedToProject && !isCreator && !hasAssignedContract) {
-          const hasTaskAssignment = await prisma.task.findFirst({
-            where: {
-              projectId: id,
-              OR: [
-                { assignments: { some: { employeeId: req.user!.id } } },
-                { assignedEmployeeId: req.user!.id },
-              ],
-            },
-            select: { id: true },
-          });
-          
-          if (!hasTaskAssignment) {
-            res.status(403).json({
-              success: false,
-              message: 'Access Denied: You can only edit projects assigned to you.',
-              code: 'ACCESS_DENIED',
-            });
-            return;
-          }
-        }
-      } else {
-        // Employee: No project/task assignment check - allow save (e.g. child tasks) without restriction
       }
     }
 
@@ -1724,63 +2681,123 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       }
     }
 
+    // Task-only managers cannot change project-level fields (status, PM, dates, etc.).
+    if (managerTaskOnlyAccess) {
+      const projectFieldKeys = [
+        'name',
+        'projectName',
+        'referenceNumber',
+        'pin',
+        'clientId',
+        'owner',
+        'description',
+        'status',
+        'projectManager',
+        'startDate',
+        'endDate',
+        'deadline',
+        'planDays',
+        'remarks',
+        'assigneeNotes',
+        'location',
+        'makaniNumber',
+        'plotNumber',
+        'community',
+        'projectType',
+        'projectFloor',
+        'developerProject',
+      ] as const;
+      const triesProjectFieldUpdate = projectFieldKeys.some((k) => req.body[k] !== undefined);
+      if (triesProjectFieldUpdate && (!subtasksToSave || subtasksToSave.length === 0)) {
+        res.status(403).json({
+          success: false,
+          message:
+            'You can only edit tasks assigned to you on projects you do not manage. Project-level fields cannot be changed.',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+      if (triesProjectFieldUpdate) {
+        console.warn(
+          `⚠️ MANAGER ${req.user?.email} on task-only project ${id} — ignoring project-level field updates`,
+        );
+      }
+      normalizedStatus = undefined;
+    }
+
     // Validate and trim projectManager (max 100 characters)
     const projectManagerText = projectManager !== undefined
       ? (projectManager ? String(projectManager).trim().substring(0, 100) : null)
       : undefined;
 
     // Update project (name is editable in modal; save whenever name or projectName is sent so it reflects in backend)
-    const nameToWrite = shouldUpdateName && projectNameToSave.length > 0 ? projectNameToSave : undefined;
+    const nameToWrite =
+      !managerTaskOnlyAccess && shouldUpdateName && projectNameToSave.length > 0
+        ? projectNameToSave
+        : undefined;
     if (nameToWrite) {
       console.log(`📝 Persisting project name to DB: "${nameToWrite}"`);
     }
-    const project = await prisma.project.update({
-      where: { id },
-      data: {
-        ...(nameToWrite ? { name: nameToWrite } : {}),
-        ...(referenceNumber && { referenceNumber }),
-        ...(pin !== undefined && { pin: pin || null }),
-        ...(clientId !== undefined && { clientId: clientId || null }),
-        ...(owner !== undefined && { owner: owner || null }),
-        ...(description !== undefined && { description: description || null }),
-        ...(status && { status }),
-        ...(projectManagerText !== undefined && { projectManager: projectManagerText }),
-        ...(startDate && { startDate: new Date(startDate) }),
-        ...(endDate && { endDate: new Date(endDate) }),
-        ...(deadline && { deadline: new Date(deadline) }),
-        ...(planDays !== undefined && { planDays: planDays ? parseInt(planDays, 10) : null }),
-        ...(remarks !== undefined && { remarks: remarks || null }),
-        ...(assigneeNotes !== undefined && { assigneeNotes: assigneeNotes || null }),
-        // Location & Project Details
-        ...(location !== undefined && { location: location || null }),
-        ...(makaniNumber !== undefined && { makaniNumber: makaniNumber || null }),
-        ...(plotNumber !== undefined && { plotNumber: plotNumber || null }),
-        ...(community !== undefined && { community: community || null }),
-        ...(projectType !== undefined && { projectType: projectType || null }),
-        ...(projectFloor !== undefined && { projectFloor: projectFloor || null }),
-        ...(developerProject !== undefined && { developerProject: developerProject || null }),
-      },
-      include: {
-        client: true,
-        assignedEmployees: {
-          include: {
-            employee: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-                email: true,
-              },
+    let project: any;
+    if (managerTaskOnlyAccess) {
+      project = await prisma.project.findUnique({
+        where: { id },
+        include: {
+          client: true,
+          assignedEmployees: {
+            include: {
+              employee: { select: USER_AVATAR_SELECT },
             },
           },
         },
-      },
-    });
+      });
+      if (!project) {
+        res.status(404).json({ success: false, message: 'Project not found' });
+        return;
+      }
+    } else {
+      project = await prisma.project.update({
+        where: { id },
+        data: {
+          ...(nameToWrite ? { name: nameToWrite } : {}),
+          ...(referenceNumber && { referenceNumber }),
+          ...(pin !== undefined && { pin: pin || null }),
+          ...(clientId !== undefined && { clientId: clientId || null }),
+          ...(owner !== undefined && { owner: owner || null }),
+          ...(description !== undefined && { description: description || null }),
+          ...(normalizedStatus && { status: normalizedStatus }),
+          ...(projectManagerText !== undefined && { projectManager: projectManagerText }),
+          ...(startDate && { startDate: new Date(startDate) }),
+          ...(endDate && { endDate: new Date(endDate) }),
+          ...(deadline && { deadline: new Date(deadline) }),
+          ...(planDays !== undefined && { planDays: planDays ? parseInt(planDays, 10) : null }),
+          ...(remarks !== undefined && { remarks: remarks || null }),
+          ...(assigneeNotes !== undefined && { assigneeNotes: assigneeNotes || null }),
+          // Location & Project Details
+          ...(location !== undefined && { location: location || null }),
+          ...(makaniNumber !== undefined && { makaniNumber: makaniNumber || null }),
+          ...(plotNumber !== undefined && { plotNumber: plotNumber || null }),
+          ...(community !== undefined && { community: community || null }),
+          ...(projectType !== undefined && { projectType: projectType || null }),
+          ...(projectFloor !== undefined && { projectFloor: projectFloor || null }),
+          ...(developerProject !== undefined && { developerProject: developerProject || null }),
+        },
+        include: {
+          client: true,
+          assignedEmployees: {
+            include: {
+              employee: { select: USER_AVATAR_SELECT },
+            },
+          },
+        },
+      });
+    }
 
     // Save/update subtasks and child subtasks if provided (use subtasksToSave so add-child-only path runs save too)
     // Employees can save child tasks to tasks assigned to them
     if (subtasksToSave && Array.isArray(subtasksToSave)) {
       try {
+        const projectCreatorId = (existingProject as any).createdBy ?? null;
         console.log(`📝 Saving ${subtasksToSave.length} subtasks for project ${id} (user: ${req.user?.id}, role: ${req.user?.role}, email: ${req.user?.email})`);
         console.log(`📝 Subtasks structure:`, JSON.stringify(subtasksToSave.map((st: any) => ({
           id: st.id,
@@ -1810,22 +2827,108 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             assignments: {
               select: { employeeId: true },
             },
+            delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
           },
         });
 
         const existingSubtaskIds = new Set(existingSubtasks.map(st => st.id));
         const incomingSubtaskIds = new Set(subtasksToSave.filter((st: any) => st.id).map((st: any) => st.id));
 
-        // Delete subtasks that are no longer in the incoming list
-        const subtasksToDelete = existingSubtasks.filter(st => !incomingSubtaskIds.has(st.id));
-        if (subtasksToDelete.length > 0) {
-          console.log(`🗑️ Deleting ${subtasksToDelete.length} removed subtasks`);
-          await prisma.task.deleteMany({
-            where: {
-              id: { in: subtasksToDelete.map(st => st.id) },
-            },
-          });
+        // Delete subtasks that are no longer in the incoming list.
+        // CRITICAL: When an EMPLOYEE (or a collaborator PM) updates a project, the frontend may send
+        // a partial subtask list (only rows visible to that user). We must NOT treat "missing" as
+        // "deleted" unless the caller can delete every missing row — otherwise the whole PUT fails
+        // with 403 and status changes never persist (e.g. assignee marks Done, refresh reverts).
+        const missingFromPayload = existingSubtasks.filter((st) => !incomingSubtaskIds.has(st.id));
+        const authUser = req.user;
+        const canDeleteEveryMissingSubtask =
+          authUser?.id &&
+          authUser.role &&
+          missingFromPayload.length > 0 &&
+          missingFromPayload.every((st) =>
+            computeTaskPermissions({
+              user: { id: authUser.id, role: authUser.role as any },
+              task: st as any,
+              projectCreatedById: projectCreatorId,
+              projectStatus: project.status,
+              userManagesProject: managerOwnsProject,
+            }).canDelete,
+          );
+
+        if (req.user?.role === 'EMPLOYEE') {
+          if (missingFromPayload.length > 0) {
+            console.log(
+              `⚠️ Skipping deletion of ${missingFromPayload.length} subtasks (partial payload from EMPLOYEE)`,
+            );
+          }
+        } else if (missingFromPayload.length > 0 && canDeleteEveryMissingSubtask) {
+          console.log(`🗑️ Deleting ${missingFromPayload.length} removed subtasks`);
+          for (const st of missingFromPayload) {
+            await logProjectActivity({
+              projectId: id,
+              actorId: req.user?.id,
+              action: 'SUBTASK_DELETED',
+              taskId: st.id,
+              summary: `Removed work item "${st.title}"`,
+              metadata: { taskTitle: st.title },
+            });
+          }
+          await softDeleteTasks(missingFromPayload.map((st) => st.id));
+        } else if (missingFromPayload.length > 0) {
+          console.log(
+            `⚠️ Skipping deletion of ${missingFromPayload.length} subtasks (partial payload or insufficient delete permission; applying updates only)`,
+          );
         }
+
+        await syncProjectPredecessorLinksFromDisplayKeys(prisma, id);
+
+        const allProjectTasksForPred = await prisma.task.findMany({
+          where: { projectId: id },
+          select: { id: true, stableWorkSeq: true, taskOrder: true, parentTaskId: true, displayAnchorSeq: true, displaySuffix: true },
+        });
+        const predResolveIndex = buildPredecessorResolveIndex(allProjectTasksForPred);
+        const projectMetaForPred = await prisma.project.findUnique({
+          where: { id },
+          select: { projectNumber: true },
+        });
+        const predProjectNumber = projectMetaForPred?.projectNumber ?? 1;
+        const resolvePredKey = (key: string) =>
+          resolvePredecessorIdFromDisplayKey(key, predResolveIndex, {
+            allRows: allProjectTasksForPred,
+            projectNumber: predProjectNumber,
+          });
+
+        const allProjectTasksById = await prisma.task.findMany({
+          where: { projectId: id },
+          select: {
+            id: true,
+            predecessorId: true,
+            predecessors: true,
+            status: true,
+            workflowStatus: true,
+            parentTaskId: true,
+          },
+        });
+        const existingTaskById = new Map(allProjectTasksById.map((t) => [t.id, t]));
+
+        // Preload predecessor completion for subtasks so workflowStatus stays correct when the client
+        // omits predecessorId on save (otherwise WAITING_FOR_PREDECESSOR was overwritten with NOT_STARTED).
+        const subtaskPredecessorIds = new Set<string>();
+        for (const st of subtasksToSave) {
+          const ex = st.id ? existingTaskById.get(st.id) : undefined;
+          const eff = resolveEffectivePredecessorForTaskRow(st, ex, resolvePredKey);
+          if (eff) subtaskPredecessorIds.add(eff);
+        }
+        const predecessorCompletionRows =
+          subtaskPredecessorIds.size > 0
+            ? await prisma.task.findMany({
+                where: { id: { in: Array.from(subtaskPredecessorIds) } },
+                select: { id: true, status: true, workflowStatus: true },
+              })
+            : [];
+        const predecessorCompletedById = new Map(
+          predecessorCompletionRows.map((p) => [p.id, isPredecessorRowCompleted(p)]),
+        );
 
         // Project defaults from manager project list: inherit into all subtasks and child tasks
         const projectDefaults: ProjectLocationDefaults = {
@@ -1839,20 +2942,97 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
         };
 
         // Create or update subtasks (inherit plot number, community, project type, no. of floors, developer name from project)
+        const referencePlanDaysMap = await loadReferencePlanDaysData(prisma);
+        const syncFromReference = !isReferenceProjectRef((existingProject as any).referenceNumber);
         let createdCount = 0;
         let updatedCount = 0;
-        for (const subtask of subtasks) {
+        for (let subtaskIndex = 0; subtaskIndex < subtasksToSave.length; subtaskIndex++) {
+          const subtask = subtasksToSave[subtaskIndex];
+          const parsedOrder =
+            subtask.taskOrder != null ? parseInt(String(subtask.taskOrder), 10) : NaN;
+          const taskOrderForRow = Number.isFinite(parsedOrder) ? parsedOrder : subtaskIndex;
+
+          const existingOneEarly = subtask.id ? existingTaskById.get(subtask.id) : undefined;
+          const effectivePredecessorId = resolveEffectivePredecessorForTaskRow(
+            subtask,
+            existingOneEarly,
+            resolvePredKey,
+          );
+          let predecessorDoneForRow = true;
+          if (effectivePredecessorId) {
+            if (predecessorCompletedById.has(effectivePredecessorId)) {
+              predecessorDoneForRow =
+                predecessorCompletedById.get(effectivePredecessorId) ?? false;
+            } else {
+              const predRow = await prisma.task.findUnique({
+                where: { id: effectivePredecessorId },
+                select: { status: true, workflowStatus: true },
+              });
+              predecessorDoneForRow = isPredecessorRowCompleted(predRow);
+              predecessorCompletedById.set(effectivePredecessorId, predecessorDoneForRow);
+            }
+          }
+          const isLockedByPred = !!effectivePredecessorId && !predecessorDoneForRow;
+
+          const mappedRawStatus = mapStatusToTaskStatus(subtask.status);
+          let mappedSubtaskStatus = clampTaskStatusAgainstIncompletePredecessor(
+            mappedRawStatus,
+            effectivePredecessorId,
+            predecessorDoneForRow,
+          );
+          const isExistingSubtaskRow = !!(subtask.id && existingSubtaskIds.has(subtask.id));
+          const pmReopeningCompleted =
+            isExistingSubtaskRow &&
+            existingOneEarly?.status === TaskStatus.COMPLETED &&
+            mappedSubtaskStatus !== TaskStatus.COMPLETED &&
+            authUser?.id &&
+            userCanUnlockCompletedTask(
+              { id: authUser.id, role: authUser.role as any },
+              projectCreatorId,
+            );
+          if (
+            isExistingSubtaskRow &&
+            existingOneEarly &&
+            !pmReopeningCompleted &&
+            shouldPreserveCompletedTaskStatusOnSave(
+              existingOneEarly,
+              subtask.status,
+              mappedSubtaskStatus,
+            )
+          ) {
+            mappedSubtaskStatus = existingOneEarly.status as TaskStatus;
+            predecessorDoneForRow = true;
+          }
+
+          const subtaskTitle = subtask.name || subtask.title || '';
           const subtaskData: any = {
-            title: subtask.name || subtask.title || '',
+            title: subtaskTitle,
             projectId: id,
             parentTaskId: null,
-            status: mapStatusToTaskStatus(subtask.status),
-            priority: mapPriorityToTaskPriority(subtask.priority),
-            category: subtask.category || null,
+            status: mappedSubtaskStatus,
+            priority: mapPriorityToTaskPriority(
+              resolvePriorityForTaskTitle(subtaskTitle, subtask.priority, referencePlanDaysMap, subtaskIndex) ||
+                subtask.priority,
+            ),
+            category: resolveCategoryForTaskTitle(
+              subtaskTitle,
+              subtask.category,
+              referencePlanDaysMap,
+              subtaskIndex,
+            ),
             referenceNumber: subtask.referenceNumber || null,
-            planDays: subtask.planDays ? parseInt(String(subtask.planDays), 10) : null,
+            planDays: resolvePlanDaysForTaskTitle(
+              subtaskTitle,
+              subtask.planDays,
+              referencePlanDaysMap,
+              subtaskIndex,
+            ),
             remarks: subtask.remarks || null,
             assigneeNotes: subtask.assigneeNotes || null,
+            link:
+              subtask.link != null && String(subtask.link).trim() !== ''
+                ? String(subtask.link).trim()
+                : null,
             createdBy: req.user?.id ?? null,
             location: subtask.location ?? projectDefaults.location ?? null,
             makaniNumber: subtask.makaniNumber ?? projectDefaults.makaniNumber ?? null,
@@ -1863,8 +3043,51 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             developerProject: subtask.developerProject ?? projectDefaults.developerProject ?? null,
             description: subtask.description || subtask.remarks || null,
             tags: Array.isArray(subtask.tags) ? subtask.tags : [],
-            taskOrder: subtask.taskOrder != null ? parseInt(String(subtask.taskOrder), 10) : null,
+            // Persist row index when client omits taskOrder so DB sort matches Main Table order (avoids NULLs last vs small integers).
+            taskOrder: taskOrderForRow,
           };
+          if (
+            (subtask as any).displayAnchorSeq != null &&
+            Number.isFinite(Number((subtask as any).displayAnchorSeq))
+          ) {
+            subtaskData.displayAnchorSeq = Number((subtask as any).displayAnchorSeq);
+          }
+          if ((subtask as any).displaySuffix != null && String((subtask as any).displaySuffix).trim()) {
+            subtaskData.displaySuffix = String((subtask as any).displaySuffix).trim();
+          }
+          applyEffortFieldsFromPayload(subtaskData, subtask);
+          applyRatingFromPayload(subtaskData, subtask);
+
+          if (syncFromReference) {
+            const refAligned = applyReferenceTemplateToTaskRow(
+              {
+                title: subtaskTitle,
+                planDays: subtaskData.planDays,
+                category: subtaskData.category,
+                priority: subtask.priority,
+                assignedEmployeeId:
+                  subtask.assignedEmployeeId ??
+                  subtask.assignedEmployee ??
+                  subtask.assignedTo ??
+                  null,
+                assignedEmployee: subtask.assignedEmployeeData ?? subtask.assignedEmployee ?? null,
+              },
+              referencePlanDaysMap,
+              subtaskIndex,
+            );
+            if (refAligned.category) subtaskData.category = refAligned.category;
+            if (refAligned.planDays != null && refAligned.planDays > 0) {
+              subtaskData.planDays = refAligned.planDays;
+            }
+            if (refAligned.priority) {
+              subtaskData.priority = mapPriorityToTaskPriority(String(refAligned.priority));
+            }
+            if (refAligned.assignedEmployeeId) {
+              subtaskData.assignedEmployeeId = await resolveAssigneeUserId(
+                refAligned.assignedEmployeeId,
+              );
+            }
+          }
 
           // Only set assignedEmployeeId when the payload explicitly provides an assignee.
           // Do not overwrite with null for existing subtasks (preserves Khalid's assignment when
@@ -1878,12 +3101,22 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             subtask.assignedEmployee ??
             subtask.assignedTo ??
             null;
+          const referenceAssigneeId = resolveAssigneeIdForTaskTitle(
+            subtaskTitle,
+            payloadAssignee,
+            referencePlanDaysMap,
+            subtaskIndex,
+          );
           const isExistingSubtask = subtask.id && existingSubtaskIds.has(subtask.id);
           if (assigneeInPayload && payloadAssignee) {
             const resolvedAssigneeId = await resolveAssigneeUserId(payloadAssignee);
             subtaskData.assignedEmployeeId = resolvedAssigneeId;
           } else if (assigneeInPayload && payloadAssignee === null && !isExistingSubtask) {
-            subtaskData.assignedEmployeeId = null;
+            subtaskData.assignedEmployeeId = referenceAssigneeId
+              ? await resolveAssigneeUserId(referenceAssigneeId)
+              : null;
+          } else if (!isExistingSubtask && referenceAssigneeId) {
+            subtaskData.assignedEmployeeId = await resolveAssigneeUserId(referenceAssigneeId);
           }
           // If existing subtask and payload has null/undefined assignee: do not set assignedEmployeeId (keep current in DB)
 
@@ -1895,14 +3128,14 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
                 : null;
           }
           // Normalized predecessor link (strict sequencing)
-          if (subtask.predecessorId !== undefined) {
-            subtaskData.predecessorId = subtask.predecessorId || null;
+          if (subtask.predecessors !== undefined || subtask.predecessorId !== undefined) {
+            subtaskData.predecessorId = effectivePredecessorId;
           }
-          // Keep workflowStatus aligned with predecessor lock state
-          subtaskData.workflowStatus =
-            subtaskData.status === TaskStatus.COMPLETED
-              ? 'COMPLETED'
-              : (subtaskData.predecessorId ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED');
+          subtaskData.workflowStatus = workflowStatusForSavedTaskStatus(
+            subtaskData.status,
+            effectivePredecessorId,
+            predecessorDoneForRow,
+          );
 
           // Handle timeline/dates
           if (subtask.timeline && Array.isArray(subtask.timeline) && subtask.timeline.length >= 2) {
@@ -1928,6 +3161,9 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
               const perms = computeTaskPermissions({
                 user: { id: req.user.id, role: req.user.role as any },
                 task: existingOne as any,
+                projectCreatedById: projectCreatorId,
+                projectStatus: project.status,
+                userManagesProject: managerOwnsProject,
               });
 
               if (!perms.canEditAssigneeFields && !perms.canEditMainFields) {
@@ -1938,39 +3174,190 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
               }
 
               if (perms.canEditMainFields) {
-                updateData = subtaskData;
+                updateData = { ...subtaskData, createdBy: existingOne?.createdBy ?? null };
               } else if (perms.canEditAssigneeFields) {
-                // Assignee can change status + remarks/notes only
-                updateData = {
-                  status: subtaskData.status,
-                  workflowStatus: subtaskData.workflowStatus,
-                  remarks: subtaskData.remarks,
-                  assigneeNotes: subtaskData.assigneeNotes,
-                };
+                const rawStatus = subtask.status != null ? String(subtask.status).trim().toLowerCase() : '';
+                const looksLikeWaitingLabel =
+                  rawStatus.includes('waiting') && rawStatus.includes('predecessor');
+
+                // Assignee partial save must not clear predecessor lock (frontend often omits predecessors).
+                if (isLockedByPred) {
+                  updateData = {
+                    workflowStatus: 'WAITING_FOR_PREDECESSOR',
+                    status: TaskStatus.PENDING,
+                    remarks: subtaskData.remarks,
+                    assigneeNotes: subtaskData.assigneeNotes,
+                    link: subtaskData.link,
+                  };
+                } else {
+                  updateData = {
+                    // If UI sends the human "Waiting for predecessor..." label back, don't downgrade stored status.
+                    // This prevents reopening a successor from resetting already-completed predecessors to PENDING.
+                    ...(looksLikeWaitingLabel
+                      ? {}
+                      : {
+                          status: subtaskData.status,
+                          workflowStatus: subtaskData.workflowStatus,
+                        }),
+                    remarks: subtaskData.remarks,
+                    assigneeNotes: subtaskData.assigneeNotes,
+                    link: subtaskData.link,
+                  };
+                }
               }
             } else {
               // Fallback: preserve previous behaviour if no user context
-              updateData = subtaskData;
+              updateData = { ...subtaskData, createdBy: existingOne?.createdBy ?? null };
             }
 
-            console.log(`🔄 Updating subtask ${subtask.id}: ${subtaskData.title}`);
+            projectDebugLog(`🔄 Updating subtask ${subtask.id}: ${subtaskData.title}`);
             await prisma.task.update({
               where: { id: subtask.id },
               data: updateData,
             });
-            await unlockDependentsWaitingOnFinishedPredecessor(prisma, subtask.id);
+            if (authUser?.id && existingOne) {
+              void maybeNotifyTaskNotesFromSave({
+                projectId: id,
+                projectName: project.name,
+                projectReferenceNumber: project.referenceNumber,
+                taskId: subtask.id,
+                taskTitle: String(existingOne.title ?? subtaskData.title ?? ''),
+                actorId: authUser.id,
+                existing: {
+                  remarks: existingOne.remarks,
+                  assigneeNotes: existingOne.assigneeNotes,
+                },
+                incoming: {
+                  remarks: subtask.remarks,
+                  assigneeNotes: subtask.assigneeNotes,
+                },
+              });
+            }
+            const subAssigneeId =
+              (updateData.assignedEmployeeId as string | null | undefined) ??
+              existingOne?.assignedEmployeeId ??
+              null;
+            await maybeAwardXpForStatusTransition(
+              subtask.id,
+              existingOne?.status,
+              (updateData.status as TaskStatus | undefined) ?? subtaskData.status,
+              subAssigneeId,
+            );
+            const persistedStatus =
+              (updateData.status as TaskStatus | undefined) ?? subtaskData.status;
+            if (
+              existingOne &&
+              isTaskStatusChanged(existingOne.status as TaskStatus, persistedStatus)
+            ) {
+              await processPmTaskStatusChangeNotification({
+                projectId: id,
+                taskId: subtask.id,
+                taskTitle: String(existingOne.title ?? subtaskData.title ?? ''),
+                actor: { id: authUser!.id, role: authUser!.role as any },
+                projectCreatedById: projectCreatorId,
+                previousStatus: existingOne.status as TaskStatus,
+                newStatus: persistedStatus,
+                assigneeUserId: subAssigneeId,
+                reason: extractStatusReversionReason(subtask),
+              });
+            }
+            const unlockedSub = await unlockDependentsWaitingOnFinishedPredecessor(
+              prisma,
+              subtask.id,
+            );
+            for (const d of unlockedSub) {
+              const { displayId } = await resolveTaskDisplayIdForTaskId(id, d.id);
+              await logProjectActivity({
+                projectId: id,
+                actorId: req.user?.id,
+                action: 'SUCCESSOR_UNBLOCKED_AFTER_PREDECESSOR',
+                taskId: d.id,
+                summary: `Unblocked ${formatWorkItemRef(d.title, displayId)} — predecessor finished`,
+                metadata: {
+                  taskTitle: d.title,
+                  taskDisplayId: displayId ?? undefined,
+                  predecessorTaskId: subtask.id,
+                },
+              });
+            }
             updatedCount++;
+            const refreshedSub = await prisma.task.findUnique({
+              where: { id: subtask.id },
+            });
+            const changes = refreshedSub
+              ? collectTaskChangesAfterPersist(
+                  existingOne as Record<string, unknown>,
+                  updateData as Record<string, unknown>,
+                  refreshedSub as Record<string, unknown>,
+                )
+              : collectTaskChanges(
+                  existingOne as Record<string, unknown>,
+                  updateData as Record<string, unknown>,
+                );
+            if (changes.length > 0) {
+              const workTitle = String((existingOne as any).title ?? '');
+              const { displayId } = await resolveTaskDisplayIdForTaskId(id, subtask.id);
+              await logProjectActivity({
+                projectId: id,
+                actorId: req.user?.id,
+                action: 'SUBTASK_UPDATED',
+                taskId: subtask.id,
+                summary: `Updated work item ${formatWorkItemRef(workTitle, displayId)} (${changes.length} field(s))`,
+                metadata: {
+                  taskTitle: workTitle,
+                  taskDisplayId: displayId ?? undefined,
+                  changes,
+                },
+              });
+            }
           } else {
-            // Create new subtask
+            // Create new subtask — task-only managers cannot add rows to projects they do not manage
+            if (managerTaskOnlyAccess) {
+              console.log(
+                `⛔ Skipping create subtask on project ${id}: user ${req.user?.id} is not the project manager`,
+              );
+              continue;
+            }
             console.log(`➕ Creating new subtask: ${subtaskData.title}`);
+            const clientSubSeq =
+              (subtask as any).stableWorkSeq != null
+                ? parseInt(String((subtask as any).stableWorkSeq), 10)
+                : NaN;
+            const nextSubSeq =
+              Number.isFinite(clientSubSeq) && clientSubSeq > 0
+                ? clientSubSeq
+                : await computeNextMainDisplaySeq(prisma, id, null);
             const newSubtask = await prisma.task.create({
-              data: subtaskData,
+              data: {
+                ...subtaskData,
+                stableWorkSeq: nextSubSeq,
+                taskOrder: subtaskData.taskOrder ?? nextSubSeq,
+              },
             });
             console.log(`✅ Created subtask ${newSubtask.id}: ${newSubtask.title}`);
             createdCount++;
+            const assigneeName = await userShortLabel(newSubtask.assignedEmployeeId);
+            const assigneePart = assigneeName ? ` · Assignee: ${assigneeName}` : '';
+            const { displayId: newSubDisplayId } = await resolveTaskDisplayIdForTaskId(
+              id,
+              newSubtask.id,
+            );
+            await logProjectActivity({
+              projectId: id,
+              actorId: req.user?.id,
+              action: 'SUBTASK_CREATED',
+              taskId: newSubtask.id,
+              summary: `Added work item ${formatWorkItemRef(newSubtask.title, newSubDisplayId)}${assigneePart}`,
+              metadata: {
+                taskTitle: newSubtask.title,
+                taskDisplayId: newSubDisplayId ?? undefined,
+                assigneeId: newSubtask.assignedEmployeeId,
+                assigneeName: assigneeName ?? undefined,
+              },
+            });
 
-            // Save child subtasks for this subtask
-            if (subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0) {
+            // Save child subtasks for this subtask (allow empty array to delete all children)
+            if (subtask.childSubtasks && Array.isArray(subtask.childSubtasks)) {
               await saveChildSubtasks(
                 newSubtask.id,
                 id,
@@ -1979,6 +3366,11 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
                 projectDefaults,
                 req.user?.id ?? null,
                 req.user?.role ?? null,
+                projectCreatorId,
+                project.status,
+                referencePlanDaysMap,
+                syncFromReference,
+                managerOwnsProject,
               );
             }
           }
@@ -2004,8 +3396,9 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
         
         // Handle child subtasks for existing subtasks
         // IMPORTANT: Process child tasks for ALL subtasks (both new and existing) to ensure assignments are preserved
-        for (const subtask of subtasks) {
-          if (subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0) {
+        for (const subtask of subtasksToSave) {
+          // Allow empty array so frontend can delete all children under a subtask
+          if (subtask.childSubtasks && Array.isArray(subtask.childSubtasks)) {
             // Try to get subtask ID from multiple sources
             let subtaskId = subtask.id ? String(subtask.id).trim() : null;
             
@@ -2031,7 +3424,14 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             // Only process child tasks if we have a valid parent subtask ID
             if (subtaskId) {
               try {
-                console.log(`💾 Calling saveChildSubtasks for parent ${subtaskId} with ${subtask.childSubtasks.length} children`);
+                if (subtask.childSubtasks.length === 0) {
+                  const existingChildCount = await prisma.task.count({
+                    where: { parentTaskId: subtaskId, projectId: id, deletedAt: null },
+                  });
+                  if (existingChildCount === 0) {
+                    continue;
+                  }
+                }
                 await saveChildSubtasks(
                   subtaskId,
                   id,
@@ -2040,6 +3440,11 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
                   projectDefaults,
                   req.user?.id ?? null,
                   req.user?.role ?? null,
+                  projectCreatorId,
+                  project.status,
+                  referencePlanDaysMap,
+                  syncFromReference,
+                  managerOwnsProject,
                 );
                 console.log(`✅ Successfully saved child tasks for subtask ${subtaskId}`);
               } catch (childError: any) {
@@ -2063,7 +3468,7 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
           }
         }
 
-        console.log(`✅ Saved ${subtasks.length} subtasks for project ${id} (${createdCount} created, ${updatedCount} updated)`);
+        console.log(`✅ Saved ${subtasksToSave.length} subtasks for project ${id} (${createdCount} created, ${updatedCount} updated)`);
       } catch (subtaskError: any) {
         console.error('❌ Error saving subtasks:', subtaskError);
         console.error('❌ Subtask error details:', {
@@ -2083,7 +3488,20 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
       }
     }
 
+    if (shouldCascadeSuspension) {
+      await prisma.task.updateMany({
+        where: { projectId: id },
+        data: { status: TaskStatus.ON_HOLD },
+      });
+    }
+
     // Refetch project with nested subtasks so response includes newly created child tasks
+    await compactMainRowStableWorkSeq(prisma, id, null);
+    const projectMeta = await prisma.project.findUnique({
+      where: { id },
+      select: { projectNumber: true },
+    });
+    await repairInsertedTaskDisplayKeys(prisma, id, null, projectMeta?.projectNumber ?? 1);
     const updatedProject = await prisma.project.findUnique({
       where: { id },
       include: {
@@ -2097,14 +3515,7 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
         },
         assignedEmployees: {
           include: {
-            employee: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-                email: true,
-              },
-            },
+            employee: { select: USER_AVATAR_SELECT },
           },
         },
         tasks: {
@@ -2121,43 +3532,23 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
                 },
               },
             },
-            assignedEmployee: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-                email: true,
-              },
-            },
+            delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+            assignedEmployee: { select: USER_AVATAR_SELECT },
             subtasks: {
               include: {
-                assignedEmployee: {
-                  select: {
-                    id: true,
-                    firstName: true,
-                    lastName: true,
-                    email: true,
-                  },
-                },
+                assignments: { select: { employeeId: true } },
+                delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+                assignedEmployee: { select: USER_AVATAR_SELECT },
                 subtasks: {
                   include: {
-                    assignedEmployee: {
-                      select: {
-                        id: true,
-                        firstName: true,
-                        lastName: true,
-                        email: true,
-                      },
-                    },
+                    assignments: { select: { employeeId: true } },
+                    delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+                    assignedEmployee: { select: USER_AVATAR_SELECT },
                   },
-                  orderBy: {
-                    createdAt: 'asc',
-                  },
+                  orderBy: [...TASK_ORDER_THEN_CREATED_AT],
                 },
               },
-              orderBy: {
-                createdAt: 'asc',
-              },
+              orderBy: [...TASK_ORDER_THEN_CREATED_AT],
             },
             _count: {
               select: {
@@ -2166,9 +3557,7 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
               },
             },
           },
-          orderBy: {
-            createdAt: 'desc',
-          },
+          orderBy: [...TASK_ORDER_THEN_CREATED_AT],
         },
         checklists: {
           orderBy: {
@@ -2204,6 +3593,7 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
             endDate: true,
             contractValue: true,
             currency: true,
+            builtUpArea: true,
             developerName: true,
             plotNumber: true,
             community: true,
@@ -2233,8 +3623,52 @@ export const updateProject = async (req: AuthRequest, res: Response): Promise<vo
     // Ensure frontend can show updated name in Project Details: expose both name and projectName (display = name or referenceNumber)
     const data = responseProject as any;
     const projectDisplay = data
-      ? { ...data, projectName: data.name != null && data.name !== '' ? data.name : data.referenceNumber }
+      ? {
+          ...data,
+          projectName: data.name != null && data.name !== '' ? data.name : data.referenceNumber,
+          permissions: {
+            canEditProjectFields:
+              normalizeErpRole(req.user?.role) === 'ADMIN' ||
+              normalizeErpRole(req.user?.role) === 'HR' ||
+              normalizeErpRole(req.user?.role) === 'SUPER_ADMIN' ||
+              managerOwnsProject,
+          },
+          tasks: mapProjectTasksForMainTableClient(
+            mapTaskTreeWithPermissions(
+              data.tasks,
+              req.user ? { id: req.user.id, role: req.user.role as any } : null,
+              data.createdBy ?? null,
+              data.status,
+              managerOwnsProject,
+            ),
+          ),
+        }
       : data;
+    setNoCacheJson(res);
+
+    if (
+      projectManagerText !== undefined &&
+      String(projectManagerText || '') !== String(existingProject.projectManager || '')
+    ) {
+      const manager = await resolveProjectManagerUser(projectManagerText);
+      if (manager?.email && responseProject) {
+        void notifyProjectManagerAssignedEmail({
+          manager,
+          project: {
+            id: responseProject.id,
+            name: responseProject.name,
+            referenceNumber: responseProject.referenceNumber,
+            startDate: responseProject.startDate,
+            deadline: responseProject.deadline,
+            client: (responseProject as any).client ?? null,
+          },
+          assignedBy: req.user
+            ? { firstName: (req.user as any).firstName, lastName: (req.user as any).lastName }
+            : null,
+        });
+      }
+    }
+
     res.json({
       success: true,
       message: 'Project updated successfully',
@@ -2307,10 +3741,34 @@ export const updateProjectName = async (req: AuthRequest, res: Response): Promis
   }
 };
 
+/** POST /api/projects/:id/request-deletion-otp — internal ERP approval; PM/Manager only */
+export const requestProjectDeletionOtp = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const result = await createProjectDeletionRequest(id, req);
+    if (!result.success) {
+      res.status(400).json({ success: false, message: result.message });
+      return;
+    }
+    res.json({
+      success: true,
+      message: result.message,
+      data: { requestId: result.requestId },
+    });
+  } catch (error: any) {
+    console.error('❌ Request project deletion error:', error);
+    res.status(500).json({
+      success: false,
+      message: error?.message || 'Failed to request deletion authorization',
+    });
+  }
+};
+
 // Delete project
 export const deleteProject = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { id } = req.params;
+    const deletionOtp = String(req.body?.deletionOtp ?? '').trim();
 
     console.log(`🗑️ Delete project request received for ID: ${id}`);
 
@@ -2338,7 +3796,6 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    // Employee role: Cannot delete projects
     if (req.user?.role === 'EMPLOYEE') {
       res.status(403).json({
         success: false,
@@ -2348,121 +3805,92 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
       return;
     }
 
-    // Manager role: Can delete projects they created, are assigned to, or from their contracts
-    if (req.user?.role === 'MANAGER') {
-      const projectWithRelations = project as any;
-      const isCreator = project.createdBy === req.user.id;
-      const isAssigned = projectWithRelations.assignedEmployees?.some(
-        (a: { employeeId: string }) => a.employeeId === req.user!.id
-      );
-      
-      // Check if project was created from a contract assigned to this manager
-      const hasAssignedContract = projectWithRelations.contracts?.some((contract: any) => {
-        return (req.user?.email && contract.assignedManagerEmail === req.user.email) ||
-               (req.user?.id && contract.assignedManagerId === req.user.id);
-      });
-
-      if (!isCreator && !isAssigned && !hasAssignedContract) {
+    if (requiresProjectDeletionOtp(req.user?.role)) {
+      if (!(await managerCanAccessProjectForDeletion(project, req))) {
         res.status(403).json({
           success: false,
-          message: 'Access Denied: You can only delete projects you created, are assigned to, or that were created from your contracts.',
+          message:
+            'Access Denied: You can only delete projects you manage or that were created from your contracts.',
           code: 'ACCESS_DENIED',
         });
         return;
       }
-    }
-
-    console.log(`📋 Deleting project: ${project.name} (${(project as any).referenceNumber})`);
-
-    // Delete all related records first (cascade delete)
-    // Use a transaction to ensure all deletions succeed or none do
-    await prisma.$transaction(async (tx) => {
-      console.log(`🔄 Starting transaction for project ${id} deletion`);
-
-      // Get all tender IDs for this project first
-      const tenders = await tx.tender.findMany({
-        where: { projectId: id },
-        select: { id: true },
-      });
-      const tenderIds = tenders.map(t => t.id);
-      console.log(`📦 Found ${tenderIds.length} tenders to delete`);
-
-      // Delete tender invitations for all tenders in this project
-      if (tenderIds.length > 0) {
-        const deletedInvitations = await tx.tenderInvitation.deleteMany({
-          where: { tenderId: { in: tenderIds } },
+      if (!deletionOtp) {
+        res.status(403).json({
+          success: false,
+          message: 'Project deletion requires Admin/Super Admin authorization. Request and enter the OTP.',
+          code: 'REQUIRES_DELETION_OTP',
         });
-        console.log(`✅ Deleted ${deletedInvitations.count} tender invitations`);
-
-        // Delete technical submissions for all tenders
-        const deletedSubmissions = await tx.technicalSubmission.deleteMany({
-          where: { tenderId: { in: tenderIds } },
+        return;
+      }
+      const otpCheck = await consumeDeletionOtp(id, deletionOtp, req.user!.id);
+      if (!otpCheck.ok) {
+        res.status(otpCheck.status).json({
+          success: false,
+          message: otpCheck.message,
+          code: 'INVALID_DELETION_OTP',
         });
-        console.log(`✅ Deleted ${deletedSubmissions.count} technical submissions`);
+        return;
       }
 
-      // Delete project assignments
-      const deletedAssignments = await tx.projectAssignment.deleteMany({
-        where: { projectId: id },
+      console.log(`📋 Soft-deleting project: ${project.name} (${project.referenceNumber})`);
+
+      await softDeleteProject(id);
+      await markDeletionRequestDeleted(otpCheck.requestId);
+
+      const approvedBy = await prisma.projectDeletionOtpRequest.findUnique({
+        where: { id: otpCheck.requestId },
+        select: { approvedById: true, approvedBy: { select: { firstName: true, lastName: true, email: true } } },
       });
-      console.log(`✅ Deleted ${deletedAssignments.count} project assignments`);
 
-      // Delete tasks
-      const deletedTasks = await tx.task.deleteMany({
-        where: { projectId: id },
+      await logProjectActivity({
+        projectId: id,
+        actorId: req.user?.id,
+        action: 'PROJECT_DELETED_OTP',
+        summary: `Project moved to trash after internal OTP approval: ${project.name} (${project.referenceNumber})`,
+        metadata: {
+          projectName: project.name,
+          referenceNumber: project.referenceNumber,
+          requestId: otpCheck.requestId,
+          requestedById: req.user?.id,
+          approvedById: approvedBy?.approvedById,
+          otpVerifiedById: req.user?.id,
+          deletedAt: new Date().toISOString(),
+          recoveryHours: DELETION_RECOVERY_HOURS,
+        },
       });
-      console.log(`✅ Deleted ${deletedTasks.count} tasks`);
 
-      // Delete documents
-      const deletedDocuments = await tx.document.deleteMany({
-        where: { projectId: id },
-      });
-      console.log(`✅ Deleted ${deletedDocuments.count} documents`);
-
-      // Delete tenders (after deleting their related records)
-      const deletedTenders = await tx.tender.deleteMany({
-        where: { projectId: id },
-      });
-      console.log(`✅ Deleted ${deletedTenders.count} tenders`);
-
-      // Delete checklists
-      const deletedChecklists = await tx.projectChecklist.deleteMany({
-        where: { projectId: id },
-      });
-      console.log(`✅ Deleted ${deletedChecklists.count} checklists`);
-
-      // Delete attachments
-      const deletedAttachments = await tx.projectAttachment.deleteMany({
-        where: { projectId: id },
-      });
-      console.log(`✅ Deleted ${deletedAttachments.count} attachments`);
-
-      // Finally, delete the project itself
-      await tx.project.delete({
-        where: { id },
-      });
-      console.log(`✅ Project ${id} deleted`);
-    });
-
-    // Verify the project is actually deleted
-    const verifyProject = await prisma.project.findUnique({
-      where: { id },
-    });
-
-    if (verifyProject) {
-      console.error(`❌ CRITICAL: Project ${id} still exists after deletion!`);
-      res.status(500).json({
-        success: false,
-        message: 'Project deletion failed - project still exists in database',
+      res.json({
+        success: true,
+        message: `Project moved to trash. You can restore it within ${DELETION_RECOVERY_HOURS} hours.`,
+        recoveryHours: DELETION_RECOVERY_HOURS,
       });
       return;
     }
 
-    console.log(`✅ Project ${id} deleted successfully and verified`);
+    console.log(`📋 Soft-deleting project: ${project.name} (${project.referenceNumber})`);
+
+    await softDeleteProject(id);
+
+    await logProjectActivity({
+      projectId: id,
+      actorId: req.user?.id,
+      action: 'PROJECT_DELETED',
+      summary: `Project moved to trash: ${project.name} (${project.referenceNumber})`,
+      metadata: {
+        projectName: project.name,
+        referenceNumber: project.referenceNumber,
+        deletedAt: new Date().toISOString(),
+        recoveryHours: DELETION_RECOVERY_HOURS,
+      },
+    });
+
+    console.log(`✅ Project ${id} soft-deleted (recoverable for ${DELETION_RECOVERY_HOURS}h)`);
 
     res.json({
       success: true,
-      message: 'Project deleted successfully',
+      message: `Project moved to trash. You can restore it within ${DELETION_RECOVERY_HOURS} hours.`,
+      recoveryHours: DELETION_RECOVERY_HOURS,
     });
   } catch (error) {
     console.error('❌ Delete project error:', error);
@@ -2494,7 +3922,17 @@ export const deleteProjects = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    // Manager role: Can delete projects (will be validated per project in the loop below)
+    if (requiresProjectDeletionOtp(req.user?.role)) {
+      res.status(403).json({
+        success: false,
+        message:
+          'Bulk project deletion is not available for project managers. Delete one project at a time with Admin OTP approval.',
+        code: 'ACCESS_DENIED',
+      });
+      return;
+    }
+
+    // Manager role (legacy): validated per project in the loop below
     const { ids, selectedTasks, selectedSubtasks } = req.body;
     
     // Check if this is actually a task deletion request (frontend might be calling wrong endpoint)
@@ -2568,77 +4006,19 @@ export const deleteProjects = async (req: AuthRequest, res: Response): Promise<v
       }
     }
 
-    // Delete all related records and projects in a transaction
-    const deletedCount = await prisma.$transaction(async (tx) => {
-      let totalDeleted = 0;
+    let deletedCount = 0;
+    for (const projectId of ids) {
+      await softDeleteProject(projectId);
+      deletedCount += 1;
+    }
 
-      for (const projectId of ids) {
-        // Get all tender IDs for this project
-        const tenders = await tx.tender.findMany({
-          where: { projectId },
-          select: { id: true },
-        });
-        const tenderIds = tenders.map(t => t.id);
-
-        // Delete tender invitations
-        if (tenderIds.length > 0) {
-          await tx.tenderInvitation.deleteMany({
-            where: { tenderId: { in: tenderIds } },
-          });
-
-          // Delete technical submissions
-          await tx.technicalSubmission.deleteMany({
-            where: { tenderId: { in: tenderIds } },
-          });
-        }
-
-        // Delete project assignments
-        await tx.projectAssignment.deleteMany({
-          where: { projectId },
-        });
-
-        // Delete tasks
-        await tx.task.deleteMany({
-          where: { projectId },
-        });
-
-        // Delete documents
-        await tx.document.deleteMany({
-          where: { projectId },
-        });
-
-        // Delete tenders
-        await tx.tender.deleteMany({
-          where: { projectId },
-        });
-
-        // Delete checklists
-        await tx.projectChecklist.deleteMany({
-          where: { projectId },
-        });
-
-        // Delete attachments
-        await tx.projectAttachment.deleteMany({
-          where: { projectId },
-        });
-
-        // Delete the project
-        await tx.project.delete({
-          where: { id: projectId },
-        });
-
-        totalDeleted++;
-      }
-
-      return totalDeleted;
-    });
-
-    console.log(`✅ ${deletedCount} projects deleted successfully`);
+    console.log(`✅ ${deletedCount} projects moved to trash`);
 
     res.json({
       success: true,
-      message: `${deletedCount} project(s) deleted successfully`,
+      message: `${deletedCount} project(s) moved to trash. Restore within ${DELETION_RECOVERY_HOURS} hours.`,
       deletedCount,
+      recoveryHours: DELETION_RECOVERY_HOURS,
     });
   } catch (error) {
     console.error('❌ Bulk delete projects error:', error);
@@ -2667,6 +4047,7 @@ export const assignEmployees = async (req: AuthRequest, res: Response): Promise<
 
     const project = await prisma.project.findUnique({
       where: { id },
+      include: { client: { select: { name: true } } },
     });
 
     if (!project) {
@@ -2674,35 +4055,61 @@ export const assignEmployees = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    // Remove existing assignments
-    await prisma.projectAssignment.deleteMany({
-      where: { projectId: id },
-    });
-
-    // Create new assignments
-    const assignments = await Promise.all(
-      employeeIds.map((employeeId: string) =>
-        prisma.projectAssignment.create({
-          data: {
+    // Merge assignments (do not wipe existing — chat invites must not remove other assignees)
+    const uniqueIds = [...new Set(employeeIds.map((id: string) => String(id).trim()).filter(Boolean))];
+    await Promise.all(
+      uniqueIds.map((employeeId: string) =>
+        prisma.projectAssignment.upsert({
+          where: {
+            projectId_employeeId: { projectId: id, employeeId },
+          },
+          create: {
             projectId: id,
             employeeId,
             assignedBy: req.user?.id || null,
             role: role || null,
           },
-          include: {
-            employee: {
-              select: {
-                id: true,
-                firstName: true,
-                lastName: true,
-                email: true,
-                role: true,
-              },
-            },
+          update: {
+            ...(role ? { role } : {}),
+            assignedBy: req.user?.id || null,
           },
-        })
-      )
+          include: {
+            employee: { select: { id: true, firstName: true, lastName: true, email: true, photo: true, role: true } },
+          },
+        }),
+      ),
     );
+
+    const assignments = await prisma.projectAssignment.findMany({
+      where: { projectId: id },
+      include: {
+        employee: { select: { id: true, firstName: true, lastName: true, email: true, photo: true, role: true } },
+      },
+    });
+
+    const isPmRole = String(role || '').toUpperCase().includes('PROJECT_MANAGER');
+    const assignedBy = req.user
+      ? { firstName: (req.user as any).firstName, lastName: (req.user as any).lastName }
+      : null;
+    for (const assignment of assignments) {
+      const emp = assignment.employee;
+      if (!emp?.email) continue;
+      const isPm = isPmRole || emp.role === 'PROJECT_MANAGER';
+      if (!isPm) continue;
+      if (!uniqueIds.includes(emp.id)) continue;
+      void notifyProjectManagerAssignedEmail({
+        manager: emp,
+        project: {
+          id: project.id,
+          name: project.name,
+          referenceNumber: project.referenceNumber,
+          startDate: project.startDate,
+          deadline: project.deadline,
+          client: project.client,
+        },
+        assignedBy,
+      });
+    }
 
     res.json({
       success: true,
@@ -2771,5 +4178,329 @@ export const getProjectStats = async (req: AuthRequest, res: Response): Promise<
   }
 };
 
+/** List projects/tasks in trash (recoverable within DELETION_RECOVERY_HOURS). */
+export const getDeletedItems = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({
+        success: false,
+        message: 'Employees cannot view deleted projects.',
+      });
+      return;
+    }
+    await purgeExpiredSoftDeletions();
+    const data = await listRecoverableDeletions();
+    res.json({
+      success: true,
+      data,
+      recoveryHours: DELETION_RECOVERY_HOURS,
+    });
+  } catch (error) {
+    console.error('Get deleted items error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/** Restore a soft-deleted project. */
+export const restoreDeletedProject = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({ success: false, message: 'Employees cannot restore projects.' });
+      return;
+    }
+    const ok = await restoreProject(id);
+    if (!ok) {
+      res.status(404).json({
+        success: false,
+        message: `Project not found in trash or recovery window (${DELETION_RECOVERY_HOURS}h) expired.`,
+      });
+      return;
+    }
+    res.json({
+      success: true,
+      message: 'Project restored successfully.',
+    });
+  } catch (error) {
+    console.error('Restore project error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/** Restore one or more soft-deleted tasks/subtasks. */
+export const restoreDeletedTasks = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const taskIds = Array.isArray(req.body?.taskIds) ? req.body.taskIds : [];
+    if (!taskIds.length) {
+      res.status(400).json({ success: false, message: 'taskIds array is required' });
+      return;
+    }
+    let restored = 0;
+    for (const taskId of taskIds) {
+      if (await restoreTask(String(taskId))) restored += 1;
+    }
+    res.json({
+      success: true,
+      message:
+        restored > 0
+          ? `${restored} task(s) restored.`
+          : `No tasks restored (not in trash or recovery window expired).`,
+      restored,
+    });
+  } catch (error) {
+    console.error('Restore tasks error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/** Permanently remove a soft-deleted project from trash (cannot be undone). */
+export const permanentDeleteProjectFromTrash = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({ success: false, message: 'Employees cannot permanently delete projects.' });
+      return;
+    }
+    const ok = await permanentlyDeleteProjectFromTrash(id);
+    if (!ok) {
+      res.status(404).json({
+        success: false,
+        message: 'Project not found in trash.',
+      });
+      return;
+    }
+    res.json({
+      success: true,
+      message: 'Project permanently deleted.',
+    });
+  } catch (error) {
+    console.error('Permanent delete project error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/** Permanently remove soft-deleted tasks from trash (cannot be undone). */
+export const permanentDeleteTasksFromTrash = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    if (req.user?.role === 'EMPLOYEE') {
+      res.status(403).json({ success: false, message: 'Employees cannot permanently delete tasks.' });
+      return;
+    }
+    const taskIds = Array.isArray(req.body?.taskIds) ? req.body.taskIds : [];
+    if (!taskIds.length) {
+      res.status(400).json({ success: false, message: 'taskIds array is required' });
+      return;
+    }
+    const purged = await permanentlyDeleteTasksFromTrash(taskIds.map((id: unknown) => String(id)));
+    if (purged === 0) {
+      res.status(404).json({
+        success: false,
+        message: 'No tasks found in trash to permanently delete.',
+      });
+      return;
+    }
+    res.json({
+      success: true,
+      message: `${purged} task(s) permanently deleted.`,
+      purged,
+    });
+  } catch (error) {
+    console.error('Permanent delete tasks error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/** Plan days template from project 2539 (by name, slot, stem). */
+export const getReferencePlanDays = async (_req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const data = await loadReferencePlanDaysData(prisma);
+    res.json({
+      success: true,
+      data,
+      referenceProjectRef: REFERENCE_PROJECT_REF,
+    });
+  } catch (error) {
+    console.error('Get reference plan days error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/** Soft-delete tasks immediately (moves to trash for DELETION_RECOVERY_HOURS). */
+export const softDeleteTasksEndpoint = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const taskIds = Array.isArray(req.body?.taskIds) ? req.body.taskIds : [];
+    if (!taskIds.length) {
+      res.status(400).json({ success: false, message: 'taskIds array is required' });
+      return;
+    }
+    if (!req.user?.id || !req.user.role) {
+      res.status(401).json({ success: false, message: 'Unauthorized' });
+      return;
+    }
+
+    const ids = taskIds.map((id: unknown) => String(id));
+    const rows = await prisma.task.findMany({
+      where: { id: { in: ids } },
+      include: {
+        assignments: { select: { employeeId: true } },
+        delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+        project: { select: { id: true, createdBy: true, status: true } },
+      },
+    });
+
+    const managesCache = new Map<string, boolean>();
+    for (const row of rows) {
+      let userManagesProject = false;
+      const role = req.user.role as any;
+      if (role === 'MANAGER' || role === 'PROJECT_MANAGER') {
+        if (!managesCache.has(row.projectId)) {
+          managesCache.set(
+            row.projectId,
+            await resolveUserManagesProject(
+              { id: req.user.id, role, email: req.user.email },
+              row.projectId,
+            ),
+          );
+        }
+        userManagesProject = managesCache.get(row.projectId) ?? false;
+      }
+      const perms = computeTaskPermissions({
+        user: { id: req.user.id, role },
+        task: row as any,
+        projectCreatedById: row.project?.createdBy ?? null,
+        projectStatus: row.project?.status ?? null,
+        userManagesProject,
+      });
+      if (!perms.canDelete) {
+        res.status(403).json({
+          success: false,
+          message: MESSAGE_NO_PERMISSION_DELETE_TASK,
+          code: 'NO_PERMISSION_DELETE_TASK',
+        });
+        return;
+      }
+    }
+
+    await softDeleteTasks(ids);
+    res.json({
+      success: true,
+      message: `${taskIds.length} task(s) moved to trash.`,
+      recoveryHours: DELETION_RECOVERY_HOURS,
+    });
+  } catch (error) {
+    console.error('Soft delete tasks error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
+/**
+ * Insert a work row after an existing task without shifting display IDs (stableWorkSeq).
+ * List position uses taskOrder; dependencies use internal predecessorId UUIDs.
+ */
+export const insertTaskAfterHandler = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    assertTaskManagementRole(req.user?.role);
+
+    const projectId = String(req.params.id || '').trim();
+    const {
+      insertAfterTaskId,
+      title,
+      name,
+      dependencyMode,
+      parentTaskId,
+      category,
+      priority,
+      planDays,
+      assignedEmployeeId,
+      phase,
+    } = req.body ?? {};
+
+    if (!projectId || !insertAfterTaskId) {
+      res.status(400).json({
+        success: false,
+        message: 'projectId and insertAfterTaskId are required',
+      });
+      return;
+    }
+
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      include: {
+        contracts: {
+          select: {
+            assignedManagerId: true,
+            assignedManagerEmail: true,
+            assignedManager: { select: { id: true } },
+          },
+        },
+      },
+    });
+    if (!project) {
+      res.status(404).json({ success: false, message: 'Project not found' });
+      return;
+    }
+
+    const role = normalizeErpRole(req.user?.role);
+    if (role === 'MANAGER') {
+      const managerUser = await prisma.user.findUnique({
+        where: { id: req.user!.id },
+        select: { email: true, firstName: true, lastName: true },
+      });
+      const owns = managerOwnsProjectAsPm(project as any, {
+        id: req.user!.id,
+        email: managerUser?.email ?? req.user?.email ?? null,
+        nameVariations: buildUserNameVariations(managerUser?.firstName, managerUser?.lastName),
+      });
+      if (!owns && project.createdBy !== req.user!.id) {
+        res.status(403).json({
+          success: false,
+          message: 'Only the project manager can add tasks to this project.',
+          code: 'ACCESS_DENIED',
+        });
+        return;
+      }
+    }
+
+    const { throwIfProjectWriteLocked } = await import('../utils/project-suspension');
+    throwIfProjectWriteLocked({
+      projectStatus: project.status,
+      projectCreatedById: project.createdBy,
+      user: req.user,
+    });
+
+    const mode: InsertDependencyMode =
+      dependencyMode === 'keep_existing' ? 'keep_existing' : 'insert_into_chain';
+
+    const result = await insertTaskAfter({
+      projectId,
+      insertAfterTaskId: String(insertAfterTaskId),
+      title: String(title ?? name ?? ''),
+      dependencyMode: mode,
+      actorId: req.user!.id,
+      parentTaskId: parentTaskId ?? null,
+      category: category ?? phase ?? null,
+      priority: priority ?? null,
+      planDays: planDays != null ? Number(planDays) : null,
+      assignedEmployeeId: assignedEmployeeId ?? null,
+      phase: phase ?? null,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Task inserted successfully',
+      data: result,
+    });
+  } catch (error: any) {
+    const status = error?.statusCode || 500;
+    if (status >= 500) {
+      console.error('Insert task after error:', error);
+    }
+    res.status(status).json({
+      success: false,
+      message: error?.message || 'Failed to insert task',
+      code: error?.code,
+    });
+  }
+};
 
 

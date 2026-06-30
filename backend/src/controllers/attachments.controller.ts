@@ -1,6 +1,11 @@
 import { Response } from 'express';
 import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
+import {
+  ensureProjectWriteAllowed,
+  ensureTaskProjectWriteAllowed,
+  PROJECT_SUSPENDED_MESSAGE,
+} from '../utils/project-suspension';
 
 // Project Attachments
 
@@ -29,6 +34,20 @@ export const createProjectAttachment = async (req: AuthRequest, res: Response): 
   try {
     const { projectId } = req.params;
     const file = req.file;
+
+    try {
+      await ensureProjectWriteAllowed(projectId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
 
     if (!file) {
       res.status(400).json({
@@ -65,6 +84,20 @@ export const createProjectAttachment = async (req: AuthRequest, res: Response): 
 export const deleteProjectAttachment = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { projectId, attachmentId } = req.params;
+
+    try {
+      await ensureProjectWriteAllowed(projectId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
 
     const attachment = await prisma.projectAttachment.findFirst({
       where: {
@@ -126,6 +159,20 @@ export const createTaskAttachment = async (req: AuthRequest, res: Response): Pro
     const { taskId } = req.params;
     const file = req.file;
 
+    try {
+      await ensureTaskProjectWriteAllowed(taskId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
+
     if (!file) {
       res.status(400).json({
         success: false,
@@ -161,6 +208,20 @@ export const createTaskAttachment = async (req: AuthRequest, res: Response): Pro
 export const deleteTaskAttachment = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { taskId, attachmentId } = req.params;
+
+    try {
+      await ensureTaskProjectWriteAllowed(taskId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
 
     const attachment = await prisma.taskAttachment.findFirst({
       where: {

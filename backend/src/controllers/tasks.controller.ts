@@ -1,12 +1,100 @@
 import { Request, Response } from 'express';
 import prisma from '../config/database';
 import { taskRowInvolvesEmployee } from '../utils/employee-task-involvement';
-import { unlockDependentsWaitingOnFinishedPredecessor } from '../utils/task-predecessor-unlock';
+import {
+  unlockDependentsWaitingOnFinishedPredecessor,
+  enrichTaskTreeForClient,
+  enrichTaskNodeForClient,
+  syncProjectPredecessorLinksFromDisplayKeys,
+  mapProjectTasksForMainTableClient,
+  isPredecessorRowCompleted,
+  workflowStatusForSavedTaskStatus,
+} from '../utils/task-predecessor-unlock';
+import { assertNoPredecessorCycle } from '../utils/task-dependency-graph';
+
+function setNoCacheJson(res: Response): void {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+}
 import { AuthRequest } from '../middleware/auth.middleware';
+import {
+  logProjectActivity,
+  collectTaskChanges,
+  collectTaskChangesAfterPersist,
+  logTaskTreeCreated,
+  resolveTaskDisplayIdForTaskId,
+} from '../services/projectActivity.service';
+import { formatWorkItemRef } from '../utils/task-display-id';
+import {
+  parseTaskEffortType,
+  parseTaskWeightInput,
+  clampTaskWeight,
+} from '../utils/workload.utils';
+import { awardXpForTaskCompletion } from '../services/gamification.service';
+import {
+  extractStatusReversionReason,
+  isTaskStatusChanged,
+  processPmTaskStatusChangeNotification,
+} from '../services/taskStatusReversion.service';
+import { maybeNotifyTaskNotesFromSave } from '../services/taskNotesNotify.service';
+import { computeEmployeeWorkload } from '../services/workload.service';
+import { notifyWorkloadForTaskChange } from '../services/workloadNotify.service';
+import { notifyTaskAssignedEmail } from '../services/emailDispatch.service';
+import { TaskEffortType, TaskStatus } from '@prisma/client';
 import {
   computeTaskPermissions,
   hasMainFieldChanges,
+  isTaskDoneLockedStatus,
+  TASK_DONE_LOCK_MESSAGE,
+  userCanUnlockCompletedTask,
+  mapTaskTreeWithPermissions,
+  MESSAGE_NO_PERMISSION_DELETE_TASK,
 } from '../utils/task-permissions';
+import { resolveUserManagesProject } from '../utils/project-pm-ownership';
+import { computeNextStableWorkSeq } from '../utils/project-number';
+import {
+  ensureTaskProjectWriteAllowed,
+  isProjectWriteLockedForUser,
+  PROJECT_SUSPENDED_MESSAGE,
+} from '../utils/project-suspension';
+import { mapFrontendTaskStatusToEnum } from '../utils/taskStatusMap';
+
+async function deletePermissionsForTask(
+  user: NonNullable<AuthRequest['user']>,
+  task: {
+    projectId: string;
+    createdBy?: string | null;
+    assignedEmployeeId?: string | null;
+    assignments?: { employeeId: string }[];
+    delegations?: Record<string, unknown>[];
+    status?: string | null;
+  },
+  projectMeta: { createdBy?: string | null; status?: string | null } | null | undefined,
+  managesCache: Map<string, boolean>,
+) {
+  const role = user.role as any;
+  let userManagesProject = false;
+  if (role === 'MANAGER' || role === 'PROJECT_MANAGER') {
+    if (!managesCache.has(task.projectId)) {
+      managesCache.set(
+        task.projectId,
+        await resolveUserManagesProject(
+          { id: user.id, role, email: (user as any).email },
+          task.projectId,
+        ),
+      );
+    }
+    userManagesProject = managesCache.get(task.projectId) ?? false;
+  }
+  return computeTaskPermissions({
+    user: { id: user.id, role },
+    task: task as any,
+    projectCreatedById: projectMeta?.createdBy ?? null,
+    projectStatus: projectMeta?.status ?? null,
+    userManagesProject,
+  });
+}
 
 // Reusable lock helper for predecessor‑based workflow
 async function checkTaskLock(taskId: string) {
@@ -91,7 +179,7 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
     // When admin/manager views another employee's tasks (e.g. /employees/30), use employee= or assignedTo
     const canViewOtherEmployee =
       req.user &&
-      ['ADMIN', 'HR', 'PROJECT_MANAGER'].includes(req.user.role);
+      ['ADMIN', 'HR', 'PROJECT_MANAGER', 'SUPER_ADMIN'].includes(req.user.role);
     const targetEmployeeId =
       (employeeParam as string) || (assignedTo as string) || null;
     const useTargetEmployee =
@@ -139,6 +227,19 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
       where.OR = employeeOr;
     }
 
+    if (projectId && typeof projectId === 'string') {
+      await syncProjectPredecessorLinksFromDisplayKeys(prisma, projectId);
+    } else if (filterByEmployeeId) {
+      const projectIds = await prisma.task.findMany({
+        where: taskRowInvolvesEmployee(filterByEmployeeId),
+        select: { projectId: true },
+        distinct: ['projectId'],
+      });
+      await Promise.all(
+        projectIds.map((p) => syncProjectPredecessorLinksFromDisplayKeys(prisma, p.projectId)),
+      );
+    }
+
     const [tasks, total] = await Promise.all([
       prisma.task.findMany({
         where,
@@ -154,6 +255,8 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
               name: true,
               referenceNumber: true,
               pin: true,
+              status: true,
+              createdBy: true,
             },
           },
           assignments: {
@@ -228,9 +331,14 @@ export const getAllTasks = async (req: AuthRequest, res: Response): Promise<void
       prisma.task.count({ where }),
     ]);
 
+    const enrichedTasks = mapProjectTasksForMainTableClient(
+      enrichTaskTreeForClient(tasks as any),
+    );
+
+    setNoCacheJson(res);
     res.json({
       success: true,
-      data: tasks,
+      data: enrichedTasks,
       pagination: {
         page: pageNum,
         limit: limitNum,
@@ -310,6 +418,7 @@ export const getTaskById = async (req: AuthRequest, res: Response): Promise<void
             referenceNumber: true,
             pin: true,
             status: true,
+            createdBy: true,
           },
         },
         assignments: {
@@ -326,6 +435,7 @@ export const getTaskById = async (req: AuthRequest, res: Response): Promise<void
             },
           },
         },
+        delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
         // Include nested subtasks and their child tasks
         subtasks: {
           include: {
@@ -400,7 +510,39 @@ export const getTaskById = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    res.json({ success: true, data: task });
+    const projectCreatedById = (task as any).project?.createdBy ?? null;
+    const projectStatus = (task as any).project?.status ?? null;
+    const userCtx = req.user ? { id: req.user.id, role: req.user.role as any } : null;
+    const permissions = userCtx
+      ? computeTaskPermissions({
+          user: userCtx,
+          task: task as any,
+          projectCreatedById,
+          projectStatus,
+        })
+      : undefined;
+    const subtasksWithPerm =
+      userCtx && (task as any).subtasks
+        ? mapTaskTreeWithPermissions((task as any).subtasks, userCtx, projectCreatedById, projectStatus)
+        : (task as any).subtasks;
+
+    const synced = (task as any)?.projectId
+      ? await syncProjectPredecessorLinksFromDisplayKeys(prisma, (task as any).projectId)
+      : 0;
+    if (synced > 0) {
+      console.log(`🔗 Synced ${synced} predecessor link(s) for task ${id}`);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        ...enrichTaskNodeForClient({
+          ...task,
+          permissions,
+          subtasks: subtasksWithPerm,
+        }),
+      },
+    });
   } catch (error) {
     console.error('Get task by ID error:', error);
     res.status(500).json({ success: false, message: 'Internal server error' });
@@ -455,7 +597,16 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
       predecessorId,
       // Nested subtasks and child tasks
       subtasks, // Array of subtasks with nested childSubtasks
+      effortType,
+      taskWeight,
     } = req.body;
+
+    const parsedEffort =
+      parseTaskEffortType(effortType) ?? TaskEffortType.FULL_FOCUS;
+    const parsedWeight =
+      parseTaskWeightInput(taskWeight) != null
+        ? clampTaskWeight(parseTaskWeightInput(taskWeight)!)
+        : 3;
 
     // Validate required fields
     if (!title || !projectId) {
@@ -482,10 +633,7 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
     // Helper function to map subtask data for nested create (supports assignedEmployeeId for child visibility)
     const mapSubtaskData = (subtask: any) => {
       const assignedEmpId = subtask.assignedEmployeeId || subtask.assignedTo || null;
-      const subStatus =
-        subtask.status === 'not started' ? 'PENDING' :
-        subtask.status === 'working' ? 'IN_PROGRESS' :
-        subtask.status === 'done' ? 'COMPLETED' : 'PENDING';
+      const subStatus = mapFrontendTaskStatusToEnum(subtask.status);
       
       // All managers can assign subtasks to any employee - no team member restriction
       
@@ -522,6 +670,11 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
         assignedEmployeeId: assignedEmpId,
         predecessors: (subtask.predecessors != null && String(subtask.predecessors).trim() !== '') ? String(subtask.predecessors).trim() : null,
         predecessorId: subtask.predecessorId || null,
+        effortType: parseTaskEffortType(subtask.effortType) ?? TaskEffortType.FULL_FOCUS,
+        taskWeight:
+          parseTaskWeightInput(subtask.taskWeight) != null
+            ? clampTaskWeight(parseTaskWeightInput(subtask.taskWeight)!)
+            : 3,
         // taskOrder removed: execution order now purely visual on frontend
         // Nested child subtasks
         subtasks: subtask.childSubtasks && Array.isArray(subtask.childSubtasks) && subtask.childSubtasks.length > 0
@@ -576,6 +729,8 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
       // Root/main task workflow: if a predecessor is set at creation time, start
       // in WAITING_FOR_PREDECESSOR; otherwise treat as NOT_STARTED.
       workflowStatus: predecessorId ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED',
+      effortType: parsedEffort,
+      taskWeight: parsedWeight,
       // Create TaskAssignment records for main task employees
       assignments: finalEmployeeIds.length > 0 ? {
         create: finalEmployeeIds.map((employeeId: string) => ({
@@ -626,6 +781,57 @@ export const createTask = async (req: AuthRequest, res: Response): Promise<void>
       } as any,
     });
 
+    // Nested create cannot set per-parent stableWorkSeq before child rows exist — assign after insert.
+    const rootSubs = task.subtasks || [];
+    for (const st of rootSubs) {
+      const next = await computeNextStableWorkSeq(prisma, projectId, task.id);
+      await prisma.task.update({ where: { id: st.id }, data: { stableWorkSeq: next, taskOrder: next } as any });
+      const children = (st as any).subtasks || [];
+      for (const ch of children) {
+        const n2 = await computeNextStableWorkSeq(prisma, projectId, st.id);
+        await prisma.task.update({ where: { id: ch.id }, data: { stableWorkSeq: n2, taskOrder: n2 } as any });
+      }
+    }
+
+    const mapCreatedTaskTree = (t: any) => ({
+      id: t.id,
+      title: t.title,
+      parentTaskId: t.parentTaskId ?? null,
+      assignedEmployeeId: t.assignedEmployeeId ?? null,
+      subtasks: (t.subtasks || []).map(mapCreatedTaskTree),
+    });
+    await logTaskTreeCreated(projectId, req.user?.id ?? null, mapCreatedTaskTree(task));
+
+    // Notify workload subscribers for any newly affected assignees.
+    // Use `finalEmployeeIds` (guaranteed string[]) instead of relying on Prisma include typing.
+    const createdAssignees = Array.from(
+      new Set([task.assignedEmployeeId ?? null, ...finalEmployeeIds].filter(Boolean) as string[]),
+    );
+    void notifyWorkloadForTaskChange(createdAssignees, 'task_created');
+
+    if (task.project) {
+      const assignedBy = req.user
+        ? { firstName: (req.user as any).firstName, lastName: (req.user as any).lastName }
+        : null;
+      const projectInfo = task.project as unknown as {
+        id: string;
+        name: string;
+        referenceNumber?: string | null;
+      };
+      for (const assignment of (task.assignments || []) as Array<{
+        employee?: { id: string; email: string; firstName?: string | null; lastName?: string | null };
+      }>) {
+        const emp = assignment.employee;
+        if (!emp?.email) continue;
+        void notifyTaskAssignedEmail({
+          assignee: emp,
+          task: { id: task.id, title: task.title, dueDate: task.dueDate },
+          project: projectInfo,
+          assignedBy,
+        });
+      }
+    }
+
     res.status(201).json({
       success: true,
       message: 'Task created successfully',
@@ -655,9 +861,14 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
       // Assignee‑side fields (allowed for assignees)
       remarks,
       assigneeNotes,
+      statusReversionReason,
+      revertReason,
+      reopenReason,
       // Legacy predecessor fields (no longer used for locking)
       predecessors,
       predecessorId,
+      effortType,
+      taskWeight,
     } = req.body;
 
     // Check if task exists (and basic assignment info)
@@ -668,6 +879,10 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
           select: {
             employeeId: true,
           },
+        },
+        delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+        project: {
+          select: { createdBy: true, status: true, name: true, referenceNumber: true },
         },
         predecessor: {
           select: {
@@ -690,19 +905,51 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
+    if (
+      isProjectWriteLockedForUser({
+        projectStatus: existingTask.project?.status ?? null,
+        projectCreatedById: existingTask.project?.createdBy ?? null,
+        user: req.user,
+      })
+    ) {
+      res.status(423).json({
+        success: false,
+        message: PROJECT_SUSPENDED_MESSAGE,
+        code: 'PROJECT_SUSPENDED',
+      });
+      return;
+    }
+
     // Centralised permission evaluation based on role, creator, and assignments
     const perms = computeTaskPermissions({
       user: { id: req.user.id, role: req.user.role as any },
       task: existingTask,
+      projectCreatedById: existingTask.project?.createdBy ?? null,
+      projectStatus: existingTask.project?.status ?? null,
     });
 
     // If user is neither creator, assignee, nor privileged → cannot update at all
     if (!perms.canEditAssigneeFields && !perms.canEditMainFields) {
-      res.status(403).json({
+      const doneLocked = isTaskDoneLockedStatus(existingTask.status);
+      res.status(doneLocked ? 423 : 403).json({
         success: false,
-        message:
-          'Access Denied: You are not assigned to this task and cannot update it.',
-        code: 'ACCESS_DENIED',
+        message: doneLocked
+          ? TASK_DONE_LOCK_MESSAGE
+          : 'Access Denied: You are not assigned to this task and cannot update it.',
+        code: doneLocked ? 'TASK_COMPLETED_LOCKED' : 'ACCESS_DENIED',
+      });
+      return;
+    }
+
+    const canUnlockDone = userCanUnlockCompletedTask(
+      { id: req.user.id, role: req.user.role as any },
+      existingTask.project?.createdBy ?? null,
+    );
+    if (isTaskDoneLockedStatus(existingTask.status) && !canUnlockDone) {
+      res.status(423).json({
+        success: false,
+        message: TASK_DONE_LOCK_MESSAGE,
+        code: 'TASK_COMPLETED_LOCKED',
       });
       return;
     }
@@ -710,13 +957,26 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
     const canEditMainFields = perms.canEditMainFields;
     const canEditAssigneeFields = perms.canEditAssigneeFields;
 
+    // Important: some frontends send the full task payload even when an assignee only changes status.
+    // We should ignore non-allowed fields (gated by `canEditMainFields`) rather than rejecting the whole update,
+    // otherwise the UI appears to change but refresh reverts it.
+
     // Predecessor-based blocking: if this task has a predecessor, do not allow
     // it to move to IN_PROGRESS or COMPLETED until the predecessor is COMPLETED.
-    const nextStatus = status || existingTask.status;
+    const mappedStatus =
+      status != null && String(status).trim() !== ''
+        ? mapFrontendTaskStatusToEnum(status)
+        : undefined;
+    const nextStatus = mappedStatus || existingTask.status;
     if (existingTask.predecessorId) {
       const lockInfo = await checkTaskLock(id);
 
-      if (lockInfo.locked && (nextStatus === 'IN_PROGRESS' || nextStatus === 'COMPLETED')) {
+      if (
+        lockInfo.locked &&
+        (nextStatus === TaskStatus.IN_PROGRESS ||
+          nextStatus === TaskStatus.SUBMITTED_IN_PROGRESS ||
+          nextStatus === TaskStatus.COMPLETED)
+      ) {
         res.status(400).json({
           success: false,
           code: 'PREDECESSOR_NOT_COMPLETED',
@@ -733,7 +993,8 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
       ...(canEditMainFields &&
         description !== undefined && { description: description || null }),
       // Status is allowed for both main editors and assignees
-      ...((canEditMainFields || canEditAssigneeFields) && status && { status }),
+      ...((canEditMainFields || canEditAssigneeFields) &&
+        mappedStatus && { status: mappedStatus }),
       ...(canEditMainFields && priority && { priority }),
       ...(canEditMainFields &&
         startDate && { startDate: new Date(startDate) }),
@@ -765,23 +1026,58 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
         assignedEmployeeId !== undefined && {
           assignedEmployeeId: assignedEmployeeId || null,
         }),
+      ...(canEditMainFields &&
+        effortType !== undefined && {
+          effortType: parseTaskEffortType(effortType) ?? TaskEffortType.FULL_FOCUS,
+        }),
+      ...(canEditMainFields &&
+        taskWeight !== undefined && {
+          taskWeight:
+            parseTaskWeightInput(taskWeight) != null
+              ? clampTaskWeight(parseTaskWeightInput(taskWeight)!)
+              : existingTask.taskWeight ?? 3,
+        }),
 
-      // Assignee‑side fields – creator / managers / admins / assignees
+      // Assignee‑side fields
       ...(canEditAssigneeFields &&
         remarks !== undefined && { remarks: remarks || null }),
       ...(canEditAssigneeFields &&
         assigneeNotes !== undefined && { assigneeNotes: assigneeNotes || null }),
     };
 
+    if (predecessorId !== undefined && canEditMainFields) {
+      const nextPred = predecessorId ? String(predecessorId) : null;
+      const projectTasks = await prisma.task.findMany({
+        where: { projectId: existingTask.projectId, deletedAt: null },
+        select: { id: true, predecessorId: true },
+      });
+      assertNoPredecessorCycle(projectTasks, id, nextPred);
+    }
+
+    if (mappedStatus) {
+      const predecessorIsCompleted = existingTask.predecessor
+        ? isPredecessorRowCompleted(existingTask.predecessor)
+        : true;
+      updateData.workflowStatus = workflowStatusForSavedTaskStatus(
+        mappedStatus,
+        existingTask.predecessorId,
+        predecessorIsCompleted,
+      );
+    }
+
     // If status is being changed to COMPLETED, set completedAt
-    if (status === 'COMPLETED' && existingTask.status !== 'COMPLETED') {
+    if (mappedStatus === TaskStatus.COMPLETED && existingTask.status !== TaskStatus.COMPLETED) {
       updateData.completedAt = new Date();
-    } else if (status !== 'COMPLETED' && existingTask.status === 'COMPLETED') {
+    } else if (
+      mappedStatus &&
+      mappedStatus !== TaskStatus.COMPLETED &&
+      existingTask.status === TaskStatus.COMPLETED
+    ) {
       updateData.completedAt = null;
     }
 
     // Update task (and unlock dependents when completing) in a transaction
-    const task = await prisma.$transaction(async (tx) => {
+    const { updated: task, unlockedDependents } = await prisma.$transaction(async (tx) => {
       const updated = await tx.task.update({
         where: { id },
         data: updateData,
@@ -810,15 +1106,151 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
 
       // Unlock dependents whenever this task row is a finished predecessor (handles custom
       // "Done - …" labels saved via project API + heals stale WAITING rows).
-      await unlockDependentsWaitingOnFinishedPredecessor(tx, id);
+      const unlockedDependents = await unlockDependentsWaitingOnFinishedPredecessor(tx, id);
 
-      return updated;
+      return { updated, unlockedDependents };
     });
+
+    for (const d of unlockedDependents) {
+      const { displayId } = await resolveTaskDisplayIdForTaskId(d.projectId, d.id);
+      await logProjectActivity({
+        projectId: d.projectId,
+        actorId: req.user?.id,
+        action: 'SUCCESSOR_UNBLOCKED_AFTER_PREDECESSOR',
+        taskId: d.id,
+        summary: `Unblocked ${formatWorkItemRef(d.title, displayId)} — predecessor finished`,
+        metadata: {
+          taskTitle: d.title,
+          taskDisplayId: displayId ?? undefined,
+          predecessorTaskId: id,
+        },
+      });
+    }
+
+    const changes = collectTaskChangesAfterPersist(
+      existingTask as Record<string, unknown>,
+      updateData as Record<string, unknown>,
+      task as Record<string, unknown>,
+    );
+    if (changes.length > 0) {
+      let action = 'SUBTASK_UPDATED';
+      if (!existingTask.parentTaskId) {
+        action = 'MAIN_TASK_ROW_UPDATED';
+      } else {
+        const parent = await prisma.task.findUnique({
+          where: { id: existingTask.parentTaskId },
+          select: { parentTaskId: true },
+        });
+        action = parent?.parentTaskId ? 'CHILD_TASK_UPDATED' : 'SUBTASK_UPDATED';
+      }
+      const { displayId } = await resolveTaskDisplayIdForTaskId(existingTask.projectId, id);
+      await logProjectActivity({
+        projectId: existingTask.projectId,
+        actorId: req.user?.id,
+        action,
+        taskId: id,
+        summary: `Updated ${formatWorkItemRef(existingTask.title, displayId)} (${changes.length} field(s))`,
+        metadata: {
+          taskTitle: existingTask.title,
+          taskDisplayId: displayId ?? undefined,
+          changes,
+        },
+      });
+    }
+
+    if (
+      mappedStatus &&
+      isTaskStatusChanged(existingTask.status as TaskStatus, mappedStatus)
+    ) {
+      await processPmTaskStatusChangeNotification({
+        projectId: existingTask.projectId,
+        taskId: id,
+        taskTitle: existingTask.title,
+        actor: { id: req.user.id, role: req.user.role as any },
+        projectCreatedById: existingTask.project?.createdBy ?? null,
+        previousStatus: existingTask.status as TaskStatus,
+        newStatus: mappedStatus,
+        assigneeUserId:
+          task.assignedEmployeeId ??
+          existingTask.assignedEmployeeId ??
+          task.assignments?.[0]?.employee?.id ??
+          null,
+        reason: extractStatusReversionReason({
+          statusReversionReason,
+          revertReason,
+          reopenReason,
+        }),
+      });
+    }
+
+    if (req.user?.id) {
+      void maybeNotifyTaskNotesFromSave({
+        projectId: existingTask.projectId,
+        projectName: task.project?.name,
+        projectReferenceNumber: task.project?.referenceNumber,
+        taskId: id,
+        taskTitle: existingTask.title,
+        actorId: req.user.id,
+        existing: {
+          remarks: existingTask.remarks,
+          assigneeNotes: existingTask.assigneeNotes,
+        },
+        incoming: { remarks, assigneeNotes },
+      });
+    }
+
+    let gamification: Awaited<ReturnType<typeof awardXpForTaskCompletion>> | null = null;
+    const updatedAssigneeId =
+      task.assignedEmployeeId ??
+      existingTask.assignedEmployeeId ??
+      task.assignments?.[0]?.employee?.id ??
+      null;
+    if (
+      mappedStatus === TaskStatus.COMPLETED &&
+      existingTask.status !== TaskStatus.COMPLETED
+    ) {
+      if (updatedAssigneeId) {
+        gamification = await awardXpForTaskCompletion(id, updatedAssigneeId);
+      }
+    }
+
+    void notifyWorkloadForTaskChange(
+      [existingTask.assignedEmployeeId, updatedAssigneeId],
+      'task_updated',
+    );
+
+    if (
+      updatedAssigneeId &&
+      updatedAssigneeId !== existingTask.assignedEmployeeId &&
+      task.project
+    ) {
+      const assignee =
+        task.assignments?.[0]?.employee ||
+        (await prisma.user.findUnique({
+          where: { id: updatedAssigneeId },
+          select: { id: true, email: true, firstName: true, lastName: true },
+        }));
+      if (assignee?.email) {
+        void notifyTaskAssignedEmail({
+          assignee,
+          task: { id: task.id, title: task.title, dueDate: task.dueDate },
+          project: task.project as unknown as {
+            id: string;
+            name: string;
+            referenceNumber?: string | null;
+          },
+          assignedBy: req.user
+            ? { firstName: (req.user as any).firstName, lastName: (req.user as any).lastName }
+            : null,
+        });
+      }
+    }
 
     res.json({
       success: true,
       message: 'Task updated successfully',
       data: task,
+      ...(gamification ? { gamification } : {}),
     });
   } catch (error) {
     console.error('Update task error:', error);
@@ -829,12 +1261,6 @@ export const updateTask = async (req: AuthRequest, res: Response): Promise<void>
 // Delete task
 export const deleteTask = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    // PROJECT_MANAGER, ADMIN, HR: can delete all tasks (main + child).
-    // MANAGER: can delete child tasks/subtasks only.
-    // EMPLOYEE: can delete only their own child tasks/subtasks (assigned to them).
-    const allowedRolesForAllTasks = ['PROJECT_MANAGER', 'ADMIN', 'HR'];
-    const allowedRolesForChildTasks = ['PROJECT_MANAGER', 'ADMIN', 'HR', 'MANAGER'];
-    
     if (!req.user?.role) {
       res.status(403).json({
         success: false,
@@ -847,10 +1273,7 @@ export const deleteTask = async (req: AuthRequest, res: Response): Promise<void>
     const { id } = req.params;
 
     console.log(`🗑️ Delete task request: id=${id}, user=${req.user?.email}, role=${req.user?.role}`);
-    console.log(`🔍 Request path: ${req.path}, method: ${req.method}`);
-    console.log(`🔍 Request URL: ${req.url}`);
 
-    // Fetch task to check if it exists and get its type (main task or child task)
     const task = await prisma.task.findUnique({
       where: { id },
       include: {
@@ -858,8 +1281,11 @@ export const deleteTask = async (req: AuthRequest, res: Response): Promise<void>
           select: { id: true, title: true },
         },
         parentTask: {
-          select: { id: true, title: true },
+          select: { id: true, title: true, parentTaskId: true },
         },
+        assignments: { select: { employeeId: true } },
+        delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+        project: { select: { createdBy: true, status: true } },
       },
     });
 
@@ -869,65 +1295,29 @@ export const deleteTask = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
-    // Check if this is a child task (has parentTaskId)
+    const projectIdForLog = task.projectId;
+    const titleForLog = task.title;
+    const parentTaskIdForLog = task.parentTaskId;
+    const parentParentId = task.parentTask?.parentTaskId;
+
     const isChildTask = !!task.parentTaskId;
-    
-    console.log(`📋 Task details:`, {
-      id: task.id,
-      title: task.title,
-      isChildTask,
-      parentTaskId: task.parentTaskId,
-      parentTaskTitle: task.parentTask?.title || 'N/A',
-      hasSubtasks: task.subtasks?.length > 0,
-      subtaskCount: task.subtasks?.length || 0,
-    });
-    
-    console.log(`🔐 Permission check - User role: ${req.user?.role}`);
-    console.log(`🔐 Allowed roles for child tasks:`, allowedRolesForChildTasks);
-    console.log(`🔐 Allowed roles for main tasks:`, allowedRolesForAllTasks);
-    console.log(`🔐 Is child task: ${isChildTask}`);
-    console.log(`🔐 User can delete child tasks: ${allowedRolesForChildTasks.includes(req.user?.role || '')}`);
-    console.log(`🔐 User can delete main tasks: ${allowedRolesForAllTasks.includes(req.user?.role || '')}`);
-    
-    // Check permissions based on task type
-    if (isChildTask) {
-      // Child task/subtask: MANAGER, PROJECT_MANAGER, ADMIN, HR can delete any. EMPLOYEE only if assigned to them.
-      if (req.user.role === 'EMPLOYEE') {
-        if (task.assignedEmployeeId !== req.user.id) {
-          console.error(`❌ Permission denied: Employee can only delete child tasks assigned to them`);
-          res.status(403).json({
-            success: false,
-            message: 'Access Denied: You can only delete child tasks and subtasks that are assigned to you.',
-            code: 'ACCESS_DENIED',
-          });
-          return;
-        }
-        console.log(`✅ Permission granted: Employee deleting their own child task`);
-      } else if (!allowedRolesForChildTasks.includes(req.user.role)) {
-        console.error(`❌ Permission denied: User ${req.user?.role} cannot delete child tasks`);
-        res.status(403).json({
-          success: false,
-          message: 'Access Denied: You do not have permission to delete child tasks.',
-          code: 'ACCESS_DENIED',
-        });
-        return;
-      } else {
-        console.log(`✅ Permission granted: User ${req.user?.role} can delete child tasks`);
-      }
-    } else {
-      // Main task: Only PROJECT_MANAGER, ADMIN, HR can delete
-      if (!allowedRolesForAllTasks.includes(req.user.role)) {
-        console.error(`❌ Permission denied: User ${req.user?.role} cannot delete main tasks`);
-        res.status(403).json({
-          success: false,
-          message: 'Access Denied: You do not have permission to delete main tasks. Only project managers, admins, and HR can delete main tasks.',
-          code: 'ACCESS_DENIED',
-        });
-        return;
-      }
-      console.log(`✅ Permission granted: User ${req.user?.role} can delete main tasks`);
+
+    const delPerms = await deletePermissionsForTask(
+      req.user,
+      task as any,
+      task.project,
+      new Map(),
+    );
+
+    if (!delPerms.canDelete) {
+      res.status(403).json({
+        success: false,
+        message: MESSAGE_NO_PERMISSION_DELETE_TASK,
+        code: 'NO_PERMISSION_DELETE_TASK',
+      });
+      return;
     }
-    
+
     // Prisma will automatically handle cascading deletes for child tasks when parent is deleted
     // For child tasks, we can delete them directly
     
@@ -941,6 +1331,30 @@ export const deleteTask = async (req: AuthRequest, res: Response): Promise<void>
       // Delete the task (Prisma will cascade delete child tasks if this is a parent task)
       const deleteResult = await prisma.task.delete({
         where: { id },
+      });
+
+      let deleteAction = 'SUBTASK_DELETED';
+      if (!parentTaskIdForLog) {
+        deleteAction = 'MAIN_TASK_ROW_DELETED';
+      } else if (!parentParentId) {
+        deleteAction = 'SUBTASK_DELETED';
+      } else {
+        deleteAction = 'CHILD_TASK_DELETED';
+      }
+      const nested = task.subtasks?.length || 0;
+      await logProjectActivity({
+        projectId: projectIdForLog,
+        actorId: req.user?.id,
+        action: deleteAction,
+        taskId: id,
+        summary:
+          !parentTaskIdForLog && nested > 0
+            ? `Removed "${titleForLog}" (${nested} nested item(s) cascade-deleted)`
+            : `Removed "${titleForLog}"`,
+        metadata: {
+          taskTitle: titleForLog,
+          nestedSubtasksDeleted: nested,
+        },
       });
 
       console.log(`✅ Successfully deleted ${isChildTask ? 'child task' : 'task'} ${id} (${task.title})`);
@@ -1029,12 +1443,6 @@ export const deleteTasks = async (req: AuthRequest, res: Response): Promise<void
   console.log('👤 User:', req.user?.email, 'Role:', req.user?.role);
   
   try {
-    // PROJECT_MANAGER, ADMIN, and HR can delete all tasks (main tasks and child tasks)
-    // MANAGER can delete child tasks (subtasks) but not main tasks
-    // EMPLOYEE cannot delete any tasks
-    const allowedRolesForAllTasks = ['PROJECT_MANAGER', 'ADMIN', 'HR'];
-    const allowedRolesForChildTasks = ['PROJECT_MANAGER', 'ADMIN', 'HR', 'MANAGER'];
-    
     if (!req.user?.role) {
       console.log('❌ No user role found');
       res.status(403).json({
@@ -1081,7 +1489,6 @@ export const deleteTasks = async (req: AuthRequest, res: Response): Promise<void
     console.log(`📋 Total task IDs to delete: ${allTaskIds.length}`, allTaskIds);
     console.log(`🗑️ Bulk delete request: ${allTaskIds.length} tasks, user=${req.user?.email}, role=${req.user?.role}`);
 
-    // Fetch all tasks to check their types and permissions
     const tasks = await prisma.task.findMany({
       where: { id: { in: allTaskIds } },
       include: {
@@ -1089,55 +1496,37 @@ export const deleteTasks = async (req: AuthRequest, res: Response): Promise<void
           select: { id: true, title: true },
         },
         parentTask: {
-          select: { id: true, title: true },
+          select: { id: true, title: true, parentTaskId: true },
         },
+        assignments: { select: { employeeId: true } },
+        delegations: { select: { originalAssigneeId: true, newAssigneeId: true } },
+        project: { select: { createdBy: true, status: true } },
       },
     });
 
     if (tasks.length !== allTaskIds.length) {
-      const foundIds = new Set(tasks.map(t => t.id));
-      const missingIds = allTaskIds.filter(id => !foundIds.has(id));
+      const foundIds = new Set(tasks.map((t) => t.id));
+      const missingIds = allTaskIds.filter((tid) => !foundIds.has(tid));
       console.warn(`⚠️ Some tasks not found: ${missingIds.join(', ')}`);
     }
 
-    // Separate main tasks and child tasks
-    const mainTasks = tasks.filter(t => !t.parentTaskId);
-    const childTasks = tasks.filter(t => !!t.parentTaskId);
+    const managesCache = new Map<string, boolean>();
+    const forbidden = [];
+    for (const t of tasks) {
+      const p = await deletePermissionsForTask(req.user!, t as any, t.project, managesCache);
+      if (!p.canDelete) forbidden.push(t);
+    }
 
-    console.log(`📋 Task breakdown: ${mainTasks.length} main tasks, ${childTasks.length} child tasks`);
-
-    // Check permissions for main tasks (EMPLOYEE and MANAGER cannot delete main tasks)
-    if (mainTasks.length > 0 && !allowedRolesForAllTasks.includes(req.user.role)) {
+    if (forbidden.length > 0) {
       res.status(403).json({
         success: false,
-        message: 'Access Denied: You do not have permission to delete main tasks. Only project managers, admins, and HR can delete main tasks.',
-        code: 'ACCESS_DENIED',
+        message: MESSAGE_NO_PERMISSION_DELETE_TASK,
+        code: 'NO_PERMISSION_DELETE_TASK',
       });
       return;
     }
 
-    // For EMPLOYEE: may only delete child tasks that are assigned to them
-    let tasksToDelete = tasks;
-    if (req.user.role === 'EMPLOYEE') {
-      const notAllowed = tasks.filter(t => !t.parentTaskId || t.assignedEmployeeId !== req.user!.id);
-      if (notAllowed.length > 0) {
-        res.status(403).json({
-          success: false,
-          message: 'Access Denied: You can only delete child tasks and subtasks that are assigned to you.',
-          code: 'ACCESS_DENIED',
-        });
-        return;
-      }
-      tasksToDelete = tasks.filter(t => !!t.parentTaskId && t.assignedEmployeeId === req.user!.id);
-      console.log(`📋 Employee: deleting ${tasksToDelete.length} child task(s) assigned to them`);
-    } else if (childTasks.length > 0 && !allowedRolesForChildTasks.includes(req.user.role)) {
-      res.status(403).json({
-        success: false,
-        message: 'Access Denied: You do not have permission to delete child tasks.',
-        code: 'ACCESS_DENIED',
-      });
-      return;
-    }
+    const tasksToDelete = tasks;
 
     // Delete all allowed tasks
     let deletedCount = 0;
@@ -1226,6 +1615,20 @@ export const assignEmployees = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
+    try {
+      await ensureTaskProjectWriteAllowed(id, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
+
     // Remove existing assignments
     await prisma.taskAssignment.deleteMany({
       where: { taskId: id },
@@ -1297,6 +1700,20 @@ export const updateAssignmentStatus = async (req: AuthRequest, res: Response): P
       return;
     }
 
+    try {
+      await ensureTaskProjectWriteAllowed(id, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
+
     const updatedAssignment = await prisma.taskAssignment.update({
       where: { id: assignmentId },
       data: { status },
@@ -1362,6 +1779,20 @@ export const delegateTask = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
+    try {
+      await ensureTaskProjectWriteAllowed(taskId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
+
     // Only child/subtasks can be delegated by employees (main tasks have parentTaskId = null)
     if (!task.parentTaskId && req.user?.role === 'EMPLOYEE') {
       res.status(403).json({
@@ -1373,7 +1804,12 @@ export const delegateTask = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     // Only the current assignee (or admin) can delegate
-    if (task.assignedEmployeeId !== currentUserId && req.user?.role !== 'ADMIN' && req.user?.role !== 'PROJECT_MANAGER') {
+    if (
+      task.assignedEmployeeId !== currentUserId &&
+      req.user?.role !== 'ADMIN' &&
+      req.user?.role !== 'SUPER_ADMIN' &&
+      req.user?.role !== 'PROJECT_MANAGER'
+    ) {
       res.status(403).json({
         success: false,
         message: 'You can only delegate tasks that are assigned to you.',
@@ -1438,10 +1874,128 @@ export const delegateTask = async (req: AuthRequest, res: Response): Promise<voi
   }
 };
 
+/**
+ * Manager drag-and-drop reassign — updates assignee and returns refreshed workload scores.
+ * PATCH /api/tasks/:id/reassign
+ * Body: { toEmployeeId, fromEmployeeId? }
+ */
+export const reassignTask = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const role = req.user?.role;
+    if (
+      role !== 'ADMIN' &&
+      role !== 'SUPER_ADMIN' &&
+      role !== 'MANAGER' &&
+      role !== 'PROJECT_MANAGER' &&
+      role !== 'HR'
+    ) {
+      res.status(403).json({ success: false, message: 'Access denied' });
+      return;
+    }
+
+    const { id: taskId } = req.params;
+    const toEmployeeId = String(req.body?.toEmployeeId ?? '').trim();
+    const fromEmployeeId = req.body?.fromEmployeeId
+      ? String(req.body.fromEmployeeId).trim()
+      : null;
+
+    if (!toEmployeeId) {
+      res.status(400).json({ success: false, message: 'toEmployeeId is required' });
+      return;
+    }
+
+    const task = await prisma.task.findUnique({
+      where: { id: taskId },
+      select: { id: true, title: true, assignedEmployeeId: true, projectId: true },
+    });
+    if (!task) {
+      res.status(404).json({ success: false, message: 'Task not found' });
+      return;
+    }
+
+    const previousAssigneeId = task.assignedEmployeeId;
+    if (fromEmployeeId && previousAssigneeId && fromEmployeeId !== previousAssigneeId) {
+      res.status(400).json({
+        success: false,
+        message: 'fromEmployeeId does not match current assignee',
+      });
+      return;
+    }
+
+    const newAssignee = await prisma.user.findUnique({
+      where: { id: toEmployeeId },
+      select: { id: true, isActive: true },
+    });
+    if (!newAssignee?.isActive) {
+      res.status(400).json({ success: false, message: 'Target employee not found or inactive' });
+      return;
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.task.update({
+        where: { id: taskId },
+        data: { assignedEmployeeId: toEmployeeId },
+      });
+      await tx.taskAssignment.updateMany({
+        where: { taskId, employeeId: previousAssigneeId ?? undefined },
+        data: { employeeId: toEmployeeId, status: 'IN_PROGRESS' },
+      });
+      const hasAssignment = await tx.taskAssignment.findFirst({ where: { taskId, employeeId: toEmployeeId } });
+      if (!hasAssignment) {
+        await tx.taskAssignment.create({
+          data: {
+            taskId,
+            employeeId: toEmployeeId,
+            assignedBy: req.user?.id ?? null,
+            status: 'IN_PROGRESS',
+          },
+        });
+      }
+    });
+
+    const [fromWorkload, toWorkload, updatedTask] = await Promise.all([
+      previousAssigneeId ? computeEmployeeWorkload(previousAssigneeId) : null,
+      computeEmployeeWorkload(toEmployeeId),
+      prisma.task.findUnique({
+        where: { id: taskId },
+        include: {
+          assignedEmployee: {
+            select: { id: true, firstName: true, lastName: true, email: true, starCount: true, totalXp: true },
+          },
+        },
+      }),
+    ]);
+
+    void notifyWorkloadForTaskChange(
+      [previousAssigneeId, toEmployeeId],
+      'task_reassigned',
+    );
+
+    res.json({
+      success: true,
+      message: 'Task reassigned successfully',
+      data: {
+        task: updatedTask,
+        workload: {
+          from: fromWorkload,
+          to: toWorkload,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('reassignTask error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+};
+
 // Admin: delegation report for audit (original assignee, new assignee, task ID, date/time, reason)
 export const getDelegationsReport = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    if (req.user?.role !== 'ADMIN' && req.user?.role !== 'PROJECT_MANAGER') {
+    if (
+      req.user?.role !== 'ADMIN' &&
+      req.user?.role !== 'SUPER_ADMIN' &&
+      req.user?.role !== 'PROJECT_MANAGER'
+    ) {
       res.status(403).json({
         success: false,
         message: 'Only admins and project managers can access the delegation report.',
@@ -1663,6 +2217,20 @@ export const addSubtask = async (req: AuthRequest, res: Response): Promise<void>
       return;
     }
 
+    try {
+      await ensureTaskProjectWriteAllowed(parentId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
+
     // Employee role: Can only create subtasks for tasks assigned to them
     // Main tasks use assignments, subtasks use assignedEmployeeId
     if (req.user?.role === 'EMPLOYEE') {
@@ -1705,10 +2273,7 @@ export const addSubtask = async (req: AuthRequest, res: Response): Promise<void>
     // Helper to map child subtask data
     const mapChildSubtaskData = (child: any) => {
       const childHasPredecessor = !!child.predecessorId;
-      const childStatus =
-        child.status === 'not started' ? 'PENDING' :
-        child.status === 'working' ? 'IN_PROGRESS' :
-        child.status === 'done' ? 'COMPLETED' : 'PENDING';
+      const childStatus = mapFrontendTaskStatusToEnum(child.status);
       return {
         title: child.title || child.name || '',
         description: child.description || null,
@@ -1750,18 +2315,18 @@ export const addSubtask = async (req: AuthRequest, res: Response): Promise<void>
       assignedEmployeeId: assigneeId,
       hasChildSubtasks: childSubtasks && Array.isArray(childSubtasks) && childSubtasks.length > 0,
     });
-    const subStatus =
-      status === 'not started' ? 'PENDING' :
-      status === 'working' ? 'IN_PROGRESS' :
-      status === 'done' ? 'COMPLETED' : 'PENDING';
+    const subStatus = mapFrontendTaskStatusToEnum(status);
     const hasPredecessor = !!predecessorId;
 
+    const nextSubSeq = await computeNextStableWorkSeq(prisma, projectId, parentId as string);
     const subtask = await prisma.task.create({
       data: {
         title: titleStr,
         description: description || null,
         projectId: projectId,
         parentTaskId: parentId as any, // Link to parent task
+        stableWorkSeq: nextSubSeq,
+        taskOrder: nextSubSeq,
         status: subStatus,
         workflowStatus: hasPredecessor ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED',
         priority: priority === 'Low' ? 'LOW' : 
@@ -1816,6 +2381,12 @@ export const addSubtask = async (req: AuthRequest, res: Response): Promise<void>
         },
       } as any,
     });
+
+    const nestedKids = (subtask as any).subtasks || [];
+    for (const ch of nestedKids) {
+      const n2 = await computeNextStableWorkSeq(prisma, projectId, subtask.id);
+      await prisma.task.update({ where: { id: ch.id }, data: { stableWorkSeq: n2, taskOrder: n2 } as any });
+    }
 
     res.status(201).json({
       success: true,
@@ -1910,6 +2481,20 @@ export const addChildTask = async (req: AuthRequest, res: Response): Promise<voi
       return;
     }
 
+    try {
+      await ensureTaskProjectWriteAllowed(parentId, req.user, prisma);
+    } catch (error: any) {
+      if (error?.code === 'PROJECT_SUSPENDED') {
+        res.status(error.statusCode || 423).json({
+          success: false,
+          message: PROJECT_SUSPENDED_MESSAGE,
+          code: 'PROJECT_SUSPENDED',
+        });
+        return;
+      }
+      throw error;
+    }
+
     // Employee role: Can only create child tasks for subtasks assigned to them
     if (req.user?.role === 'EMPLOYEE') {
       if (parentSubtask.assignedEmployeeId !== req.user!.id) {
@@ -1930,18 +2515,18 @@ export const addChildTask = async (req: AuthRequest, res: Response): Promise<voi
       parentTaskId: parentId,
       assignedEmployeeId: assigneeId,
     });
-    const childStatus =
-      status === 'not started' ? 'PENDING' :
-      status === 'working' ? 'IN_PROGRESS' :
-      status === 'done' ? 'COMPLETED' : 'PENDING';
+    const childStatus = mapFrontendTaskStatusToEnum(status);
     const childHasPredecessor = !!predecessorId;
 
+    const nextChildSeq = await computeNextStableWorkSeq(prisma, parentSubtask.projectId, parentId as string);
     const childTask = await prisma.task.create({
       data: {
         title: titleStr,
         description: description || null,
         projectId: parentSubtask.projectId,
         parentTaskId: parentId as any, // Link to parent subtask
+        stableWorkSeq: nextChildSeq,
+        taskOrder: nextChildSeq,
         status: childStatus,
         workflowStatus: childHasPredecessor ? 'WAITING_FOR_PREDECESSOR' : 'NOT_STARTED',
         priority: priority === 'Low' ? 'LOW' : 
@@ -2076,7 +2661,9 @@ export const getKanbanTasks = async (req: AuthRequest, res: Response): Promise<v
       PENDING: tasks.filter((t: any) => t.status === 'PENDING'),
       IN_PROGRESS: tasks.filter((t: any) => t.status === 'IN_PROGRESS'),
       COMPLETED: tasks.filter((t: any) => t.status === 'COMPLETED'),
-      ON_HOLD: tasks.filter((t: any) => t.status === 'ON_HOLD'),
+      // Frontend Kanban has a "Suspended" column. We treat both ON_HOLD and NOT_REQUIRED as "Suspended"
+      // so these tasks don't disappear from Kanban when users select "NOT REQUIRED".
+      ON_HOLD: tasks.filter((t: any) => t.status === 'ON_HOLD' || t.status === 'NOT_REQUIRED'),
       CANCELLED: tasks.filter((t: any) => t.status === 'CANCELLED'),
     };
 

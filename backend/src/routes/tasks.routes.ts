@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.middleware';
 import * as tasksController from '../controllers/tasks.controller';
+import * as taskRemindersController from '../controllers/taskReminders.controller';
 import * as checklistsController from '../controllers/checklists.controller';
 import * as attachmentsController from '../controllers/attachments.controller';
 import * as commentsController from '../controllers/comments.controller';
@@ -50,9 +51,19 @@ router.get('/stats', tasksController.getTaskStats);
 router.get('/kanban', tasksController.getKanbanTasks);
 router.get('/', tasksController.getAllTasks);
 router.get('/delegations/report', tasksController.getDelegationsReport);
+router.get('/reminders/inbox', taskRemindersController.getMyReminderInbox);
+router.get('/reminders/config', taskRemindersController.getReminderConfig);
+router.post('/reminders/disable-all', taskRemindersController.disableAllReminders);
+// Critical reminder alarm system
+router.get('/reminders/alerts/active', taskRemindersController.getMyActiveReminderAlerts);
+router.post('/reminders/alerts/:alertId/acknowledge', taskRemindersController.acknowledgeReminderAlert);
+router.post('/reminders/alerts/:alertId/snooze', taskRemindersController.snoozeReminderAlert);
+router.post('/reminders/alerts/:alertId/complete', taskRemindersController.completeReminderAlert);
+router.get('/reminders/alerts/:alertId/logs', taskRemindersController.getReminderAlertLogs);
 router.get('/:id', tasksController.getTaskById);
 router.post('/', tasksController.createTask);
 router.put('/:id', tasksController.updateTask);
+router.patch('/:id/reassign', tasksController.reassignTask);
 router.delete('/bulk', tasksController.deleteTasks); // Bulk delete must come before /:id
 router.delete('/:id', tasksController.deleteTask);
 
@@ -76,6 +87,11 @@ router.delete('/:taskId/checklists/:checklistId', checklistsController.deleteTas
 router.get('/:taskId/attachments', attachmentsController.getTaskAttachments);
 router.post('/:taskId/attachments', upload.single('file'), attachmentsController.createTaskAttachment);
 router.delete('/:taskId/attachments/:attachmentId', attachmentsController.deleteTaskAttachment);
+
+// Task reminders (subtasks)
+router.get('/:taskId/reminder', taskRemindersController.getTaskReminder);
+router.put('/:taskId/reminder', taskRemindersController.upsertTaskReminder);
+router.delete('/:taskId/reminder', taskRemindersController.deleteTaskReminder);
 
 // Task comments
 router.get('/:taskId/comments', commentsController.getTaskComments);

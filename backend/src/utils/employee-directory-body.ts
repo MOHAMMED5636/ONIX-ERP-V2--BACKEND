@@ -770,3 +770,16 @@ export function shouldPatchEmailAddresses(body: Record<string, unknown>): boolea
   }
   return bodyHasBracketIndexedKey(body, ['emails', 'emailList']);
 }
+
+const UUID_LIKE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Normalize line-manager id from multipart/JSON (`""` => clear, ignore non-UUID values). */
+export function resolveManagerIdInput(raw: unknown): string | null | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (!UUID_LIKE.test(s)) return null;
+  return s;
+}

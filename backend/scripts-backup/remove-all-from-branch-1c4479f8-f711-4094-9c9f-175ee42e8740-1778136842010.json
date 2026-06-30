@@ -1,0 +1,16 @@
+{
+  "branchCompany": {
+    "id": "1c4479f8-f711-4094-9c9f-175ee42e8740",
+    "name": "ONIX ENGINEERING CONSULTANCY - BRANCH OF ABU DHABI",
+    "parentCompanyId": "0d649e36-35e4-4492-9d23-fa66a06a1a90"
+  },
+  "parentCompany": {
+    "id": "0d649e36-35e4-4492-9d23-fa66a06a1a90",
+    "name": "ONIX ENGINEERING CONSULTANCY"
+  },
+  "nextCompanyName": "ONIX ENGINEERING CONSULTANCY",
+  "execute": false,
+  "backedUpAt": "2026-05-07T06:54:02.010Z",
+  "primaryUsers": [],
+  "extraLinksCount": 0
+}

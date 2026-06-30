@@ -3,6 +3,7 @@ import prisma from '../config/database';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { Prisma, SubDepartmentStatus } from '@prisma/client';
 import { parseSubDepartmentStatus } from '../utils/orgStructureStatus';
+import { syncEmployeesForSubDepartment } from '../services/employeeSubDepartmentManagers.service';
 
 /**
  * Get all sub-departments for a specific department
@@ -451,6 +452,14 @@ export const updateSubDepartment = async (req: AuthRequest, res: Response): Prom
       ...subDepartment,
       employees: subDepartment.positions?.length || 0,
     };
+
+    if (req.body?.managerId !== undefined) {
+      try {
+        await syncEmployeesForSubDepartment(id);
+      } catch (syncErr) {
+        console.warn('Sub-department manager sync warning:', syncErr);
+      }
+    }
 
     res.json({
       success: true,
